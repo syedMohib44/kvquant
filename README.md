@@ -164,6 +164,7 @@ Run demos as **modules** from inside the `kvquant` directory with the `kvquant` 
 ```bash
 python -m kvquant.demo              # basic quantization examples
 python -m kvquant.demo_llm          # real distilgpt2 KV cache compression
+python -m kvquant.demo_llm --prompt "You text here" # prompt based test
 python -m kvquant.demo_extensions   # all 4 extensions on real data
 python -m kvquant.visualize         # regenerate all plots -> plots/
 ```
