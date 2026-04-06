@@ -16,6 +16,7 @@ What this does
 Run:  python -m kvquant.demo_llm
 """
 
+import argparse
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -121,12 +122,78 @@ def sep(title=""):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prompt", type=str, default=None,
+                        help="Custom prompt to generate from (skips default demo)")
+    parser.add_argument("--max-new-tokens", type=int, default=40,
+                        help="Number of tokens to generate (default: 40)")
+    args = parser.parse_args()
+
     model, tok = load_model()
     head_dim = get_head_dim(model)
     n_layers = model.config.n_layer
     n_heads = model.config.n_head
 
     print(f"  n_layers={n_layers}, n_heads={n_heads}, head_dim={head_dim}")
+
+    # -- Interactive prompt mode --------------------------------------------
+    if args.prompt:
+        sep("Interactive generation")
+        print(f"  Prompt : {args.prompt!r}\n")
+
+        enc = tok(args.prompt, return_tensors="pt")
+        input_ids = enc["input_ids"]
+        T_p = input_ids.shape[1]
+
+        kvs_p = capture_kv(model, input_ids)
+        all_k_p = torch.cat([kv[0].reshape(-1, T_p, head_dim) for kv in kvs_p], dim=0)
+        all_v_p = torch.cat([kv[1].reshape(-1, T_p, head_dim) for kv in kvs_p], dim=0)
+
+        # Unquantized generation
+        with torch.no_grad():
+            true_ids = model.generate(
+                input_ids, max_new_tokens=args.max_new_tokens, do_sample=False
+            )
+        print(f"  Unquant: {tok.decode(true_ids[0], skip_special_tokens=True).strip()}\n")
+
+        # Prompt forward pass: get logits at last position (unquantized)
+        with torch.no_grad():
+            prompt_out = model(input_ids, use_cache=False)
+        first_logits = prompt_out.logits[:, -1, :]  # (1, vocab)
+
+        # Quantized generation at each bit-width
+        for bits in BITS_LIST:
+            kvc = KVCacheQuantizer(
+                head_dim=head_dim,
+                num_bits=bits,
+                use_outlier=True,
+                n_outlier=N_OUTLIER,
+                outlier_bits=min(bits + 1, 4),
+                regular_bits=max(bits - 1, 1),
+            )
+            kvc.calibrate(all_k_p, all_v_p)
+            quant_kv = _make_cache(model, kvs_p, kvc)
+
+            # Manual greedy decode: quant_kv holds compressed prompt context
+            # first token from prompt logits, then step through with compressed KV
+            generated = [first_logits.argmax(-1, keepdim=True)]  # (1, 1)
+            past = quant_kv
+            for _ in range(args.max_new_tokens - 1):
+                with torch.no_grad():
+                    step = model(generated[-1], past_key_values=past, use_cache=True)
+                next_tok = step.logits[:, -1, :].argmax(-1, keepdim=True)
+                generated.append(next_tok)
+                past = step.past_key_values
+                decoded = tok.decode(next_tok[0], skip_special_tokens=False)
+                if next_tok.item() == tok.eos_token_id or decoded in ("\n", "\n\n"):
+                    break
+
+            gen_ids = torch.cat(generated, dim=1)
+            full_ids = torch.cat([input_ids, gen_ids], dim=1)
+            print(f"  {bits}-bit  : {tok.decode(full_ids[0], skip_special_tokens=True).strip()}")
+
+        sep()
+        return
 
     # -- Tokenise all texts -------------------------------------------------
     encoded = tok(
