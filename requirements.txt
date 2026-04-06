@@ -1,0 +1,7 @@
+torch>=2.1.0
+transformers>=4.40.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# dev / testing
+pytest>=7.4.0
