@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from collections import defaultdict
 from .quantizer import KVQuantMSE, QuantizedMSE
 
 
@@ -39,9 +40,11 @@ _TIERS = [4, 3, 2, 1]   # hi -> lo
 
 
 class _CacheEntry(NamedTuple):
-    q:        QuantizedMSE   # compressed KV
-    bits:     int            # current bit-width
-    score:    float          # importance score (EMA of attention weights)
+    q:              QuantizedMSE   # compressed KV
+    bits:           int            # current bit-width
+    score:          float          # importance score (EMA of attention weights)
+    pending_bits:   int            # target tier being waited on (hysteresis)
+    pending_steps:  int            # consecutive steps in pending_bits tier
 
 
 class AdaptiveKVCache(nn.Module):
@@ -57,8 +60,12 @@ class AdaptiveKVCache(nn.Module):
         hi_threshold:  Importance score above which tokens get hi_bits.
         lo_threshold:  Importance score below which tokens get lo_bits.
         evict_threshold: Importance score below which tokens get evict_bits.
-        ema_decay:     EMA decay factor for importance scores (default 0.9).
-        seed:          RNG seed.
+        ema_decay:        EMA decay factor for importance scores (default 0.9).
+        hysteresis_steps: A token is recompressed only after its score has been
+                          in the new tier for this many consecutive attend() calls
+                          (default 2).  Prevents expensive recompression from
+                          transient attention fluctuations.
+        seed:             RNG seed.
     """
 
     def __init__(
@@ -72,6 +79,7 @@ class AdaptiveKVCache(nn.Module):
         lo_threshold: float = 0.01,
         evict_threshold: float = 0.001,
         ema_decay: float = 0.9,
+        hysteresis_steps: int = 2,
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -83,7 +91,8 @@ class AdaptiveKVCache(nn.Module):
         self.hi_threshold    = hi_threshold
         self.lo_threshold    = lo_threshold
         self.evict_threshold = evict_threshold
-        self.ema_decay       = ema_decay
+        self.ema_decay        = ema_decay
+        self.hysteresis_steps = hysteresis_steps
 
         # One quantizer per bit-width tier
         self._quantizers = nn.ModuleDict({
@@ -106,8 +115,10 @@ class AdaptiveKVCache(nn.Module):
         """
         qk = self._quantize(k, self.hi_bits)
         qv = self._quantize(v, self.hi_bits)
-        self._k_entries.append(_CacheEntry(q=qk, bits=self.hi_bits, score=1.0))
-        self._v_entries.append(_CacheEntry(q=qv, bits=self.hi_bits, score=1.0))
+        self._k_entries.append(_CacheEntry(q=qk, bits=self.hi_bits, score=1.0,
+                                           pending_bits=self.hi_bits, pending_steps=0))
+        self._v_entries.append(_CacheEntry(q=qv, bits=self.hi_bits, score=1.0,
+                                           pending_bits=self.hi_bits, pending_steps=0))
 
     def attend(self, attn_weights: Tensor) -> None:
         """
@@ -121,26 +132,57 @@ class AdaptiveKVCache(nn.Module):
         if T == 0:
             return
 
-        # Average weights across batch/head dims -> (T,)
+        # Average weights across batch/head dims -> (T,) Python list
         w = attn_weights.reshape(-1, T).mean(0).tolist()
 
         new_k, new_v = [], []
         for t in range(T):
-            new_score = self.ema_decay * self._k_entries[t].score + (1 - self.ema_decay) * w[t]
-            target_bits = self._score_to_bits(new_score)
+            ek = self._k_entries[t]
+            new_score  = self.ema_decay * ek.score + (1 - self.ema_decay) * w[t]
+            want_bits  = self._score_to_bits(new_score)
 
-            # Recompress only if bit-width changes
-            if target_bits != self._k_entries[t].bits:
-                k_hat = self._dequantize(self._k_entries[t])
-                v_hat = self._dequantize(self._v_entries[t])
-                qk = self._quantize(k_hat, target_bits)
-                qv = self._quantize(v_hat, target_bits)
-            else:
-                qk = self._k_entries[t].q
+            # Hysteresis: only commit to a new tier after hysteresis_steps
+            # consecutive steps in that tier.  Avoids expensive recompression
+            # triggered by transient attention spikes.
+            if want_bits == ek.bits:
+                # Staying in the same tier — reset pending counter
+                new_pending_bits  = ek.bits
+                new_pending_steps = 0
+                qk = ek.q
                 qv = self._v_entries[t].q
+                actual_bits = ek.bits
+            elif want_bits == ek.pending_bits:
+                # Continuing towards a pending tier change
+                new_pending_steps = ek.pending_steps + 1
+                if new_pending_steps >= self.hysteresis_steps:
+                    # Confirmed: recompress now
+                    k_hat = self._dequantize(ek)
+                    v_hat = self._dequantize(self._v_entries[t])
+                    qk = self._quantize(k_hat, want_bits)
+                    qv = self._quantize(v_hat, want_bits)
+                    actual_bits       = want_bits
+                    new_pending_bits  = want_bits
+                    new_pending_steps = 0
+                else:
+                    # Not yet confirmed — keep current compression
+                    qk = ek.q
+                    qv = self._v_entries[t].q
+                    actual_bits      = ek.bits
+                    new_pending_bits = want_bits
+            else:
+                # New tier being requested — start fresh hysteresis counter
+                new_pending_bits  = want_bits
+                new_pending_steps = 1
+                qk = ek.q
+                qv = self._v_entries[t].q
+                actual_bits = ek.bits
 
-            new_k.append(_CacheEntry(q=qk, bits=target_bits, score=new_score))
-            new_v.append(_CacheEntry(q=qv, bits=target_bits, score=new_score))
+            new_k.append(_CacheEntry(q=qk, bits=actual_bits, score=new_score,
+                                     pending_bits=new_pending_bits,
+                                     pending_steps=new_pending_steps))
+            new_v.append(_CacheEntry(q=qv, bits=actual_bits, score=new_score,
+                                     pending_bits=new_pending_bits,
+                                     pending_steps=new_pending_steps))
 
         self._k_entries = new_k
         self._v_entries = new_v
@@ -149,15 +191,59 @@ class AdaptiveKVCache(nn.Module):
         """
         Reconstruct the full KV cache.
 
+        Tokens are grouped by bit-width and dequantized in a single batched
+        call per tier, instead of T individual calls.  For T=128 with 4 tiers
+        this is ~4 calls instead of 128, giving a large reduction in Python
+        dispatch overhead and better utilisation of BLAS.
+
         Returns:
             K_hat: (T, ..., head_dim)
             V_hat: (T, ..., head_dim)
         """
         if not self._k_entries:
             raise RuntimeError("Cache is empty.")
-        k_list = [self._dequantize(e) for e in self._k_entries]
-        v_list = [self._dequantize(e) for e in self._v_entries]
-        return torch.stack(k_list), torch.stack(v_list)
+
+        T = len(self._k_entries)
+
+        # Group token indices by bit-width
+        tier_idx: dict[int, list[int]] = defaultdict(list)
+        for t, e in enumerate(self._k_entries):
+            tier_idx[e.bits].append(t)
+
+        k_out: list[Tensor | None] = [None] * T
+        v_out: list[Tensor | None] = [None] * T
+
+        for bits, idxs in tier_idx.items():
+            quantizer = self._quantizers[str(bits)]
+            k_batch = self._batch_dequantize(
+                quantizer, [self._k_entries[t].q for t in idxs]
+            )
+            v_batch = self._batch_dequantize(
+                quantizer, [self._v_entries[t].q for t in idxs]
+            )
+            for i, t in enumerate(idxs):
+                k_out[t] = k_batch[i]
+                v_out[t] = v_batch[i]
+
+        return torch.stack(k_out), torch.stack(v_out)  # type: ignore[arg-type]
+
+    def _batch_dequantize(
+        self, quantizer: KVQuantMSE, qs: list[QuantizedMSE]
+    ) -> Tensor:
+        """
+        Dequantize a list of QuantizedMSE entries in a single fused call.
+
+        Each entry has indices/norms of shape (..., head_dim) / (..., 1).
+        Returns a tensor of shape (len(qs), ..., head_dim).
+        """
+        n = len(qs)
+        BH = qs[0].indices.reshape(-1, self.head_dim).shape[0]
+
+        all_idx   = torch.cat([q.indices.reshape(-1, self.head_dim) for q in qs])
+        all_norms = torch.cat([q.norms.reshape(-1, 1)               for q in qs])
+        combined  = QuantizedMSE(all_idx, all_norms, (n * BH, self.head_dim))
+        result    = quantizer.dequantize(combined)      # (n*BH, head_dim)
+        return result.reshape(n, BH, self.head_dim)
 
     def reset(self) -> None:
         self._k_entries.clear()

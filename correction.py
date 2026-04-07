@@ -40,6 +40,57 @@ from torch import Tensor
 from .quantizer import KVQuantMSE, KVQuantIP, QuantizedMSE, QuantizedIP
 
 
+def _randomized_svd(
+    A: Tensor,
+    rank: int,
+    n_oversampling: int = 10,
+    n_power_iter: int = 2,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Randomized SVD of a batch of matrices A of shape (N, m, n).
+
+    Returns (U, S, Vh) truncated to `rank`, where:
+        U  : (N, m, rank)
+        S  : (N, rank)
+        Vh : (N, rank, n)
+
+    Algorithm: randomized range finder + power iteration (Halko et al., 2011,
+    Algorithm 4.4).  Power iteration refines the sketch so that accuracy
+    converges to the full SVD as n_power_iter increases, with only
+    2*n_power_iter extra (cheap) matrix multiplies.
+
+    Args:
+        A:              Batch of matrices (N, m, n).
+        rank:           Number of singular vectors to compute.
+        n_oversampling: Extra sketch dimensions (default 10).
+        n_power_iter:   Power-iteration steps (default 2).  Even 1–2 steps
+                        bring the error very close to the full SVD for typical
+                        KV-cache residuals.
+    """
+    N, m, n = A.shape
+    k = min(rank + n_oversampling, min(m, n))
+
+    # Random Gaussian sketch: Y = A @ Omega  →  (N, m, k)
+    Omega = torch.randn(N, n, k, device=A.device, dtype=A.dtype)
+    Y = A @ Omega
+
+    # Power iteration: Y ← (A @ A^T)^q @ Y  improves range approximation
+    # QR at each step keeps the columns orthonormal and avoids numerical drift.
+    for _ in range(n_power_iter):
+        Q, _ = torch.linalg.qr(Y)
+        Z, _ = torch.linalg.qr(A.transpose(-2, -1) @ Q)
+        Y = A @ Z
+
+    # Final orthonormal basis for range(A)
+    Q, _ = torch.linalg.qr(Y)                       # (N, m, k)
+    # Project into small space and run exact SVD there — cheap: O(k²·n)
+    B = Q.transpose(-2, -1) @ A                      # (N, k, n)
+    U_hat, S, Vh = torch.linalg.svd(B, full_matrices=False)
+    U = Q @ U_hat                                    # (N, m, k)
+
+    return U[..., :rank], S[..., :rank], Vh[..., :rank, :]
+
+
 class CorrectedQuantized(NamedTuple):
     base_q:  QuantizedMSE | QuantizedIP   # compressed base
     U:       Tensor                        # (T, r)  left singular vectors * singular values
@@ -92,15 +143,17 @@ class LowRankCorrection(nn.Module):
         x_hat   = self.quantizer.dequantize(base_q)       # (NT, d)
         residual = (x_2d - x_hat).reshape(*shape)          # (..., T, d)
 
-        # SVD of residual matrix: shape (..., T, d)
-        # We apply per-sample (last 2 dims)
         residual_flat = residual.reshape(-1, shape[-2], self.dim)  # (N, T, d)
-        U, S, Vh = torch.linalg.svd(residual_flat, full_matrices=False)
-        # Truncate to rank r
-        r = min(self.rank, S.shape[-1])
-        U  = U[..., :r]        # (N, T, r)
-        S  = S[..., :r]        # (N, r)
-        Vh = Vh[..., :r, :]    # (N, r, d)
+        r = min(self.rank, min(shape[-2], self.dim))
+        T_seq = shape[-2]
+        if T_seq >= 64:
+            # Randomized SVD: faster for long sequences (O(T·d·r) sketch).
+            U, S, Vh = _randomized_svd(residual_flat, rank=r)
+        else:
+            # Full SVD: lower fixed overhead wins for short sequences.
+            U, S, Vh = torch.linalg.svd(residual_flat, full_matrices=False)
+            U, S, Vh = U[..., :r], S[..., :r], Vh[..., :r, :]
+        # U: (N, T, r)  S: (N, r)  Vh: (N, r, d)
 
         # Absorb S into U:  U_scaled = U * S  so correction = U_scaled @ Vh
         U_scaled = U * S.unsqueeze(-2)                    # (N, T, r)
@@ -142,11 +195,12 @@ class LowRankCorrection(nn.Module):
         x_hat  = self.quantizer.dequantize(base_q)
         R = (x_2d - x_hat).reshape(1, -1, self.dim)   # (1, N, d)
 
-        _, S, _ = torch.linalg.svd(R, full_matrices=False)
+        rank = min(max_rank, min(R.shape[-2], self.dim))
+        _, S, _ = _randomized_svd(R, rank=rank)
         S = S.squeeze(0)
         energy = S ** 2
         total  = energy.sum()
-        cumulative = energy[:max_rank].cumsum(0) / total
+        cumulative = energy.cumsum(0) / total
         return cumulative
 
     def storage_ratio(self, T: int) -> float:

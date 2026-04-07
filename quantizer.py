@@ -96,24 +96,30 @@ class KVQuantMSE(nn.Module):
         dim: int,
         num_bits: int = 2,
         seed: int = 0,
-        use_hadamard: bool = False,
+        use_hadamard: bool | None = None,
     ) -> None:
         super().__init__()
         assert 1 <= num_bits <= 4, "num_bits must be 1–4"
         self.dim = dim
         self.num_bits = num_bits
-        self.use_hadamard = use_hadamard
 
-        if use_hadamard:
+        # Hadamard is O(d log d) vs O(d²) for QR in theory, but the FWHT uses
+        # a Python loop that loses to a single BLAS matmul on CPU for d<=256.
+        # Default stays QR; pass use_hadamard=True explicitly for GPU workloads
+        # or larger d where the structured transform pays off.
+        self.use_hadamard = False if use_hadamard is None else use_hadamard
+
+        if self.use_hadamard:
             assert (dim & (dim - 1)) == 0, \
                 "use_hadamard=True requires dim to be a power of 2"
             self.rotation = HadamardRotation(dim, seed)
         else:
             self.rotation = RandomRotation(dim, seed)
 
-        # Centroids for N(0, 1/d) = N(0,1) / sqrt(d): shape (2**num_bits,)
-        centroids = build_codebook(num_bits, dim)
-        self.register_buffer("centroids", centroids)   # (k,)
+        # Centroids and pre-computed boundaries for fast bucketize
+        centroids, boundaries = build_codebook(num_bits, dim)
+        self.register_buffer("centroids",  centroids)   # (k,)
+        self.register_buffer("boundaries", boundaries)  # (k-1,)
 
     # ------------------------------------------------------------------
     def quantize(self, x: Tensor) -> QuantizedMSE:
@@ -136,10 +142,8 @@ class KVQuantMSE(nn.Module):
         # Rotate
         y = self.rotation(x_unit)                                   # (N, d)
 
-        # Nearest centroid via binary search on sorted centroids - O(N·d·log k)
-        # Boundaries are midpoints between consecutive centroids
-        boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2  # (k-1,)
-        indices = torch.bucketize(y, boundaries)                    # (N, d)
+        # Nearest centroid via binary search — boundaries cached from build_codebook
+        indices = torch.bucketize(y, self.boundaries)               # (N, d)
 
         return QuantizedMSE(
             indices=indices.reshape(*shape[:-1], self.dim),
@@ -167,6 +171,15 @@ class KVQuantMSE(nn.Module):
         # Restore scale
         x_hat = x_unit_hat * norms_flat
         return x_hat.reshape(q.shape)
+
+    def _dequantize_unit(self, idx_flat: Tensor) -> Tensor:
+        """
+        Fast path: dequantize pre-flattened indices assuming unit-norm vectors.
+        Skips the norm-restore multiply and the QuantizedMSE allocation.
+        Used internally by KVQuantIP.dequantize() where norms are always 1.
+        """
+        y_tilde = self.centroids[idx_flat]          # (N, d)
+        return self.rotation.inverse(y_tilde)       # (N, d)
 
     def forward(self, x: Tensor) -> Tensor:
         """Quantize then immediately dequantize."""
@@ -222,14 +235,15 @@ class KVQuantIP(nn.Module):
         num_bits: int = 2,
         seed: int = 0,
         qjl_seed: int = 1,
-        use_hadamard: bool = False,
+        use_hadamard: bool | None = None,
     ) -> None:
         super().__init__()
         assert 1 <= num_bits <= 4, "num_bits must be 1–4"
         self.dim = dim
         self.num_bits = num_bits
         self.mse_bits = max(0, num_bits - 1)
-        self.use_hadamard = use_hadamard
+
+        self.use_hadamard = False if use_hadamard is None else use_hadamard
 
         if self.mse_bits > 0:
             self.mse_quantizer: KVQuantMSE | None = KVQuantMSE(
@@ -309,14 +323,9 @@ class KVQuantIP(nn.Module):
 
         # --- Recover MSE component (unit scale) ---
         if self.mse_quantizer is not None:
-            # Reconstruct with unit norms (norms=1 stored in a dummy QuantizedMSE)
-            dummy_norms = torch.ones(N, 1, device=self.S.device, dtype=self.S.dtype)
-            q_mse_inner = QuantizedMSE(
-                indices=idx_flat,
-                norms=dummy_norms,
-                shape=(N, self.dim),
-            )
-            x_hat_unit = self.mse_quantizer.dequantize(q_mse_inner)  # (N, d)
+            # Use the internal unit-scale path to skip the norm multiply entirely
+            # and avoid allocating a (N, 1) ones tensor on every call.
+            x_hat_unit = self.mse_quantizer._dequantize_unit(idx_flat)
         else:
             x_hat_unit = torch.zeros(N, self.dim, device=self.S.device, dtype=self.S.dtype)
 

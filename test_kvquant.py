@@ -73,13 +73,15 @@ class TestCodebook:
 
     @pytest.mark.parametrize("b", [1, 2, 3, 4])
     def test_build_codebook_returns_correct_count(self, b):
-        c = build_codebook(b, dim=D)
+        c, bnd = build_codebook(b, dim=D)
         assert c.shape == (2**b,)
+        assert bnd.shape == (2**b - 1,)
         assert (c[1:] > c[:-1]).all(), "build_codebook centroids must be sorted"
 
     def test_build_codebook_device(self):
-        c = build_codebook(2, dim=D, device=torch.device("cpu"))
+        c, bnd = build_codebook(2, dim=D, device=torch.device("cpu"))
         assert c.device.type == "cpu"
+        assert bnd.device.type == "cpu"
 
     def test_lloyd_max_returns_sorted(self):
         c = _lloyd_max(2, dim=D, num_steps=100, num_samples=10_000)

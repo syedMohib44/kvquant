@@ -87,34 +87,48 @@ def _lloyd_max(
 # Public API
 # ---------------------------------------------------------------------------
 
-# Cache keyed by (num_bits, dim) - centroids are dimension-specific
-_CACHE: dict[tuple[int, int], Tensor] = {}
+# Cache keyed by (num_bits, dim) -> (centroids, boundaries)
+# Boundaries are midpoints between consecutive centroids: shape (2**num_bits - 1,)
+# Caching them avoids recomputing (centroids[:-1] + centroids[1:]) / 2 on every
+# quantize() call, which would otherwise run O(k) arithmetic each forward pass.
+_CACHE: dict[tuple[int, int], tuple[Tensor, Tensor]] = {}
 
 
-def build_codebook(num_bits: int, dim: int = 1, device: torch.device | None = None) -> Tensor:
+def build_codebook(
+    num_bits: int,
+    dim: int = 1,
+    device: torch.device | None = None,
+) -> tuple[Tensor, Tensor]:
     """
-    Return Lloyd-Max centroids fitted to the true unit-sphere marginal
-    distribution for the given `num_bits` and embedding dimension `dim`.
+    Return (centroids, boundaries) for the Lloyd-Max codebook fitted to the
+    true unit-sphere marginal distribution for the given ``num_bits`` and ``dim``.
 
-    The returned centroids are already at the correct scale for comparing
-    against rotated unit vectors - no additional rescaling by 1/sqrtd is needed.
+    Both tensors are cached after the first call so that quantize() can use the
+    pre-computed boundaries directly without recomputing them every forward pass.
 
     Args:
         num_bits: Bits per coordinate (1–4).
         dim:      Embedding dimension d.
-        device:   Target device.
+        device:   Target device (both tensors are moved there).
 
     Returns:
-        centroids: Tensor of shape (2**num_bits,).
+        centroids:  Tensor of shape (2**num_bits,).
+        boundaries: Tensor of shape (2**num_bits - 1,)  — midpoints between
+                    consecutive centroids, ready for ``torch.bucketize``.
     """
     assert 1 <= num_bits <= 4, "Only 1–4 bits/coordinate are supported."
     key = (num_bits, dim)
     if key not in _CACHE:
-        _CACHE[key] = _lloyd_max(num_bits, dim)
-    c = _CACHE[key].clone()
+        c = _lloyd_max(num_bits, dim)
+        b = ((c[:-1] + c[1:]) / 2).contiguous()
+        _CACHE[key] = (c, b)
+    centroids, boundaries = _CACHE[key]
+    centroids  = centroids.clone()
+    boundaries = boundaries.clone()
     if device is not None:
-        c = c.to(device)
-    return c
+        centroids  = centroids.to(device)
+        boundaries = boundaries.to(device)
+    return centroids, boundaries
 
 
 # ---------------------------------------------------------------------------
