@@ -149,10 +149,17 @@ def main():
         all_k_p = torch.cat([kv[0].reshape(-1, T_p, head_dim) for kv in kvs_p], dim=0)
         all_v_p = torch.cat([kv[1].reshape(-1, T_p, head_dim) for kv in kvs_p], dim=0)
 
+        # Suppress bare newlines so the model generates real words
+        newline_id = tok.encode("\n")[0]  # token 198 in GPT-2
+        bad_words = [[newline_id]]
+
         # Unquantized generation
         with torch.no_grad():
             true_ids = model.generate(
-                input_ids, max_new_tokens=args.max_new_tokens, do_sample=False
+                input_ids,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                bad_words_ids=bad_words,
             )
         print(f"  Unquant: {tok.decode(true_ids[0], skip_special_tokens=True).strip()}\n")
 
@@ -176,16 +183,20 @@ def main():
 
             # Manual greedy decode: quant_kv holds compressed prompt context
             # first token from prompt logits, then step through with compressed KV
-            generated = [first_logits.argmax(-1, keepdim=True)]  # (1, 1)
+            # First token: suppress newline from prompt logits too
+            first_logits_masked = first_logits.clone()
+            first_logits_masked[:, newline_id] = float("-inf")
+            generated = [first_logits_masked.argmax(-1, keepdim=True)]  # (1, 1)
             past = quant_kv
             for _ in range(args.max_new_tokens - 1):
                 with torch.no_grad():
                     step = model(generated[-1], past_key_values=past, use_cache=True)
-                next_tok = step.logits[:, -1, :].argmax(-1, keepdim=True)
+                logits_step = step.logits[:, -1, :].clone()
+                logits_step[:, newline_id] = float("-inf")  # suppress \n
+                next_tok = logits_step.argmax(-1, keepdim=True)
                 generated.append(next_tok)
                 past = step.past_key_values
-                decoded = tok.decode(next_tok[0], skip_special_tokens=False)
-                if next_tok.item() == tok.eos_token_id or decoded in ("\n", "\n\n"):
+                if next_tok.item() == tok.eos_token_id:
                     break
 
             gen_ids = torch.cat(generated, dim=1)

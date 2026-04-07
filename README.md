@@ -241,6 +241,23 @@ kvquant/
 └-- correction.py      # Extension 4: low-rank error correction
 ```
 
+## Example Output
+
+```bash
+python -m kvquant.demo_llm --prompt "Hi how are you?"
+```
+---- Interactive generation ------------------------------------
+  Prompt : 'Hi how are you?'
+
+  Unquant: Hi how are you? I'm a big fan of the game and I'm really excited to see how it will be released. I'm really excited to see how it will be released. I'm really excited to see how
+
+  2-bit  : Hi how are you? I’s a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is
+
+  3-bit  : Hi how are you? I’m a little bit shy, but I’m a little bit shy, but I’m a little bit shy, but I’m a little bit shy, but
+  
+  4-bit  : Hi how are you? I'm a big fan of the game and I'm really excited to see what you do. I'm really excited to see what you do. I'm a big fan of the game and I'm
+----------------------------------------------------------------
+
 ---
 
 ## Citation
