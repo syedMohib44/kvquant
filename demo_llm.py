@@ -284,7 +284,13 @@ def main():
         print(f"  Model  : {args.model}")
         print(f"  Prompt : {args.prompt!r}\n")
 
-        enc = tok(args.prompt, return_tensors="pt")
+        # Qwen3 thinking models honour /no_think to skip the <think> block.
+        # Append it automatically so both unquant and quantized paths skip reasoning.
+        prompt_text = args.prompt
+        if "qwen3" in args.model.lower() or "qwen-3" in args.model.lower():
+            prompt_text = prompt_text.rstrip() + " /no_think"
+
+        enc = tok(prompt_text, return_tensors="pt")
         input_ids = enc["input_ids"]
         T_p = input_ids.shape[1]
 
@@ -310,6 +316,7 @@ def main():
             true_ids = model.generate(
                 input_ids, max_new_tokens=args.max_new_tokens,
                 do_sample=False, bad_words_ids=bad_words,
+                repetition_penalty=args.repetition_penalty,
             )
         print(f"  Unquant: {_clean(tok.decode(true_ids[0], skip_special_tokens=True))}\n")
 

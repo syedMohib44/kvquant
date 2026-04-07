@@ -166,7 +166,7 @@ python -m kvquant.demo              # basic quantization examples
 python -m kvquant.demo_llm          # real distilgpt2 KV cache 
 
 #### Prompt testing ####
-python -m kvquant.demo_llm --prompt "Hi how are you?" # Pure transformer (default)
+python -m kvquant.demo_llm --prompt "Hi how are you?" --max-new-tokens 60 # Pure transformer (default)
 python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is AI?" # Hybrid model (Qwen3.5) — auto-detected, uses native cache
 python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "Once upon a time" # Recommended alternative models
 python -m kvquant.demo_llm --model microsoft/phi-2 --prompt "Explain transformers" # Recommended alternative models
