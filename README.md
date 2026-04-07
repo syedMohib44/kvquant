@@ -163,8 +163,15 @@ Run demos as **modules** from inside the `kvquant` directory with the `kvquant` 
 
 ```bash
 python -m kvquant.demo              # basic quantization examples
-python -m kvquant.demo_llm          # real distilgpt2 KV cache compression
-python -m kvquant.demo_llm --prompt "You text here" # prompt based test
+python -m kvquant.demo_llm          # real distilgpt2 KV cache 
+
+#### Prompt testing ####
+python -m kvquant.demo_llm --prompt "Hi how are you?" # Pure transformer (default)
+python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is AI?" # Hybrid model (Qwen3.5) — auto-detected, uses native cache
+python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "Once upon a time" # Recommended alternative models
+python -m kvquant.demo_llm --model microsoft/phi-2 --prompt "Explain transformers" # Recommended alternative models
+#########################
+
 python -m kvquant.demo_extensions   # all 4 extensions on real data
 python -m kvquant.visualize         # regenerate all plots -> plots/
 ```
