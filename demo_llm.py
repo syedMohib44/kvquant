@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kvquant import KVCacheQuantizer
+from kvquant.correction import _randomized_svd
 
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL = "distilgpt2"
@@ -127,7 +128,26 @@ def _kvs_from_cache(native_cache):
     return []
 
 
-def _quantize_cache(native_cache, kvc):
+def _apply_lowrank_correction(x: torch.Tensor, x_hat: torch.Tensor, rank: int) -> torch.Tensor:
+    """Add rank-r SVD correction to x_hat using residual (x - x_hat)."""
+    orig_shape = x_hat.shape
+    # reshape to (N, T, d) for batched SVD
+    N = x_hat.reshape(-1, orig_shape[-2], orig_shape[-1]).shape[0]
+    R = (x.float() - x_hat.float()).reshape(N, orig_shape[-2], orig_shape[-1])
+    T = R.shape[1]
+    r = min(rank, T - 1, orig_shape[-1] - 1)
+    if r < 1:
+        return x_hat
+    if T >= 64:
+        U, S, Vh = _randomized_svd(R, rank=r)
+    else:
+        U, S, Vh = torch.linalg.svd(R, full_matrices=False)
+        U, S, Vh = U[..., :r], S[..., :r], Vh[..., :r, :]
+    correction = (U * S.unsqueeze(-2)) @ Vh   # (N, T, d)
+    return (x_hat.float() + correction.reshape(orig_shape)).to(x_hat.dtype)
+
+
+def _quantize_cache(native_cache, kvc, correction_rank: int = 0):
     """
     Return a COPY of native_cache with K, V quantized in transformer-attention
     layers.  Linear/state-space state is left untouched so hybrid models (Qwen3.5,
@@ -136,9 +156,12 @@ def _quantize_cache(native_cache, kvc):
     cache_q = copy.deepcopy(native_cache)
 
     def _quant_pair(k, v):
-        """Quantize a (k, v) pair and cast back to the original dtype."""
+        """Quantize a (k, v) pair, optionally apply low-rank correction, cast back."""
         dtype = k.dtype
         k_hat, v_hat = kvc.decompress_kv(*kvc.compress_kv(k.float(), v.float()))
+        if correction_rank > 0:
+            k_hat = _apply_lowrank_correction(k, k_hat, correction_rank)
+            v_hat = _apply_lowrank_correction(v, v_hat, correction_rank)
         return k_hat.to(dtype), v_hat.to(dtype)
 
     # New-style DynamicCache
@@ -262,6 +285,17 @@ def main():
         help="Repetition penalty applied during quantized greedy decode (default: 1.3). "
              "Values > 1 discourage repeating already-generated tokens.",
     )
+    parser.add_argument(
+        "--raw", action="store_true",
+        help="Skip the chat template and tokenize the prompt as plain text. "
+             "Use for sentence-completion prompts; leave off for Q&A prompts.",
+    )
+    parser.add_argument(
+        "--correction-rank", type=int, default=0,
+        help="Apply rank-r low-rank error correction to the quantized KV cache "
+             "(0 = disabled, 4 = recommended). Reduces quantization error at the "
+             "cost of storing r*(T+d) extra floats per layer.",
+    )
     args = parser.parse_args()
 
     model, tok = load_model(args.model)
@@ -279,13 +313,17 @@ def main():
         sep("Interactive generation")
         print(f"  Model  : {args.model}")
         print(f"  Prompt : {args.prompt!r}")
-        print(f"  Mode   : {'chat template' if (hasattr(tok, 'apply_chat_template') and tok.chat_template) else 'raw'}\n")
-
-        # For chat/thinking models, apply the chat template so the model gets
-        # the proper BOS + system prompt structure.  Pass enable_thinking=False
-        # for Qwen3 models (suppresses the <think> block without /no_think hack).
+        # Determine prompt mode:
+        #   chat template  — model has a chat template (instruct/chat models)
+        #   qa-format      — base model (no chat template), auto-wrap as Q:/A:
+        #   raw            — user passed --raw, or sentence-completion style
         raw_prompt = args.prompt
-        if hasattr(tok, "apply_chat_template") and tok.chat_template:
+        has_template = hasattr(tok, "apply_chat_template") and bool(tok.chat_template)
+        use_template = has_template and not args.raw
+        use_qa_fmt   = not has_template and not args.raw
+
+        if use_template:
+            mode_label = "chat template"
             messages = [{"role": "user", "content": raw_prompt}]
             try:
                 formatted = tok.apply_chat_template(
@@ -297,8 +335,16 @@ def main():
                     messages, tokenize=False, add_generation_prompt=True,
                 )
             enc = tok(formatted, return_tensors="pt", add_special_tokens=False)
+        elif use_qa_fmt:
+            # Base model: format as "Q: ...\nA:" so the model completes the answer
+            mode_label = "Q/A format (base model)"
+            formatted = f"Q: {raw_prompt.rstrip('?').strip()}?\nA:"
+            enc = tok(formatted, return_tensors="pt")
         else:
+            mode_label = "raw"
             enc = tok(raw_prompt, return_tensors="pt")
+
+        print(f"  Mode   : {mode_label}\n")
         input_ids = enc["input_ids"]
         T_p = input_ids.shape[1]
 
@@ -309,10 +355,16 @@ def main():
         native_cache_orig = prefill_out.past_key_values
         first_logits = prefill_out.logits[:, -1, :]   # (1, vocab)
 
-        # Calibration pool from captured KV tensors
-        kvs_p = _kvs_from_cache(native_cache_orig)
-        all_k_p = torch.cat([kv[0].reshape(-1, T_p, head_dim) for kv in kvs_p], dim=0)
-        all_v_p = torch.cat([kv[1].reshape(-1, T_p, head_dim) for kv in kvs_p], dim=0)
+        # Calibration pool — use TEXTS corpus for better outlier-channel estimation.
+        # The prompt alone is too short (< 20 tokens) to reliably identify outliers.
+        cal_enc = tok(TEXTS, return_tensors="pt", padding=True,
+                      truncation=True, max_length=64, add_special_tokens=True)
+        with torch.no_grad():
+            cal_out = model(cal_enc["input_ids"], use_cache=True)
+        cal_kvs = _kvs_from_cache(cal_out.past_key_values)
+        cal_T   = cal_enc["input_ids"].shape[1]
+        all_k_p = torch.cat([kv[0].reshape(-1, cal_T, head_dim) for kv in cal_kvs], dim=0)
+        all_v_p = torch.cat([kv[1].reshape(-1, cal_T, head_dim) for kv in cal_kvs], dim=0)
 
         # Newline suppression (varies by tokenizer)
         newline_ids = tok.encode("\n", add_special_tokens=False)
@@ -342,7 +394,7 @@ def main():
             # _quantize_cache deep-copies native_cache and quantizes K,V in-place.
             # For hybrid models the Mamba/linear-attn state is preserved in the copy,
             # so the subsequent forward passes work without error.
-            past = _quantize_cache(native_cache_orig, kvc)
+            past = _quantize_cache(native_cache_orig, kvc, correction_rank=args.correction_rank)
 
             # Greedy decode: first token from prefill logits, rest from model.
             first_logits_m = first_logits.clone()

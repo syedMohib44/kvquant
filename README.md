@@ -170,6 +170,14 @@ python -m kvquant.demo_llm --prompt "Hi how are you?" --max-new-tokens 60 # Pure
 python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is AI?" # Hybrid model (Qwen3.5) — auto-detected, uses native cache
 python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "Once upon a time" # Recommended alternative models
 python -m kvquant.demo_llm --model microsoft/phi-2 --prompt "Explain transformers" # Recommended alternative models
+# Base model — auto Q/A format
+python -m kvquant.demo_llm --model distilgpt2 --prompt "What is the capital of France?" --max-new-tokens 20
+# Instruction model — chat template
+python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "What is the capital of France?" --max-new-tokens 20
+# Hybrid thinking model — chat template + enable_thinking=False
+python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is the capital of France?" --max-new-tokens 20
+# Rank 4 will get us 11% MSE reduction at only 7.4% extra storage
+python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "What is the capital of France?" --max-new-tokens 20 --correction-rank 4
 #########################
 
 python -m kvquant.demo_extensions   # all 4 extensions on real data
