@@ -229,15 +229,11 @@ def _apply_repetition_penalty(logits, generated_ids, penalty):
 
 
 def _clean(text):
-    """
-    Strip Qwen3.5 <think>…</think> reasoning blocks and collapse whitespace.
-    For unclosed <think> (model hit token limit mid-think), keep the content
-    but annotate it so the user knows it's incomplete reasoning.
-    """
-    # Closed think block → drop entirely (keep only the response after)
+    """Strip <think>…</think> reasoning blocks (closed or unclosed) and collapse whitespace."""
+    # Closed think block → drop entirely
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # Unclosed think block → strip the tag, keep the text, mark as partial
-    text = re.sub(r"<think>", "[thinking] ", text)
+    # Unclosed think block (hit token limit mid-think) → drop tag and all content after
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -282,15 +278,27 @@ def main():
     if args.prompt:
         sep("Interactive generation")
         print(f"  Model  : {args.model}")
-        print(f"  Prompt : {args.prompt!r}\n")
+        print(f"  Prompt : {args.prompt!r}")
+        print(f"  Mode   : {'chat template' if (hasattr(tok, 'apply_chat_template') and tok.chat_template) else 'raw'}\n")
 
-        # Qwen3 thinking models honour /no_think to skip the <think> block.
-        # Append it automatically so both unquant and quantized paths skip reasoning.
-        prompt_text = args.prompt
-        if "qwen3" in args.model.lower() or "qwen-3" in args.model.lower():
-            prompt_text = prompt_text.rstrip() + " /no_think"
-
-        enc = tok(prompt_text, return_tensors="pt")
+        # For chat/thinking models, apply the chat template so the model gets
+        # the proper BOS + system prompt structure.  Pass enable_thinking=False
+        # for Qwen3 models (suppresses the <think> block without /no_think hack).
+        raw_prompt = args.prompt
+        if hasattr(tok, "apply_chat_template") and tok.chat_template:
+            messages = [{"role": "user", "content": raw_prompt}]
+            try:
+                formatted = tok.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                formatted = tok.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            enc = tok(formatted, return_tensors="pt", add_special_tokens=False)
+        else:
+            enc = tok(raw_prompt, return_tensors="pt")
         input_ids = enc["input_ids"]
         T_p = input_ids.shape[1]
 
@@ -318,7 +326,8 @@ def main():
                 do_sample=False, bad_words_ids=bad_words,
                 repetition_penalty=args.repetition_penalty,
             )
-        print(f"  Unquant: {_clean(tok.decode(true_ids[0], skip_special_tokens=True))}\n")
+        gen_only = true_ids[0, T_p:]
+        print(f"  Unquant: {_clean(tok.decode(gen_only, skip_special_tokens=True))}\n")
 
         # Quantized generation — one pass per bit-width
         for bits in BITS_LIST:
@@ -356,9 +365,8 @@ def main():
                 if next_tok.item() == tok.eos_token_id:
                     break
 
-            gen_ids  = torch.cat(generated, dim=1)
-            full_ids = torch.cat([input_ids, gen_ids], dim=1)
-            print(f"  {bits}-bit  : {_clean(tok.decode(full_ids[0], skip_special_tokens=True))}")
+            gen_ids = torch.cat(generated, dim=1)
+            print(f"  {bits}-bit  : {_clean(tok.decode(gen_ids[0], skip_special_tokens=True))}")
 
         sep()
         return
