@@ -281,9 +281,10 @@ def main():
         help="Tokens to generate in --prompt mode (default: 40).",
     )
     parser.add_argument(
-        "--repetition-penalty", type=float, default=1.3,
-        help="Repetition penalty applied during quantized greedy decode (default: 1.3). "
-             "Values > 1 discourage repeating already-generated tokens.",
+        "--repetition-penalty", type=float, default=1.5,
+        help="Repetition penalty applied during quantized greedy decode (default: 1.5). "
+             "Values > 1 discourage repeating already-generated tokens. "
+             "Increase to 2.0+ if you see repetition loops at low bit-widths.",
     )
     parser.add_argument(
         "--raw", action="store_true",

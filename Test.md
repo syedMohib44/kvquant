@@ -66,3 +66,19 @@ The attention mask is not set and cannot be inferred from input because pad toke
   3-bit  : The answer to for this question: "France" . Capital of your country as ? state.
   4-bit  : The capital of France is is is: it Capital of France is is is Paris.
 ----------------------------------------------------------------
+
+
+#################################################################################
+python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "How to bake pizza?" --max-new-tokens 80 --correction-rank 4
+
+---- Interactive generation ------------------------------------
+  Model  : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Prompt : 'How to bake pizza?'
+  Mode   : chat template
+
+  Unquant: Sure, here's a step-by-step guide on how to make homemade pizzas: 1. Preheat your oven and prepare the dough according to package instructions (usually around room temperature). You can use store bought or homemade crust recipes depending upon what you have available in your kitchen. If using premade breadcrumbs
+
+  2-bit  : Sure, here's a step-by-step guide on how you can make delicious and easy homemade pizzas using the following ingredients: 1. Preheat your oven at around temperature of about (205°F) or higher for best results! You want it hot enough that when you touch it with bare hands without gloves - they
+  3-bit  : Sure, here's a step-by-step guide on how to make homemade breaded and fried chicken wings: 1. Preheat your oven at the highest temperature setting (usually around or above) for about an hour before starting with this recipe so that you can get it ready in time when making these delicious crispy treats!
+  4-bit  : Sure, here's a step-by-step guide on how you can make homemade crust for your favorite Margherita or pepperoni pizzas: 1. Preheat the oven at its highest temperature (usually around about375°F/190C). This will help ensure that both sides of each slice are golden brown and
+----------------------------------------------------------------
