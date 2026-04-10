@@ -164,9 +164,8 @@ class OutlierKVQuant(nn.Module):
         Returns a Float tensor of shape q.shape.
         """
         self._check_calibrated()
-        N = 1
-        for s in q.shape[:-1]:
-            N *= s
+        import math
+        N = math.prod(q.shape[:-1])
 
         x_out = self._outlier_q.dequantize(q.outlier_q).reshape(N, self.n_outlier)
         x_reg = self._regular_q.dequantize(q.regular_q).reshape(N, self.n_regular)

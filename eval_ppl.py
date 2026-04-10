@@ -177,10 +177,16 @@ FALLBACK_TEXTS = [
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-def load_chunks(tokenizer, context_len: int, target_len: int, max_chunks: int):
+def load_chunks(
+    tokenizer, context_len: int, target_len: int,
+    max_chunks: int, skip: int = 0,
+):
     """
     Return a list of (context_ids, target_ids) tensors from WikiText-2 or
     the built-in fallback corpus.
+
+    skip: number of chunks to skip from the start (used to separate
+          calibration data from evaluation data).
     """
     try:
         from datasets import load_dataset
@@ -188,11 +194,11 @@ def load_chunks(tokenizer, context_len: int, target_len: int, max_chunks: int):
         text = "\n\n".join(t for t in dataset["text"] if len(t.strip()) > 100)
         print("  Dataset : WikiText-2 test set (via `datasets`)")
     except Exception:
-        # Tile the corpus so we have enough tokens for max_chunks.
+        # Tile the corpus so we have enough tokens for skip + max_chunks.
         # English averages ~5 chars/token; add +2 repeats as safety margin.
         chunk_tokens = context_len + target_len
         base = " ".join(FALLBACK_TEXTS)
-        chars_needed = (max_chunks + 2) * chunk_tokens * 5
+        chars_needed = (skip + max_chunks + 2) * chunk_tokens * 5
         repeats = math.ceil(chars_needed / max(len(base), 1)) + 1
         text = (" " + base) * max(repeats, 2)
         print("  Dataset : built-in fallback corpus  "
@@ -207,7 +213,8 @@ def load_chunks(tokenizer, context_len: int, target_len: int, max_chunks: int):
     _hf_log.setLevel(_prev)
     chunk = context_len + target_len
     chunks = []
-    for i in range(0, len(tokens) - chunk, chunk):
+    start_tok = skip * chunk          # token offset corresponding to `skip` chunks
+    for i in range(start_tok, len(tokens) - chunk, chunk):
         ctx = tokens[i: i + context_len].unsqueeze(0)
         tgt = tokens[i + context_len: i + chunk].unsqueeze(0)
         chunks.append((ctx, tgt))
@@ -220,7 +227,9 @@ def load_chunks(tokenizer, context_len: int, target_len: int, max_chunks: int):
 # PPL computation
 # ---------------------------------------------------------------------------
 
-def compute_ppl(model, chunks, kvc=None, correction_rank: int = 0) -> float:
+def compute_ppl(
+    model, chunks, kvc=None, correction_rank: int = 0, label: str = ""
+) -> float:
     """
     Compute perplexity under (optionally quantized) KV cache.
 
@@ -228,8 +237,13 @@ def compute_ppl(model, chunks, kvc=None, correction_rank: int = 0) -> float:
     """
     total_nll = 0.0
     total_tok = 0
+    n = len(chunks)
 
-    for ctx, tgt in chunks:
+    import sys
+    tty = sys.stdout.isatty()
+    for i, (ctx, tgt) in enumerate(chunks):
+        if tty:
+            print(f"\r  {label or 'eval'} [{i+1}/{n}]", end="", flush=True)
         # Prefill: full-precision KV cache from context tokens
         with torch.no_grad():
             prefill = model(ctx, use_cache=True)
@@ -252,6 +266,8 @@ def compute_ppl(model, chunks, kvc=None, correction_rank: int = 0) -> float:
         total_nll += nll.sum().item()
         total_tok  += tgt.numel()
 
+    if tty:
+        print(f"\r{' ' * 40}\r", end="", flush=True)  # clear progress line
     return math.exp(total_nll / max(total_tok, 1))
 
 
@@ -274,9 +290,13 @@ def main():
     parser.add_argument("--correction-rank", type=int, default=0,
                         help="Low-rank correction rank applied to quantized cache. "
                              "0 = disabled, 4 = recommended  (default: 0)")
+    parser.add_argument("--half", action="store_true",
+                        help="Load model in float16 (faster, less memory for large models)")
     args = parser.parse_args()
 
     model, tok = load_model(args.model)
+    if args.half:
+        model = model.half()
     _, _, _, head_dim = get_model_dims(model)
     n_outlier = max(4, head_dim // 4)
 
@@ -290,8 +310,10 @@ def main():
     chunks = load_chunks(tok, args.context_len, args.target_len, args.max_chunks)
     print(f"  Loaded  : {len(chunks)} chunks\n")
 
-    # Calibration pool from the first 8 context chunks
-    cal_ids = torch.cat([c for c, _ in chunks[:8]], dim=0)
+    # Calibration pool — skip past the eval window so no token overlap.
+    cal_chunks = load_chunks(tok, args.context_len, args.target_len,
+                             max_chunks=8, skip=args.max_chunks)
+    cal_ids = torch.cat([c for c, _ in cal_chunks], dim=0)
     with torch.no_grad():
         cal_out = model(cal_ids, use_cache=True)
     cal_kvs = _kvs_from_cache(cal_out.past_key_values)
@@ -305,7 +327,7 @@ def main():
     print(f"  {'Configuration':<{W}} {'PPL':>8}  {'delta PPL':>10}")
     sep()
 
-    ppl_fp32 = compute_ppl(model, chunks)
+    ppl_fp32 = compute_ppl(model, chunks, label="fp32")
     print(f"  {'Float32 (unquant)':<{W}} {ppl_fp32:>8.2f}  {'—':>10}")
 
     for bits in BITS_LIST:
@@ -318,7 +340,8 @@ def main():
         kvc.calibrate(all_k, all_v)
 
         # Without correction
-        ppl_q = compute_ppl(model, chunks, kvc=kvc, correction_rank=0)
+        ppl_q = compute_ppl(model, chunks, kvc=kvc, correction_rank=0,
+                            label=f"{bits}-bit")
         d = ppl_q - ppl_fp32
         print(f"  {f'{bits}-bit  (avg {kvc.avg_bits:.2f} bpw)':<{W}} "
               f"{ppl_q:>8.2f}  {d:>+10.2f}")
@@ -326,7 +349,8 @@ def main():
         # With low-rank correction (if requested)
         if args.correction_rank > 0:
             ppl_c = compute_ppl(model, chunks, kvc=kvc,
-                                correction_rank=args.correction_rank)
+                                correction_rank=args.correction_rank,
+                                label=f"{bits}-bit+rank-{args.correction_rank}")
             d_c = ppl_c - ppl_fp32
             label = f"{bits}-bit + rank-{args.correction_rank} correction"
             print(f"  {label:<{W}} {ppl_c:>8.2f}  {d_c:>+10.2f}")

@@ -147,6 +147,29 @@ def _apply_lowrank_correction(x: torch.Tensor, x_hat: torch.Tensor, rank: int) -
     return (x_hat.float() + correction.reshape(orig_shape)).to(x_hat.dtype)
 
 
+def _crop_cache(native_cache, seq_len: int):
+    """
+    Return a deep copy of native_cache with KV tensors truncated to seq_len
+    positions along the sequence dimension.  Non-KV state (Mamba, linear-attn)
+    is preserved unchanged.  Used to obtain the T_p-1 cache needed to compute
+    an accurate quantized logit for the first generated token.
+    """
+    cache = copy.deepcopy(native_cache)
+    if hasattr(cache, "layers"):          # new-style DynamicCache
+        for layer in cache.layers:
+            k = getattr(layer, "keys", None)
+            if isinstance(k, torch.Tensor) and k.shape[-2] > seq_len:
+                layer.keys   = k[...,  :seq_len, :]
+                layer.values = layer.values[..., :seq_len, :]
+    elif hasattr(cache, "key_cache"):     # old-style DynamicCache / HybridCache
+        for i in range(len(cache.key_cache)):
+            k = cache.key_cache[i]
+            if isinstance(k, torch.Tensor) and k.shape[-2] > seq_len:
+                cache.key_cache[i]   = k[...,  :seq_len, :]
+                cache.value_cache[i] = cache.value_cache[i][..., :seq_len, :]
+    return cache
+
+
 def _quantize_cache(native_cache, kvc, correction_rank: int = 0):
     """
     Return a COPY of native_cache with K, V quantized in transformer-attention
@@ -354,7 +377,6 @@ def main():
         with torch.no_grad():
             prefill_out = model(input_ids, use_cache=True)
         native_cache_orig = prefill_out.past_key_values
-        first_logits = prefill_out.logits[:, -1, :]   # (1, vocab)
 
         # Calibration pool — use TEXTS corpus for better outlier-channel estimation.
         # The prompt alone is too short (< 20 tokens) to reliably identify outliers.
@@ -372,13 +394,27 @@ def main():
         bad_words   = [[t] for t in newline_ids] if newline_ids else None
         newline_id  = newline_ids[0] if newline_ids else -1
 
+        attn_mask = torch.ones_like(input_ids)
+
+        # Suppress HuggingFace warnings that fire on every greedy generate() call
+        # (attention_mask inference warning, temperature/top_p/top_k validity warning).
+        import logging as _logging
+        _hf = _logging.getLogger("transformers")
+        _prev_hf = _hf.level
+        _hf.setLevel(_logging.ERROR)
+
         # Unquantized baseline
         with torch.no_grad():
             true_ids = model.generate(
-                input_ids, max_new_tokens=args.max_new_tokens,
+                input_ids,
+                attention_mask=attn_mask,
+                pad_token_id=tok.eos_token_id,
+                max_new_tokens=args.max_new_tokens,
                 do_sample=False, bad_words_ids=bad_words,
                 repetition_penalty=args.repetition_penalty,
             )
+
+        _hf.setLevel(_prev_hf)
         gen_only = true_ids[0, T_p:]
         print(f"  Unquant: {_clean(tok.decode(gen_only, skip_special_tokens=True))}\n")
 
@@ -397,8 +433,15 @@ def main():
             # so the subsequent forward passes work without error.
             past = _quantize_cache(native_cache_orig, kvc, correction_rank=args.correction_rank)
 
-            # Greedy decode: first token from prefill logits, rest from model.
-            first_logits_m = first_logits.clone()
+            # Greedy decode: get the first-token logit from the QUANTIZED cache
+            # by cropping to T_p-1 positions and running the last prompt token
+            # through. Using the unquantized prefill logit here would make all
+            # bit-widths produce the same first token — hiding the real degradation.
+            past_crop = _crop_cache(past, T_p - 1)
+            with torch.no_grad():
+                q1_out = model(input_ids[:, -1:], past_key_values=past_crop,
+                               use_cache=False)
+            first_logits_m = q1_out.logits[:, -1, :].clone()
             if newline_id >= 0:
                 first_logits_m[:, newline_id] = float("-inf")
             generated = [first_logits_m.argmax(-1, keepdim=True)]

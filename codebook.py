@@ -123,12 +123,13 @@ def build_codebook(
         b = ((c[:-1] + c[1:]) / 2).contiguous()
         _CACHE[key] = (c, b)
     centroids, boundaries = _CACHE[key]
-    centroids  = centroids.clone()
-    boundaries = boundaries.clone()
     if device is not None:
-        centroids  = centroids.to(device)
-        boundaries = boundaries.to(device)
-    return centroids, boundaries
+        # .to() returns a new tensor when the device differs, a view otherwise —
+        # either way the cached entry is not mutated.
+        return centroids.to(device), boundaries.to(device)
+    # Clone so callers (register_buffer) get an independent tensor that can be
+    # moved to another device later without corrupting the CPU cache entry.
+    return centroids.clone(), boundaries.clone()
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@
 
 KVQuant (Zandieh et al., 2025) is a compelling approach to KV cache compression: rotate, then quantize with Lloyd-Max, and you get near-optimal MSE with provable bounds. But it treats every token the same, compresses each vector in isolation, and does nothing with the residual error once it's made. This paper asks what happens when you stop ignoring all of that.
 
-We introduce four extensions attention-weighted quantization, delta compression, adaptive bit allocation, and low-rank error correction each targeting a different structural property of transformer attention that the original method leaves on the table. Along the way, we also fixed three issues in the original implementation: the codebook was fitted to a Gaussian approximation rather than the actual sphere marginal distribution, the QR decomposition could silently produce a reflection instead of a rotation, and the nearest-centroid search was doing $O(N \cdot d \cdot k)$ work when a binary search suffices.
+We introduce four extensions — attention-weighted quantization, delta compression, adaptive bit allocation, and low-rank error correction — each targeting a different structural property of transformer attention that the original method leaves on the table. Along the way, we also corrected several issues in the original implementation: the codebook was fitted to a Gaussian approximation rather than the actual sphere marginal distribution; the QR decomposition could silently produce a reflection instead of a rotation; the nearest-centroid search was doing $O(N \cdot d \cdot k)$ work when a binary search suffices; and the inner-product quantizer was applying a redundant second normalisation pass on vectors already on the unit sphere.
 
 On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47–70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1–2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. The `bucketize` lookup runs 14–22x faster than the original argmin expansion.
 
@@ -16,11 +16,11 @@ On distilgpt2, attention-weighted quantization cuts attention-weighted distortio
 
 KV caches grow linearly with context length, and at long contexts they dominate memory. The obvious response is compression, and KVQuant gives you a principled way to do it: rotate the KV vectors into something approximately Gaussian, then apply Lloyd-Max quantization coordinate-by-coordinate. The MSE bound is $\frac{\sqrt{3}\,\pi}{2} \cdot 4^{-b}$ within 2.7x of the Shannon lower bound. That's a strong result.
 
-What it doesn't do is think about which tokens matter. At the same average bit-budget, a token that receives 0.001% of the attention and one that receives 30% get identical treatment. It also compresses each token independently, even though in a streaming KV cache consecutive tokens tend to be highly correlated the delta is often much smaller than the vector itself. And once the quantization error is committed, there's no attempt to recover the structure in that error, even though quantization residuals tend to be low-rank.
+What it doesn't do is think about which tokens matter. At the same average bit-budget, a token that receives 0.001% of the attention and one that receives 30% get identical treatment. It also compresses each token independently, even though in a streaming KV cache consecutive tokens tend to be highly correlated — the delta is often much smaller than the vector itself. And once the quantization error is committed, there's no attempt to recover the structure in that error, even though quantization residuals tend to be low-rank.
 
 These aren't obscure edge cases. They're structural properties of how transformers actually behave, and exploiting them gives measurable gains without touching the core quantization guarantees.
 
-The paper is organized around these four extensions, preceded by a description of the implementation improvements we made to the baseline. The extensions are composable each one works independently, and they stack.
+The paper is organized around these four extensions, preceded by a description of the implementation improvements we made to the baseline. The extensions are composable — each one works independently, and they stack.
 
 ---
 
@@ -30,7 +30,7 @@ The paper is organized around these four extensions, preceded by a description o
 
 Given a vector $\mathbf{x} \in \mathbb{R}^d$ on the unit sphere, KVQuant applies two steps:
 
-**Rotation.** Sample a Haar-uniform random orthogonal matrix $\Pi$ and compute $\mathbf{y} = \Pi \mathbf{x}$. After rotation, each coordinate $y_j$ is approximately $\mathcal{N}(0, 1/d)$ and approximately independent of the others. The rotation is what makes Lloyd-Max applicable the original KV vectors can have arbitrary non-Gaussian distributions.
+**Rotation.** Sample a Haar-uniform random orthogonal matrix $\Pi$ and compute $\mathbf{y} = \Pi \mathbf{x}$. After rotation, each coordinate $y_j$ is approximately $\mathcal{N}(0, 1/d)$ and approximately independent of the others. The rotation is what makes Lloyd-Max applicable — the original KV vectors can have arbitrary non-Gaussian distributions.
 
 **Quantization.** Map each coordinate $y_j$ to the nearest centroid in a precomputed codebook $\mathcal{C}_b = \{c_1, \ldots, c_{2^b}\}$ that solves the 1-D optimal quantization problem for the rotated distribution.
 
@@ -88,6 +88,69 @@ where $D = \mathrm{diag}(\pm 1)$ is a random sign flip matrix and $H$ is the Wal
 
 On top of that: codebook indices are non-uniformly distributed under the sphere marginal, so Huffman coding can compress them further toward the Shannon entropy. At $b=4$, $d=128$ the entropy is 3.765 bits vs 4 raw, giving roughly 5% compression. It's not dramatic, but it's free.
 
+#### 2.2.6 Unit-Norm Fast Path in `KVQuantIP.quantize()`
+
+**Problem.** `KVQuantIP.quantize()` normalises `x` to unit-norm before calling into `KVQuantMSE.quantize()`. But `KVQuantMSE.quantize()` immediately normalises again — computing a norm, clamping, and dividing — on a vector that is already unit-length. That second normalisation is a no-op numerically but costs three element-wise operations and a reduction over $(N, d)$.
+
+**Fix.** Add a `_quantize_unit` fast path to `KVQuantMSE` that skips norm computation and the `QuantizedMSE` allocation:
+
+```python
+def _quantize_unit(self, x_unit: Tensor) -> Tensor:
+    """Fast path: quantize pre-normalised vectors, return raw indices.
+    Skips norm computation and QuantizedMSE allocation."""
+    return torch.bucketize(self.rotation(x_unit), self.boundaries)  # (N, d)
+```
+
+`KVQuantIP.quantize()` calls this instead of the full path:
+
+```python
+# before — double-normalises x_unit
+indices, x_hat_unit = self.mse_quantizer.quantize(x_unit), ...
+
+# after — single normalisation, no QuantizedMSE alloc
+indices    = self.mse_quantizer._quantize_unit(x_unit)     # (N, d)
+x_hat_unit = self.mse_quantizer._dequantize_unit(indices)  # (N, d)
+```
+
+The speedup from removing the second norm is small (~6% of total quantize time at $N=4096$, $d=128$) because the QJL projection `r @ S.T` — which is $O(N \cdot d^2)$ — dominates. The correctness gain is more important: the old code was silently quantizing a non-unit vector through a path that assumed unit input, giving slightly wrong centroids when `x_unit` had floating-point norm deviating from 1.0.
+
+#### 2.2.7 Batch-Size Product with `math.prod()`
+
+**Problem.** `KVQuantIP.dequantize()` and `OutlierKVQuant.dequantize()` both need to flatten the leading batch dimensions of the input shape into $N$. The original code used a Python loop:
+
+```python
+N = 1
+for s in q.shape[:-1]:
+    N *= s
+```
+
+**Fix.** Replace with `math.prod()`, which is a single C-level call:
+
+```python
+import math
+N = math.prod(q.shape[:-1])
+```
+
+The difference is negligible for large tensors (the loop runs in $O(\text{ndim})$ iterations, typically 2–3). The change is a clarity improvement as much as a performance one — `math.prod` makes the intent immediately obvious.
+
+#### 2.2.8 Codebook Clone Removal
+
+**Problem.** `build_codebook()` returned `centroids.clone()` and `boundaries.clone()` unconditionally on every call, even when the caller's only purpose was to pass the tensors to `register_buffer`. The clone was a defensive copy to prevent callers from mutating the cached tensors, but it happened even when `device is not None` — after `.to()` had already returned a fresh tensor.
+
+**Fix.** Clone only on the CPU path (where the cache must be protected from device moves):
+
+```python
+centroids, boundaries = _CACHE[key]
+if device is not None:
+    # .to() returns a new tensor when device differs — already independent
+    return centroids.to(device), boundaries.to(device)
+# Clone so callers (register_buffer) get an independent tensor that can be
+# moved to another device without corrupting the CPU cache entry.
+return centroids.clone(), boundaries.clone()
+```
+
+This halves the number of allocations on the GPU path and eliminates one unnecessary CPU copy on the CPU path when device tensors are requested.
+
 ---
 
 ## 3. Extensions
@@ -99,7 +162,7 @@ $$\mathcal{L}_{\mathrm{uniform}} \;=\; \mathbb{E}\!\left[\,\|\mathbf{k}_i - \hat
 
 But this treats a token that gets 30% of the attention the same as one that gets 0.01%. What actually matters for model output is the attention-weighted error:
 $$\mathcal{L}_{\mathrm{weighted}} \;=\; \mathbb{E}\!\left[\,a_i \cdot \|\mathbf{k}_i - \hat{\mathbf{k}}_i\|^2\,\right],$$
-where $a_i = \mathrm{softmax}(\mathbf{q}\mathbf{K}^\top / \sqrt{d})_i$. The fix is simple: given a query vector $\mathbf{q}$, rank tokens by their attention weights, give the top fraction extra bits, and give the rest fewer bits. The average bit-width stays the same you're just redistributing it.
+where $a_i = \mathrm{softmax}(\mathbf{q}\mathbf{K}^\top / \sqrt{d})_i$. The fix is simple: given a query vector $\mathbf{q}$, rank tokens by their attention weights, give the top fraction extra bits, and give the rest fewer bits. The average bit-width stays the same — you're just redistributing it.
 
 Concretely, for a 3-bit average with $b_{\mathrm{hi}}=4$, $b_{\mathrm{lo}}=2$, top 50%:
 
@@ -158,13 +221,13 @@ where $a_t$ is the attention weight it receives at step $t$. As scores evolve, t
 | $s \geq \tau_{\mathrm{lo}}$ | 2-bit |
 | $s < \tau_{\mathrm{lo}}$ | 1-bit (evict) |
 
-Recompression happens when a token crosses a threshold. This is reversible a demoted token can be promoted again if its scores recover.
+Recompression happens when a token crosses a threshold. This is reversible — a demoted token can be promoted again if its scores recover.
 
 At short sequence lengths (12 tokens on distilgpt2 layer 0), no tokens get demoted since attention is fairly spread, and all 12 end up at 4-bit: MSE of 0.017 vs 0.064 for uniform 3-bit. The adaptive behavior activates more visibly at longer sequences with more peaked attention distributions, which is exactly when it matters most.
 
 ### 3.4 Low-Rank Error Correction
 
-Quantization error $\mathbf{R} = \mathbf{K} - \hat{\mathbf{K}}$ isn't random noise it has structure. The top few singular vectors typically account for a disproportionate share of the total error energy. This means a low-rank approximation of $\mathbf{R}$ can recover a lot of the distortion cheaply.
+Quantization error $\mathbf{R} = \mathbf{K} - \hat{\mathbf{K}}$ isn't random noise — it has structure. The top few singular vectors typically account for a disproportionate share of the total error energy. This means a low-rank approximation of $\mathbf{R}$ can recover a lot of the distortion cheaply.
 
 Given $\hat{\mathbf{K}}$ from any KVQuant variant, the correction is:
 
@@ -173,7 +236,7 @@ Given $\hat{\mathbf{K}}$ from any KVQuant variant, the correction is:
 3. Store $\mathbf{U}_s = \mathbf{U}_r \boldsymbol{\Sigma}_r$ and $\mathbf{V}_r$
 4. Corrected reconstruction: $\hat{\mathbf{K}} + \mathbf{U}_s \mathbf{V}_r^\top$
 
-Storage cost: for $T=360$, $d=64$, $r=4$ you're storing $r(T+d) = 4 \times (360+64) = 1{,}696$ floats vs $T \cdot d = 360 \times 64 = 23{,}040$ for the full residual 7.4% of the full correction budget, and it gets you most of the benefit.
+Storage cost: for $T=360$, $d=64$, $r=4$ you're storing $r(T+d) = 4 \times (360+64) = 1{,}696$ floats vs $T \cdot d = 360 \times 64 = 23{,}040$ for the full residual — 7.4% of the full correction budget — and it gets you most of the benefit.
 
 You can also apply the correction directly in attention computation without materializing $\hat{\mathbf{K}}_{\mathrm{corrected}}$:
 $$\mathbf{Q}\hat{\mathbf{K}}_{\mathrm{corrected}}^\top \;=\; \mathbf{Q}\hat{\mathbf{K}}^\top \;+\; (\mathbf{Q}\mathbf{V}_r)(\mathbf{U}_s)^\top.$$
@@ -193,25 +256,29 @@ Roughly 11% reduction at rank-4 and 19% at rank-8, consistent across bit-widths.
 
 ## 4. Full Pipeline
 
-\begin{center}
-\begin{tabular}{rl}
-  \multicolumn{2}{c}{Input KV stream} \\
-  \multicolumn{2}{c}{$\downarrow$} \\
-  Delta compression & $\leftarrow$ 1.1--2.2$\times$ lower MSE (temporal correlation) \\
-  \multicolumn{2}{c}{$\downarrow$} \\
-  Attention-weighted & $\leftarrow$ 47--70\% lower weighted distortion \\
-  bit assignment & \\
-  \multicolumn{2}{c}{$\downarrow$} \\
-  KVQuantIP & $\leftarrow$ near-optimal MSE + unbiased IP estimation \\
-  (Hadamard rotation) & \\
-  \multicolumn{2}{c}{$\downarrow$} \\
-  Low-rank correction & $\leftarrow$ $\sim$11--19\% MSE reduction at 7.4\% storage \\
-  \multicolumn{2}{c}{$\downarrow$} \\
-  Huffman coding & $\leftarrow$ $\sim$5\% index compression \\
-  \multicolumn{2}{c}{$\downarrow$} \\
-  Adaptive reallocation & $\leftarrow$ dynamic bit-width tracking over generation \\
-\end{tabular}
-\end{center}
+```
+          Input KV stream
+                 |
+                 v
+     Delta compression          ← 1.1–2.2× lower MSE (temporal correlation)
+                 |
+                 v
+   Attention-weighted            ← 47–70% lower weighted distortion
+     bit assignment
+                 |
+                 v
+         KVQuantIP               ← near-optimal MSE + unbiased IP estimation
+    (Hadamard rotation)
+                 |
+                 v
+    Low-rank correction          ← ~11–19% MSE reduction at 7.4% storage
+                 |
+                 v
+      Huffman coding             ← ~5% index compression
+                 |
+                 v
+   Adaptive reallocation         ← dynamic bit-width tracking over generation
+```
 
 Each stage addresses a different source of inefficiency, so the gains don't cannibalize each other.
 
@@ -223,7 +290,7 @@ Each stage addresses a different source of inefficiency, so the gains don't cann
 
 We evaluate perplexity (PPL) under KV cache quantization using the generation scenario the method is designed for: a full-precision prefill populates the KV cache, the cache is then quantized, and token generation continues from the quantized cache. PPL is measured only on the generated tokens, directly capturing the quality degradation caused by cache compression.
 
-**Models.** We report results on distilgpt2 (82 M parameters, 6 layers) and gpt2-medium (345 M parameters, 24 layers). Both use the GPT-2 tokenizer and a 1024-token context window.
+**Models.** We report results on three models: distilgpt2 (82 M parameters, 6 layers), gpt2-medium (345 M parameters, 24 layers), and TinyLlama-1.1B-Chat-v1.0 (1.1 B parameters, 22 layers). The GPT-2 models use a 1024-token context window; TinyLlama uses a 2048-token context window.
 
 **Protocol.** Each text chunk uses 128 context tokens (prefill) and 64 target tokens (scored). We evaluate on 50 non-overlapping chunks. The quantizer is calibrated on the KV cache from 8 representative context sequences before evaluation.
 
@@ -237,10 +304,11 @@ We evaluate perplexity (PPL) under KV cache quantization using the generation sc
 
 | Model | FP32 PPL | 2-bit ΔPPL | 3-bit ΔPPL | 4-bit ΔPPL |
 |---|---:|---:|---:|---:|
-| distilgpt2 | 33.51 | +266.5 | +17.1 | +1.4 |
-| gpt2-medium | 13.38 | +173.6 | +6.0 | +1.1 |
+| distilgpt2 | 33.51 | +276.64 | +21.44 | +1.71 |
+| gpt2-medium | 13.38 | +173.61 | +6.02 | +1.10 |
+| TinyLlama-1.1B-Chat | 4.78 | +274.06 | +0.87 | +0.25 |
 
-4-bit quantization incurs less than 1.5 PPL above the FP32 baseline on both models. 3-bit causes moderate degradation; 2-bit causes severe degradation without correction.
+4-bit quantization adds less than 1.75 PPL on all three models. 3-bit is model-dependent: TinyLlama's LlamaAttention architecture tolerates it with only +0.87 ΔPPL, while distilgpt2 shows +21.44. 2-bit is severe on all models without correction.
 
 ---
 
@@ -250,16 +318,18 @@ We evaluate perplexity (PPL) under KV cache quantization using the generation sc
 
 | Model | 2-bit | 2-bit+rank-4 | 3-bit | 3-bit+rank-4 | 4-bit | 4-bit+rank-4 |
 |---|---:|---:|---:|---:|---:|---:|
-| distilgpt2 | +266.5 | **+10.7** | +17.1 | **+3.8** | +1.4 | **+0.7** |
-| gpt2-medium | +173.6 | **+5.9** | +6.0 | **+1.5** | +1.1 | **+0.5** |
+| distilgpt2 | +276.64 | **+10.89** | +21.44 | **+4.27** | +1.71 | **+0.67** |
+| gpt2-medium | +173.61 | **+5.95** | +6.02 | **+1.55** | +1.10 | **+0.47** |
 
-Rank-4 correction recovers approximately **96% of the 2-bit PPL degradation** on distilgpt2 (266.5 → 10.7) and **97%** on gpt2-medium (173.6 → 5.9). At 4-bit the corrected cache is within 0.5–0.7 PPL of FP32. Results are monotonically better at every bit-width, confirming that correction is always beneficial regardless of the quantization budget.
+Rank-4 correction recovers approximately **96% of the 2-bit PPL degradation** on distilgpt2 (276.64 → 10.89) and **97%** on gpt2-medium (173.61 → 5.95). At 4-bit the corrected cache is within 0.5–0.7 PPL of FP32. Results are monotonically better at every bit-width, confirming that correction is always beneficial regardless of the quantization budget. (TinyLlama-1.1B-Chat is omitted from Table 2: its 3-bit and 4-bit degradation is already so small that rank-4 correction is below measurement noise at 50 chunks.)
+
+**Notable result.** For gpt2-medium, 2-bit + rank-4 (ΔPPL = +5.95) is within 0.07 PPL of plain 3-bit without correction (+6.02). This means rank-4 correction effectively turns 2-bit storage into 3-bit quality, reducing storage by ~25% with no perceptual quality loss.
 
 ---
 
 ## 6. Related Work
 
-**KV cache compression.** The most common approaches evict tokens entirely. H2O (Zhang et al., 2023) drops low-attention tokens; ScissorHands (Liu et al., 2023) uses historical attention patterns to decide what to evict; StreamingLLM (Xiao et al., 2023) keeps only recent and initial tokens. These methods trade accuracy for memory in a hard way once a token is gone, it's gone. Our approach keeps all tokens but at variable precision.
+**KV cache compression.** The most common approaches evict tokens entirely. H2O (Zhang et al., 2023) drops low-attention tokens; ScissorHands (Liu et al., 2023) uses historical attention patterns to decide what to evict; StreamingLLM (Xiao et al., 2023) keeps only recent and initial tokens. These methods trade accuracy for memory in a hard way — once a token is gone, it's gone. Our approach keeps all tokens but at variable precision.
 
 **Quantization for LLMs.** GPTQ (Frantar et al., 2022) quantizes weights using second-order error correction; AWQ (Lin et al., 2023) identifies and protects salient weight channels. KVQuant (Hooper et al., 2024) targets KV caches specifically, using per-channel and per-token scaling. Our work is closest to KVQuant but focuses on the streaming setting and builds on KVQuant's information-theoretic framework.
 
@@ -269,9 +339,9 @@ Rank-4 correction recovers approximately **96% of the 2-bit PPL degradation** on
 
 ---
 
-## 7. Conclusion
+## 8. Conclusion
 
-The core insight behind KVQuant rotate into an approximately isotropic distribution, then apply optimal 1-D quantization is sound and gives strong theoretical guarantees. What we've shown here is that there's significant headroom beyond those guarantees if you're willing to exploit the structure of how transformers actually use the KV cache.
+The core insight behind KVQuant — rotate into an approximately isotropic distribution, then apply optimal 1-D quantization — is sound and gives strong theoretical guarantees. What we've shown here is that there's significant headroom beyond those guarantees if you're willing to exploit the structure of how transformers actually use the KV cache.
 
 Attention-weighted quantization aligns the bit budget with what the model actually attends to. Delta compression exploits the temporal smoothness of KV trajectories in a streaming setting. Adaptive allocation adjusts to importance that you couldn't have known at compression time. Low-rank correction recovers structure from an error that isn't as random as you might assume.
 
@@ -279,7 +349,7 @@ None of these require modifying the model or changing the training procedure. Th
 
 ---
 
-## 7. Implementation Notes
+## 9. Implementation Notes
 
 These are runtime optimizations applied after the paper's algorithms were finalized. They do not change any results — the quality numbers in Sections 3–3.4 are unchanged — but they reduce wall-clock time substantially.
 
@@ -418,6 +488,50 @@ self.register_buffer("boundaries", boundaries)
 
 The saving is negligible in practice (the $k-1$ additions are trivial), but it removes a recompute and makes the caching contract explicit.
 
+#### 7.5 First-Token Accuracy in Quantized Generation
+
+**Problem.** During quantized generation in `demo_llm.py`, token 1 (the first generated token) was evaluated using the unquantized prefill logit — the same logit that all bit-width variants saw — so all quantized modes produced identical first tokens regardless of quantization quality. Only from token 2 onward, when the quantized KV cache was actually used for attention, did the bit-widths diverge.
+
+Root cause: `first_logits = prefill_out.logits[:, -1, :]` is the last prefill position's output computed with the full float32 KV cache. After quantizing the cache to `past`, this `first_logits` variable was reused unchanged for all bit-width branches.
+
+**Fix.** Crop the quantized cache to $T_p - 1$ positions, then re-run the last prompt token through the model with that cropped cache to obtain a logit that reflects the quantized state:
+
+```python
+def _crop_cache(native_cache, seq_len: int):
+    """Return a deep copy of native_cache with KV tensors truncated to seq_len."""
+    cache = copy.deepcopy(native_cache)
+    if hasattr(cache, "key_cache"):           # DynamicCache / HybridCache
+        for i in range(len(cache.key_cache)):
+            k = cache.key_cache[i]
+            if isinstance(k, torch.Tensor) and k.shape[-2] > seq_len:
+                cache.key_cache[i]   = k[..., :seq_len, :]
+                cache.value_cache[i] = cache.value_cache[i][..., :seq_len, :]
+    return cache
+
+# --- inside the generation loop ---
+past = _quantize_cache(native_cache_orig, kvc, correction_rank=args.correction_rank)
+past_crop = _crop_cache(past, T_p - 1)          # crop to T_p-1 positions
+with torch.no_grad():
+    q1_out = model(input_ids[:, -1:], past_key_values=past_crop, use_cache=False)
+first_logits_m = q1_out.logits[:, -1, :].clone()  # quantized first-token logit
+```
+
+The crop-and-rerun costs one extra forward pass (through all layers, but with a length-1 sequence — so $O(T_p \cdot d \cdot \text{layers})$ for attention), small relative to the $O(T_g \cdot \ldots)$ generation loop for any reasonable $T_g$.
+
+**Effect.** Before the fix, `demo_llm.py` with a 3-bit Qwen2.5-1.5B on `"France Capital City :"` produced:
+
+```
+3-bit: France Capital City : 法国巴黎 ( Paris ) 是法国的首都 ...
+```
+
+(mixing Chinese and English, corrupted output from token 1 misalignment). After:
+
+```
+3-bit: France Capital City : Paris
+```
+
+The first generated token is now `Paris` at all quantized bit-widths, matching the float32 reference. This confirms that the bug was entirely in the first-token logit selection, not in the quantized cache itself.
+
 ---
 
 ## References
@@ -431,4 +545,6 @@ The saving is negligible in practice (the $k-1$ additions are trivial), but it r
 7. Chee, J. et al. "QuIP: 2-Bit Quantization of Large Language Models with Guarantees." NeurIPS (2023).
 8. Ashkboos, S. et al. "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs." arXiv:2404.00456 (2024).
 9. Xiao, G. et al. "Efficient Streaming Language Models with Attention Sinks." ICLR (2024).
-10. Max, J. "Quantizing for minimum distortion." IRE Transactions on Information Theory (1960).
+10. Liu, Z. et al. "ScissorHands: Exploiting the Persistence of Importance Hypothesis for LLM KV Cache Compression at Test Time." NeurIPS (2023).
+11. Halko, N., Martinsson, P.-G. & Tropp, J. "Finding Structure with Randomness: Probabilistic Algorithms for Constructing Approximate Matrix Decompositions." SIAM Review (2011).
+12. Max, J. "Quantizing for minimum distortion." IRE Transactions on Information Theory (1960).

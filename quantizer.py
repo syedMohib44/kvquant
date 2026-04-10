@@ -172,6 +172,14 @@ class KVQuantMSE(nn.Module):
         x_hat = x_unit_hat * norms_flat
         return x_hat.reshape(q.shape)
 
+    def _quantize_unit(self, x_unit: Tensor) -> Tensor:
+        """
+        Fast path: quantize pre-normalised (unit-norm) vectors, return raw indices.
+        Skips norm computation and QuantizedMSE allocation.
+        Used by KVQuantIP.quantize() to avoid double-normalising.
+        """
+        return torch.bucketize(self.rotation(x_unit), self.boundaries)  # (N, d)
+
     def _dequantize_unit(self, idx_flat: Tensor) -> Tensor:
         """
         Fast path: dequantize pre-flattened indices assuming unit-norm vectors.
@@ -279,13 +287,10 @@ class KVQuantIP(nn.Module):
 
         # --- Stage 1: MSE quantize with (b-1) bits (on unit-norm vector) ---
         if self.mse_quantizer is not None:
-            # Feed already-normalised vectors (norm=1) into the MSE quantizer
-            # but bypass its internal normalisation by passing pre-normalised data.
-            # We call the internal _quantize_unit helper to avoid double-normalising.
-            q_mse = self.mse_quantizer.quantize(x_unit)
-            # dequantize returns unit-scale (norms stored as 1 in q_mse)
-            x_hat_unit = self.mse_quantizer.dequantize(q_mse)  # (N, d), unit scale
-            indices = q_mse.indices                             # (N, d)
+            # x_unit is already normalised — use the fast path that skips the
+            # internal norm() + clamp() + div() and avoids allocating QuantizedMSE.
+            indices   = self.mse_quantizer._quantize_unit(x_unit)    # (N, d)
+            x_hat_unit = self.mse_quantizer._dequantize_unit(indices)  # (N, d)
         else:
             x_hat_unit = torch.zeros_like(x_unit)
             indices = torch.zeros(N, self.dim, dtype=torch.long, device=x_flat.device)
@@ -312,9 +317,7 @@ class KVQuantIP(nn.Module):
 
         Returns an unbiased estimator x' such that E[<y, x'>] = <y, x>.
         """
-        N = 1
-        for s in q.shape[:-1]:
-            N *= s
+        N = math.prod(q.shape[:-1])
 
         idx_flat = q.indices.reshape(N, self.dim)
         bits_flat = q.qjl_bits.reshape(N, self.dim).to(self.S.dtype)
