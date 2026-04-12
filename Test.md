@@ -82,3 +82,19 @@ python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "
   3-bit  : Sure, here's a step-by-step guide on how to make homemade breaded and fried chicken wings: 1. Preheat your oven at the highest temperature setting (usually around or above) for about an hour before starting with this recipe so that you can get it ready in time when making these delicious crispy treats!
   4-bit  : Sure, here's a step-by-step guide on how you can make homemade crust for your favorite Margherita or pepperoni pizzas: 1. Preheat the oven at its highest temperature (usually around about375°F/190C). This will help ensure that both sides of each slice are golden brown and
 ----------------------------------------------------------------
+
+# Mac M1
+#################################################################################
+OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is the capital of France?" --max-new-tokens 20
+
+---- Interactive generation ------------------------------------
+  Model  : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Prompt : 'What is the capital of France?'
+  Mode   : chat template
+
+  Unquant: The current and official name for Paris, as well as its administrative center since World War II (1
+
+  2-bit  : ��nbsp... Yes, you're correct! The Capital for what: (CO) ...
+  3-bit  : The current Capital City and Headquarters for all French institutions, including government agencies such as ministries
+  4-bit  : The current and official name for Paris, as well as its seat of government since World War II (
+  ----------------------------------------------------------------

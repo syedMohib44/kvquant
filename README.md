@@ -2,7 +2,7 @@
 
 **Attention-aware KV cache quantization for LLM inference.**
 
-KVQUANT++ extends [KVQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) with four novel extensions and several implementation improvements. It achieves near-optimal KV cache compression by combining information-theoretically grounded vector quantization with transformer-specific structure exploitation.
+KVQUANT++ extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) with four novel extensions and several implementation improvements. It achieves near-optimal KV cache compression by combining information-theoretically grounded vector quantization with transformer-specific structure exploitation.
 
 ---
 
@@ -178,6 +178,8 @@ python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "What is 
 python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is the capital of France?" --max-new-tokens 20
 # Rank 4 will get us 11% MSE reduction at only 7.4% extra storage
 python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "What is the capital of France?" --max-new-tokens 20 --correction-rank 4
+# Test for Mac M1
+OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is the capital of France?" --max-new-tokens 20
 #########################
 
 python -m kvquant.demo_extensions   # all 4 extensions on real data
