@@ -61,17 +61,18 @@ def load_model(name):
 def get_model_dims(model):
     """Return (n_layers, n_heads, n_kv_heads, head_dim) for any architecture."""
     cfg = model.config
-    n_layers  = getattr(cfg, "num_hidden_layers",  getattr(cfg, "n_layer", None))
-    n_heads   = getattr(cfg, "num_attention_heads", getattr(cfg, "n_head",  None))
+    n_layers = getattr(cfg, "num_hidden_layers", getattr(cfg, "n_layer", None))
+    n_heads = getattr(cfg, "num_attention_heads", getattr(cfg, "n_head", None))
     n_kv_heads = getattr(cfg, "num_key_value_heads", n_heads)
-    hidden    = getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None))
-    head_dim  = getattr(cfg, "head_dim", hidden // n_heads)
+    hidden = getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None))
+    head_dim = getattr(cfg, "head_dim", hidden // n_heads)
     return n_layers, n_heads, n_kv_heads, head_dim
 
 
 # ---------------------------------------------------------------------------
 # Cache helpers (architecture-agnostic)
 # ---------------------------------------------------------------------------
+
 
 def _is_hybrid_model(model):
     """
@@ -83,8 +84,17 @@ def _is_hybrid_model(model):
     """
     for _, module in model.named_modules():
         cls = type(module).__name__
-        if any(x in cls for x in ("LinearAttention", "MambaLayer", "Mamba2Layer",
-                                   "Rwkv", "RetNet", "GatedLinearAttention")):
+        if any(
+            x in cls
+            for x in (
+                "LinearAttention",
+                "MambaLayer",
+                "Mamba2Layer",
+                "Rwkv",
+                "RetNet",
+                "GatedLinearAttention",
+            )
+        ):
             return True
         # Qwen3.5 names its linear-attention child 'linear_attn'
         if "linear_attn" in {n for n, _ in module.named_children()}:
@@ -128,7 +138,9 @@ def _kvs_from_cache(native_cache):
     return []
 
 
-def _apply_lowrank_correction(x: torch.Tensor, x_hat: torch.Tensor, rank: int) -> torch.Tensor:
+def _apply_lowrank_correction(
+    x: torch.Tensor, x_hat: torch.Tensor, rank: int
+) -> torch.Tensor:
     """Add rank-r SVD correction to x_hat using residual (x - x_hat)."""
     orig_shape = x_hat.shape
     # reshape to (N, T, d) for batched SVD
@@ -143,7 +155,7 @@ def _apply_lowrank_correction(x: torch.Tensor, x_hat: torch.Tensor, rank: int) -
     else:
         U, S, Vh = torch.linalg.svd(R, full_matrices=False)
         U, S, Vh = U[..., :r], S[..., :r], Vh[..., :r, :]
-    correction = (U * S.unsqueeze(-2)) @ Vh   # (N, T, d)
+    correction = (U * S.unsqueeze(-2)) @ Vh  # (N, T, d)
     return (x_hat.float() + correction.reshape(orig_shape)).to(x_hat.dtype)
 
 
@@ -155,17 +167,17 @@ def _crop_cache(native_cache, seq_len: int):
     an accurate quantized logit for the first generated token.
     """
     cache = copy.deepcopy(native_cache)
-    if hasattr(cache, "layers"):          # new-style DynamicCache
+    if hasattr(cache, "layers"):  # new-style DynamicCache
         for layer in cache.layers:
             k = getattr(layer, "keys", None)
             if isinstance(k, torch.Tensor) and k.shape[-2] > seq_len:
-                layer.keys   = k[...,  :seq_len, :]
+                layer.keys = k[..., :seq_len, :]
                 layer.values = layer.values[..., :seq_len, :]
-    elif hasattr(cache, "key_cache"):     # old-style DynamicCache / HybridCache
+    elif hasattr(cache, "key_cache"):  # old-style DynamicCache / HybridCache
         for i in range(len(cache.key_cache)):
             k = cache.key_cache[i]
             if isinstance(k, torch.Tensor) and k.shape[-2] > seq_len:
-                cache.key_cache[i]   = k[...,  :seq_len, :]
+                cache.key_cache[i] = k[..., :seq_len, :]
                 cache.value_cache[i] = cache.value_cache[i][..., :seq_len, :]
     return cache
 
@@ -221,11 +233,13 @@ def _quantize_cache(native_cache, kvc, correction_rank: int = 0):
 # Legacy helper used by the default (non-prompt) benchmark sections
 # ---------------------------------------------------------------------------
 
+
 def _make_cache_dynamic(kvs, kvc):
     """Build a quantized cache from a list of (k, v) pairs (used by default benchmark)."""
     pairs = [kvc.decompress_kv(*kvc.compress_kv(k, v)) for k, v in kvs]
     try:
         from transformers import DynamicCache
+
         cache = DynamicCache()
         for i, (k_hat, v_hat) in enumerate(pairs):
             cache.update(k_hat, v_hat, layer_idx=i)
@@ -249,7 +263,7 @@ def capture_kv(model, input_ids):
 def attn_score_error(q, k_true, k_hat):
     scale = q.shape[-1] ** -0.5
     s_true = (q @ k_true.transpose(-2, -1)) * scale
-    s_hat  = (q @ k_hat.transpose(-2, -1)) * scale
+    s_hat = (q @ k_hat.transpose(-2, -1)) * scale
     return (s_true - s_hat).abs().mean().item()
 
 
@@ -291,34 +305,45 @@ def main():
         description="KVQuant LLM demo — benchmark or interactive generation"
     )
     parser.add_argument(
-        "--model", type=str, default=DEFAULT_MODEL,
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
         help=f"HuggingFace model name (default: {DEFAULT_MODEL}). "
-             "Works with pure-transformer and hybrid (Qwen3.5, Mamba, …) models.",
+        "Works with pure-transformer and hybrid (Qwen3.5, Mamba, …) models.",
     )
     parser.add_argument(
-        "--prompt", type=str, default=None,
+        "--prompt",
+        type=str,
+        default=None,
         help="Custom prompt for interactive generation (skips default benchmark).",
     )
     parser.add_argument(
-        "--max-new-tokens", type=int, default=40,
+        "--max-new-tokens",
+        type=int,
+        default=40,
         help="Tokens to generate in --prompt mode (default: 40).",
     )
     parser.add_argument(
-        "--repetition-penalty", type=float, default=1.5,
+        "--repetition-penalty",
+        type=float,
+        default=1.5,
         help="Repetition penalty applied during quantized greedy decode (default: 1.5). "
-             "Values > 1 discourage repeating already-generated tokens. "
-             "Increase to 2.0+ if you see repetition loops at low bit-widths.",
+        "Values > 1 discourage repeating already-generated tokens. "
+        "Increase to 2.0+ if you see repetition loops at low bit-widths.",
     )
     parser.add_argument(
-        "--raw", action="store_true",
+        "--raw",
+        action="store_true",
         help="Skip the chat template and tokenize the prompt as plain text. "
-             "Use for sentence-completion prompts; leave off for Q&A prompts.",
+        "Use for sentence-completion prompts; leave off for Q&A prompts.",
     )
     parser.add_argument(
-        "--correction-rank", type=int, default=0,
+        "--correction-rank",
+        type=int,
+        default=0,
         help="Apply rank-r low-rank error correction to the quantized KV cache "
-             "(0 = disabled, 4 = recommended). Reduces quantization error at the "
-             "cost of storing r*(T+d) extra floats per layer.",
+        "(0 = disabled, 4 = recommended). Reduces quantization error at the "
+        "cost of storing r*(T+d) extra floats per layer.",
     )
     args = parser.parse_args()
 
@@ -327,8 +352,12 @@ def main():
     n_outlier = max(4, head_dim // 4)
     hybrid = _is_hybrid_model(model)
 
-    print(f"  arch   : {'hybrid (transformer + linear attn)' if hybrid else 'pure transformer'}")
-    print(f"  layers : {n_layers}  heads : {n_heads}  kv_heads : {n_kv_heads}  head_dim : {head_dim}")
+    print(
+        f"  arch   : {'hybrid (transformer + linear attn)' if hybrid else 'pure transformer'}"
+    )
+    print(
+        f"  layers : {n_layers}  heads : {n_heads}  kv_heads : {n_kv_heads}  head_dim : {head_dim}"
+    )
 
     # -----------------------------------------------------------------------
     # --prompt  Interactive generation
@@ -344,19 +373,23 @@ def main():
         raw_prompt = args.prompt
         has_template = hasattr(tok, "apply_chat_template") and bool(tok.chat_template)
         use_template = has_template and not args.raw
-        use_qa_fmt   = not has_template and not args.raw
+        use_qa_fmt = not has_template and not args.raw
 
         if use_template:
             mode_label = "chat template"
             messages = [{"role": "user", "content": raw_prompt}]
             try:
                 formatted = tok.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
                     enable_thinking=False,
                 )
             except TypeError:
                 formatted = tok.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
             enc = tok(formatted, return_tensors="pt", add_special_tokens=False)
         elif use_qa_fmt:
@@ -380,25 +413,36 @@ def main():
 
         # Calibration pool — use TEXTS corpus for better outlier-channel estimation.
         # The prompt alone is too short (< 20 tokens) to reliably identify outliers.
-        cal_enc = tok(TEXTS, return_tensors="pt", padding=True,
-                      truncation=True, max_length=64, add_special_tokens=True)
+        cal_enc = tok(
+            TEXTS,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64,
+            add_special_tokens=True,
+        )
         with torch.no_grad():
             cal_out = model(cal_enc["input_ids"], use_cache=True)
         cal_kvs = _kvs_from_cache(cal_out.past_key_values)
-        cal_T   = cal_enc["input_ids"].shape[1]
-        all_k_p = torch.cat([kv[0].reshape(-1, cal_T, head_dim) for kv in cal_kvs], dim=0)
-        all_v_p = torch.cat([kv[1].reshape(-1, cal_T, head_dim) for kv in cal_kvs], dim=0)
+        cal_T = cal_enc["input_ids"].shape[1]
+        all_k_p = torch.cat(
+            [kv[0].reshape(-1, cal_T, head_dim) for kv in cal_kvs], dim=0
+        )
+        all_v_p = torch.cat(
+            [kv[1].reshape(-1, cal_T, head_dim) for kv in cal_kvs], dim=0
+        )
 
         # Newline suppression (varies by tokenizer)
         newline_ids = tok.encode("\n", add_special_tokens=False)
-        bad_words   = [[t] for t in newline_ids] if newline_ids else None
-        newline_id  = newline_ids[0] if newline_ids else -1
+        bad_words = [[t] for t in newline_ids] if newline_ids else None
+        newline_id = newline_ids[0] if newline_ids else -1
 
         attn_mask = torch.ones_like(input_ids)
 
         # Suppress HuggingFace warnings that fire on every greedy generate() call
         # (attention_mask inference warning, temperature/top_p/top_k validity warning).
         import logging as _logging
+
         _hf = _logging.getLogger("transformers")
         _prev_hf = _hf.level
         _hf.setLevel(_logging.ERROR)
@@ -410,7 +454,8 @@ def main():
                 attention_mask=attn_mask,
                 pad_token_id=tok.eos_token_id,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=False, bad_words_ids=bad_words,
+                do_sample=False,
+                bad_words_ids=bad_words,
                 repetition_penalty=args.repetition_penalty,
             )
 
@@ -421,8 +466,10 @@ def main():
         # Quantized generation — one pass per bit-width
         for bits in BITS_LIST:
             kvc = KVCacheQuantizer(
-                head_dim=head_dim, num_bits=bits,
-                use_outlier=True, n_outlier=n_outlier,
+                head_dim=head_dim,
+                num_bits=bits,
+                use_outlier=True,
+                n_outlier=n_outlier,
                 outlier_bits=min(bits + 1, 4),
                 regular_bits=max(bits - 1, 1),
             )
@@ -431,7 +478,9 @@ def main():
             # _quantize_cache deep-copies native_cache and quantizes K,V in-place.
             # For hybrid models the Mamba/linear-attn state is preserved in the copy,
             # so the subsequent forward passes work without error.
-            past = _quantize_cache(native_cache_orig, kvc, correction_rank=args.correction_rank)
+            past = _quantize_cache(
+                native_cache_orig, kvc, correction_rank=args.correction_rank
+            )
 
             # Greedy decode: get the first-token logit from the QUANTIZED cache
             # by cropping to T_p-1 positions and running the last prompt token
@@ -439,8 +488,9 @@ def main():
             # bit-widths produce the same first token — hiding the real degradation.
             past_crop = _crop_cache(past, T_p - 1)
             with torch.no_grad():
-                q1_out = model(input_ids[:, -1:], past_key_values=past_crop,
-                               use_cache=False)
+                q1_out = model(
+                    input_ids[:, -1:], past_key_values=past_crop, use_cache=False
+                )
             first_logits_m = q1_out.logits[:, -1, :].clone()
             if newline_id >= 0:
                 first_logits_m[:, newline_id] = float("-inf")
@@ -453,7 +503,9 @@ def main():
                 logits_s = step.logits[:, -1, :].clone()
                 if newline_id >= 0:
                     logits_s[:, newline_id] = float("-inf")
-                logits_s = _apply_repetition_penalty(logits_s, seen_ids, args.repetition_penalty)
+                logits_s = _apply_repetition_penalty(
+                    logits_s, seen_ids, args.repetition_penalty
+                )
                 next_tok = logits_s.argmax(-1, keepdim=True)
                 seen_ids.append(next_tok.item())
                 generated.append(next_tok)
@@ -462,7 +514,9 @@ def main():
                     break
 
             gen_ids = torch.cat(generated, dim=1)
-            print(f"  {bits}-bit  : {_clean(tok.decode(gen_ids[0], skip_special_tokens=True))}")
+            print(
+                f"  {bits}-bit  : {_clean(tok.decode(gen_ids[0], skip_special_tokens=True))}"
+            )
 
         sep()
         return
@@ -470,8 +524,9 @@ def main():
     # -----------------------------------------------------------------------
     # Default benchmark (pure-transformer models work best here)
     # -----------------------------------------------------------------------
-    encoded = tok(TEXTS, return_tensors="pt", padding=True,
-                  truncation=True, max_length=64)
+    encoded = tok(
+        TEXTS, return_tensors="pt", padding=True, truncation=True, max_length=64
+    )
     input_ids = encoded["input_ids"]
     B, T = input_ids.shape
 
@@ -487,13 +542,17 @@ def main():
     q_proxy = torch.randn_like(kvs[0][0])
 
     sep("Per-layer KV compression results")
-    print(f"{'bits':>5}  {'avg_bits':>9}  {'K MSE':>10}  {'V MSE':>10}  {'Attn err':>10}")
+    print(
+        f"{'bits':>5}  {'avg_bits':>9}  {'K MSE':>10}  {'V MSE':>10}  {'Attn err':>10}"
+    )
     sep()
 
     for bits in BITS_LIST:
         kvc = KVCacheQuantizer(
-            head_dim=head_dim, num_bits=bits,
-            use_outlier=True, n_outlier=n_outlier,
+            head_dim=head_dim,
+            num_bits=bits,
+            use_outlier=True,
+            n_outlier=n_outlier,
             outlier_bits=min(bits + 1, 4),
             regular_bits=max(bits - 1, 1),
         )
@@ -507,10 +566,12 @@ def main():
             v_mse_l.append(((v - v_hat) ** 2).mean().item())
             attn_l.append(attn_score_error(q_proxy, k, k_hat))
 
-        print(f"{bits:>5}  {kvc.avg_bits:>9.2f}"
-              f"  {sum(k_mse_l)/len(k_mse_l):>10.5f}"
-              f"  {sum(v_mse_l)/len(v_mse_l):>10.5f}"
-              f"  {sum(attn_l)/len(attn_l):>10.5f}")
+        print(
+            f"{bits:>5}  {kvc.avg_bits:>9.2f}"
+            f"  {sum(k_mse_l)/len(k_mse_l):>10.5f}"
+            f"  {sum(v_mse_l)/len(v_mse_l):>10.5f}"
+            f"  {sum(attn_l)/len(attn_l):>10.5f}"
+        )
 
     sep("Output logit difference (last token)")
     with torch.no_grad():
@@ -522,8 +583,10 @@ def main():
 
     for bits in BITS_LIST:
         kvc = KVCacheQuantizer(
-            head_dim=head_dim, num_bits=bits,
-            use_outlier=True, n_outlier=n_outlier,
+            head_dim=head_dim,
+            num_bits=bits,
+            use_outlier=True,
+            n_outlier=n_outlier,
             outlier_bits=min(bits + 1, 4),
             regular_bits=max(bits - 1, 1),
         )
@@ -535,15 +598,18 @@ def main():
             out_q = model(dummy, past_key_values=quant_kvs, use_cache=False)
         logits_q = out_q.logits[:, -1, :]
 
-        mae   = (logits_true - logits_q).abs().mean().item()
+        mae = (logits_true - logits_q).abs().mean().item()
         match = (logits_true.argmax(-1) == logits_q.argmax(-1)).float().mean().item()
         print(f"{bits:>5}  {kvc.avg_bits:>9.2f}  {mae:>12.5f}  {match:>11.0%}")
 
     sep(f"Top-5 next-token predictions  (bits={BITS_LIST[-1]})")
     kvc = KVCacheQuantizer(
-        head_dim=head_dim, num_bits=BITS_LIST[-1],
-        use_outlier=True, n_outlier=n_outlier,
-        outlier_bits=4, regular_bits=3,
+        head_dim=head_dim,
+        num_bits=BITS_LIST[-1],
+        use_outlier=True,
+        n_outlier=n_outlier,
+        outlier_bits=4,
+        regular_bits=3,
     )
     kvc.calibrate(all_k, all_v)
     quant_kvs = _make_cache_dynamic(kvs, kvc)
@@ -554,7 +620,7 @@ def main():
     logits_q = out_q.logits[:, -1, :]
 
     for i, text in enumerate(TEXTS):
-        true_top5  = logits_true[i].topk(5).indices.tolist()
+        true_top5 = logits_true[i].topk(5).indices.tolist()
         quant_top5 = logits_q[i].topk(5).indices.tolist()
         t_words = [tok.decode([t]).strip() for t in true_top5]
         q_words = [tok.decode([t]).strip() for t in quant_top5]
