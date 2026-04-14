@@ -28,9 +28,9 @@ from .quantizer import KVQuantIP, QuantizedIP
 
 
 class OutlierQuantized(NamedTuple):
-    outlier_q:  QuantizedIP     # quantized outlier channels  (first n_outlier cols)
-    regular_q:  QuantizedIP     # quantized regular channels  (remaining cols)
-    shape:      tuple           # original shape (..., d)
+    outlier_q: QuantizedIP  # quantized outlier channels  (first n_outlier cols)
+    regular_q: QuantizedIP  # quantized regular channels  (remaining cols)
+    shape: tuple  # original shape (..., d)
 
 
 class OutlierKVQuant(nn.Module):
@@ -69,10 +69,10 @@ class OutlierKVQuant(nn.Module):
         self._regular_q: KVQuantIP | None = None
         self._seed = seed
 
-        # perm:     original → contiguous order  (outliers first, then regular)
-        # inv_perm: contiguous → original order  (used in dequantize)
+        # perm:     original -> contiguous order  (outliers first, then regular)
+        # inv_perm: contiguous -> original order  (used in dequantize)
         # Both are set after calibrate().
-        self.register_buffer("perm",     torch.empty(0, dtype=torch.long))
+        self.register_buffer("perm", torch.empty(0, dtype=torch.long))
         self.register_buffer("inv_perm", torch.empty(0, dtype=torch.long))
         self._calibrated = False
 
@@ -89,11 +89,11 @@ class OutlierKVQuant(nn.Module):
                All tokens are used to estimate per-channel variance.
         """
         flat = x.reshape(-1, self.dim).float()
-        var = flat.var(dim=0)                              # (d,)
+        var = flat.var(dim=0)  # (d,)
 
         # Top-n_outlier channels by variance
         _, top_idx = var.topk(self.n_outlier)
-        outlier_idx = top_idx.sort().values                # sorted for determinism
+        outlier_idx = top_idx.sort().values  # sorted for determinism
 
         all_idx = torch.arange(self.dim, device=x.device)
         mask = torch.ones(self.dim, dtype=torch.bool, device=x.device)
@@ -103,11 +103,11 @@ class OutlierKVQuant(nn.Module):
         # Build a contiguous permutation: outliers first, then regular channels.
         # quantize() can then slice with [:, :n_outlier] and [:, n_outlier:] instead
         # of fancy-index scatter/gather, which is faster and more cache-friendly.
-        perm = torch.cat([outlier_idx, regular_idx])       # (d,)
+        perm = torch.cat([outlier_idx, regular_idx])  # (d,)
         inv_perm = torch.empty_like(perm)
         inv_perm[perm] = all_idx
 
-        self.perm     = perm
+        self.perm = perm
         self.inv_perm = inv_perm
 
         # Build sub-quantizers with correct sub-dimensions
@@ -144,12 +144,12 @@ class OutlierKVQuant(nn.Module):
         self._check_calibrated()
         shape = x.shape
         # Permute channels to contiguous layout: outliers first, then regular.
-        # Slicing [:, :n_outlier] / [:, n_outlier:] is a simple strided view —
+        # Slicing [:, :n_outlier] / [:, n_outlier:] is a simple strided view -
         # no scatter/gather overhead compared to fancy indexing.
-        flat = x.reshape(-1, self.dim)[:, self.perm]   # (N, d) contiguous
+        flat = x.reshape(-1, self.dim)[:, self.perm]  # (N, d) contiguous
 
-        x_out = flat[:, :self.n_outlier]               # (N, n_outlier)
-        x_reg = flat[:, self.n_outlier:]               # (N, n_regular)
+        x_out = flat[:, : self.n_outlier]  # (N, n_outlier)
+        x_reg = flat[:, self.n_outlier :]  # (N, n_regular)
 
         return OutlierQuantized(
             outlier_q=self._outlier_q.quantize(x_out),
@@ -165,15 +165,16 @@ class OutlierKVQuant(nn.Module):
         """
         self._check_calibrated()
         import math
+
         N = math.prod(q.shape[:-1])
 
         x_out = self._outlier_q.dequantize(q.outlier_q).reshape(N, self.n_outlier)
         x_reg = self._regular_q.dequantize(q.regular_q).reshape(N, self.n_regular)
 
         # Concatenate in permuted order, then invert permutation back to original
-        # channel order.  inv_perm indexing is a single gather — no scatter needed.
-        permuted = torch.cat([x_out, x_reg], dim=1)       # (N, d) in perm order
-        out = permuted[:, self.inv_perm]                   # (N, d) original order
+        # channel order.  inv_perm indexing is a single gather - no scatter needed.
+        permuted = torch.cat([x_out, x_reg], dim=1)  # (N, d) in perm order
+        out = permuted[:, self.inv_perm]  # (N, d) original order
 
         return out.reshape(q.shape)
 
@@ -185,17 +186,19 @@ class OutlierKVQuant(nn.Module):
     @property
     def outlier_idx(self) -> Tensor:
         """Channel indices of outlier channels in the original ordering."""
-        return self.perm[:self.n_outlier]
+        return self.perm[: self.n_outlier]
 
     @property
     def regular_idx(self) -> Tensor:
         """Channel indices of regular channels in the original ordering."""
-        return self.perm[self.n_outlier:]
+        return self.perm[self.n_outlier :]
 
     @property
     def avg_bits(self) -> float:
         """Weighted average bits/coordinate."""
-        return (self.n_outlier * self.outlier_bits + self.n_regular * self.regular_bits) / self.dim
+        return (
+            self.n_outlier * self.outlier_bits + self.n_regular * self.regular_bits
+        ) / self.dim
 
     def _check_calibrated(self) -> None:
         if not self._calibrated:

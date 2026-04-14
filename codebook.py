@@ -21,6 +21,7 @@ from torch import Tensor
 # True distribution sampler
 # ---------------------------------------------------------------------------
 
+
 def _sample_sphere_coord(dim: int, num_samples: int, seed: int = 42) -> Tensor:
     """
     Sample the marginal distribution of one coordinate of a uniformly random
@@ -41,6 +42,7 @@ def _sample_sphere_coord(dim: int, num_samples: int, seed: int = 42) -> Tensor:
 # Lloyd-Max solver against the true distribution
 # ---------------------------------------------------------------------------
 
+
 def _lloyd_max(
     num_bits: int,
     dim: int,
@@ -54,7 +56,7 @@ def _lloyd_max(
     Returns centroids of shape (2**num_bits,), sorted ascending, already
     scaled to the true distribution (no further rescaling needed).
     """
-    k = 2 ** num_bits
+    k = 2**num_bits
     samples = _sample_sphere_coord(dim, num_samples).contiguous()
 
     # Initialise centroids uniformly over the empirical support
@@ -74,7 +76,7 @@ def _lloyd_max(
 
         mask = counts > 0
         new_centroids[mask] /= counts[mask]
-        new_centroids[~mask] = centroids[~mask]   # keep old if cell is empty
+        new_centroids[~mask] = centroids[~mask]  # keep old if cell is empty
 
         if (new_centroids - centroids).abs().max() < 1e-7:
             break
@@ -113,7 +115,7 @@ def build_codebook(
 
     Returns:
         centroids:  Tensor of shape (2**num_bits,).
-        boundaries: Tensor of shape (2**num_bits - 1,)  — midpoints between
+        boundaries: Tensor of shape (2**num_bits - 1,)  - midpoints between
                     consecutive centroids, ready for ``torch.bucketize``.
     """
     assert 1 <= num_bits <= 4, "Only 1–4 bits/coordinate are supported."
@@ -124,7 +126,7 @@ def build_codebook(
         _CACHE[key] = (c, b)
     centroids, boundaries = _CACHE[key]
     if device is not None:
-        # .to() returns a new tensor when the device differs, a view otherwise —
+        # .to() returns a new tensor when the device differs, a view otherwise -
         # either way the cached entry is not mutated.
         return centroids.to(device), boundaries.to(device)
     # Clone so callers (register_buffer) get an independent tensor that can be
@@ -140,13 +142,35 @@ def build_codebook(
 _B1_CENTROID = math.sqrt(2.0 / math.pi)
 
 _KNOWN_GAUSSIAN_CENTROIDS: dict[int, list[float]] = {
-    2: [-1.5104176, -0.4527801,  0.4527801,  1.5104176],
-    3: [-2.1520000, -1.3439900, -0.7560500, -0.2451500,
-         0.2451500,  0.7560500,  1.3439900,  2.1520000],
-    4: [-2.7326000, -2.0691000, -1.6181000, -1.2562000,
-        -0.9423000, -0.6568000, -0.3882000, -0.1282000,
-         0.1282000,  0.3882000,  0.6568000,  0.9423000,
-         1.2562000,  1.6181000,  2.0691000,  2.7326000],
+    2: [-1.5104176, -0.4527801, 0.4527801, 1.5104176],
+    3: [
+        -2.1520000,
+        -1.3439900,
+        -0.7560500,
+        -0.2451500,
+        0.2451500,
+        0.7560500,
+        1.3439900,
+        2.1520000,
+    ],
+    4: [
+        -2.7326000,
+        -2.0691000,
+        -1.6181000,
+        -1.2562000,
+        -0.9423000,
+        -0.6568000,
+        -0.3882000,
+        -0.1282000,
+        0.1282000,
+        0.3882000,
+        0.6568000,
+        0.9423000,
+        1.2562000,
+        1.6181000,
+        2.0691000,
+        2.7326000,
+    ],
 }
 
 

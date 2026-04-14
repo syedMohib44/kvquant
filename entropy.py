@@ -40,6 +40,7 @@ from .codebook import build_codebook
 # Symbol probabilities
 # ---------------------------------------------------------------------------
 
+
 def codebook_probs(num_bits: int, dim: int) -> Tensor:
     """
     Compute the probability of each codebook symbol under N(0, 1/d).
@@ -55,7 +56,7 @@ def codebook_probs(num_bits: int, dim: int) -> Tensor:
     Returns:
         probs: Tensor of shape (2**num_bits,) summing to 1.
     """
-    centroids = build_codebook(num_bits, dim)   # (k,) scaled by 1/sqrt(d)
+    centroids = build_codebook(num_bits, dim)  # (k,) scaled by 1/sqrt(d)
     k = len(centroids)
     std = 1.0 / math.sqrt(dim)
 
@@ -69,11 +70,12 @@ def codebook_probs(num_bits: int, dim: int) -> Tensor:
     # P(symbol i) = Phi((b_{i+1} - 0) / std) - Phi((b_i - 0) / std)
     # where Phi is the standard normal CDF
     from torch.distributions import Normal
+
     normal = Normal(0.0, std)
-    lo = normal.cdf(bounds[:-1])   # (k,)
-    hi = normal.cdf(bounds[1:])    # (k,)
+    lo = normal.cdf(bounds[:-1])  # (k,)
+    hi = normal.cdf(bounds[1:])  # (k,)
     probs = (hi - lo).clamp(min=1e-12)
-    return probs / probs.sum()     # normalise for numerical safety
+    return probs / probs.sum()  # normalise for numerical safety
 
 
 def entropy_bits(num_bits: int, dim: int) -> float:
@@ -94,11 +96,12 @@ def entropy_bits(num_bits: int, dim: int) -> float:
 # Huffman codec
 # ---------------------------------------------------------------------------
 
+
 @dataclass(order=True)
 class _Node:
     prob: float
     symbol: int = field(default=-1, compare=False)
-    left:  "_Node | None" = field(default=None, compare=False)
+    left: "_Node | None" = field(default=None, compare=False)
     right: "_Node | None" = field(default=None, compare=False)
 
 
@@ -174,10 +177,10 @@ class HuffmanCodec:
 
 
 class EntropyStats(NamedTuple):
-    raw_bits:    float   # naive: num_bits per coordinate
-    entropy:     float   # Shannon lower bound
-    huffman_avg: float   # actual Huffman avg bits/coord
-    saving_pct:  float   # % reduction vs raw
+    raw_bits: float  # naive: num_bits per coordinate
+    entropy: float  # Shannon lower bound
+    huffman_avg: float  # actual Huffman avg bits/coord
+    saving_pct: float  # % reduction vs raw
 
 
 def analyse(num_bits: int, dim: int) -> EntropyStats:
@@ -191,16 +194,17 @@ def analyse(num_bits: int, dim: int) -> EntropyStats:
         EntropyStats(raw_bits=4, entropy=3.816, huffman_avg=3.847, saving_pct=3.83)
     """
     codec = HuffmanCodec(num_bits, dim)
-    raw   = float(num_bits)
-    h     = codec.entropy
-    avg   = codec.avg_bits
-    pct   = (raw - avg) / raw * 100.0
+    raw = float(num_bits)
+    h = codec.entropy
+    avg = codec.avg_bits
+    pct = (raw - avg) / raw * 100.0
     return EntropyStats(raw, h, avg, pct)
 
 
 # ---------------------------------------------------------------------------
 # Internal Huffman tree builder
 # ---------------------------------------------------------------------------
+
 
 def _build_huffman(probs: list[float]) -> tuple[list[list[int]], list[int]]:
     """
@@ -227,7 +231,7 @@ def _build_huffman(probs: list[float]) -> tuple[list[list[int]], list[int]]:
 
 
 def _assign_codes(node: _Node, prefix: list[int], codes: list[list[int]]) -> None:
-    if node.symbol >= 0:          # leaf
+    if node.symbol >= 0:  # leaf
         codes[node.symbol] = prefix[:]
         return
     if node.left:

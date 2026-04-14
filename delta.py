@@ -63,19 +63,21 @@ class DeltaKVCache(nn.Module):
         seed: int = 0,
     ) -> None:
         super().__init__()
-        self.head_dim    = head_dim
-        self.num_bits    = num_bits
+        self.head_dim = head_dim
+        self.num_bits = num_bits
         self.anchor_every = anchor_every
 
-        self.k_quantizer = KVQuantIP(head_dim, num_bits, seed=seed,     qjl_seed=seed + 1)
-        self.v_quantizer = KVQuantIP(head_dim, num_bits, seed=seed + 2, qjl_seed=seed + 3)
+        self.k_quantizer = KVQuantIP(head_dim, num_bits, seed=seed, qjl_seed=seed + 1)
+        self.v_quantizer = KVQuantIP(
+            head_dim, num_bits, seed=seed + 2, qjl_seed=seed + 3
+        )
 
         # Compressed storage
         self._k_store: list[QuantizedIP | Tensor] = []  # QuantizedIP or anchor Tensor
         self._v_store: list[QuantizedIP | Tensor] = []
-        self._k_prev:  Tensor | None = None   # last reconstructed k (for delta)
-        self._v_prev:  Tensor | None = None
-        self._anchors: list[int] = []         # indices of anchor tokens
+        self._k_prev: Tensor | None = None  # last reconstructed k (for delta)
+        self._v_prev: Tensor | None = None
+        self._anchors: list[int] = []  # indices of anchor tokens
 
     # ------------------------------------------------------------------
     def push(self, k: Tensor, v: Tensor) -> None:
@@ -128,7 +130,7 @@ class DeltaKVCache(nn.Module):
 
         for t in range(T):
             if t in self._anchors:
-                k_running = self._k_store[t]   # full-precision anchor
+                k_running = self._k_store[t]  # full-precision anchor
                 v_running = self._v_store[t]
             else:
                 dk = self.k_quantizer.dequantize(self._k_store[t])
@@ -166,5 +168,7 @@ class DeltaKVCache(nn.Module):
         return torch.tensor(norms) if norms else torch.tensor([])
 
     def extra_repr(self) -> str:
-        return (f"head_dim={self.head_dim}, num_bits={self.num_bits}, "
-                f"anchor_every={self.anchor_every}, length={self.length}")
+        return (
+            f"head_dim={self.head_dim}, num_bits={self.num_bits}, "
+            f"anchor_every={self.anchor_every}, length={self.length}"
+        )

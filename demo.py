@@ -112,6 +112,12 @@ for n_out, ob, rb, label in configs:
 
     detected = set(oq.outlier_idx.tolist())
     injected = set(range(10, 42))
+
+    # Set intersection (&) only works on sets, not tensors or lists.
+    # It gives you the channels that appear in both
+    # i.e correctly detected outliers.
+    # If they used lists they had need a nested loop
+    # sets do it in O(min(n,m)).
     overlap = len(detected & injected)
     print(f"{label:>10}  {oq.avg_bits:>9.2f}  {mse:>10.5f}  {overlap:>10}/32")
 

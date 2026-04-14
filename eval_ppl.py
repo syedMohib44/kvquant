@@ -1,5 +1,5 @@
 """
-eval_ppl.py — KV-cache quantization perplexity evaluation.
+eval_ppl.py - KV-cache quantization perplexity evaluation.
 
 Evaluates the perplexity impact of KV cache quantization on WikiText-2 (or
 a built-in fallback corpus if the `datasets` library is not installed).
@@ -15,7 +15,7 @@ For each text chunk:
      quantized) cache and record the NLL at each position.
 
 This directly measures the degradation KV cache quantization causes during
-generation — the scenario the method is designed for — rather than the
+generation - the scenario the method is designed for - rather than the
 teacher-forcing PPL which ignores cache errors entirely.
 
 Usage
@@ -38,8 +38,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kvquant import KVCacheQuantizer
 from kvquant.demo_llm import (
-    load_model, get_model_dims, _kvs_from_cache,
-    _quantize_cache, sep,
+    load_model,
+    get_model_dims,
+    _kvs_from_cache,
+    _quantize_cache,
+    sep,
 )
 
 BITS_LIST = [2, 3, 4]
@@ -59,7 +62,6 @@ FALLBACK_TEXTS = [
     "The Western Roman Empire fell in 476 AD when Odoacer deposed Romulus Augustulus. "
     "The Eastern Roman Empire, the Byzantine Empire, continued until 1453. "
     "Roman contributions to law, engineering, and language endure to this day.",
-
     "Artificial intelligence has undergone a remarkable transformation in the past "
     "decade, moving from a niche academic discipline to one of the most consequential "
     "technologies of our time. The breakthrough came with deep learning, a technique "
@@ -74,7 +76,6 @@ FALLBACK_TEXTS = [
     "language and can complete sentences, answer questions, write code, and engage "
     "in nuanced dialogue. Ensuring that AI systems remain safe and aligned with "
     "human values remains one of the central challenges of the field.",
-
     "The physics of quantum mechanics describes the behavior of matter and energy "
     "at the smallest scales, where the rules of classical physics break down. "
     "At the quantum scale, particles do not have definite positions or momenta "
@@ -88,7 +89,6 @@ FALLBACK_TEXTS = [
     "measuring one instantly determines the state of the other, regardless of "
     "distance. Einstein called this spooky action at a distance. Quantum mechanics "
     "underpins transistors, lasers, magnetic resonance imaging, and quantum computing.",
-
     "Climate change refers to long-term shifts in global temperatures and weather "
     "patterns. While natural factors have historically driven climate variations, "
     "since the Industrial Revolution human activities have been the primary driver "
@@ -101,7 +101,6 @@ FALLBACK_TEXTS = [
     "melting of polar ice, and disruptions to ecosystems worldwide. International "
     "efforts to address climate change include the Paris Agreement, signed in 2015, "
     "which aims to limit warming to 1.5 degrees Celsius above pre-industrial levels.",
-
     "The development of the internet has fundamentally transformed how human beings "
     "communicate, access information, conduct commerce, and organize society. "
     "The origins of the internet trace back to ARPANET, a research network funded "
@@ -114,7 +113,6 @@ FALLBACK_TEXTS = [
     "the rapidly expanding web. Social media platforms emerged in the 2000s, "
     "creating new forms of communication and community. Today the internet connects "
     "billions of people worldwide and supports a global digital economy.",
-
     "The human brain is the most complex organ in the known universe, containing "
     "approximately eighty-six billion neurons, each connected to thousands of others "
     "through synapses. Neurons communicate via electrochemical signals, and the "
@@ -129,7 +127,6 @@ FALLBACK_TEXTS = [
     "functional magnetic resonance imaging have allowed scientists to observe the "
     "brain at work, revealing the neural correlates of attention, decision-making, "
     "and social cognition with unprecedented precision.",
-
     "The theory of evolution by natural selection, proposed independently by "
     "Charles Darwin and Alfred Russel Wallace in 1858, is the unifying framework "
     "of modern biology. It holds that heritable variation exists within populations, "
@@ -143,7 +140,6 @@ FALLBACK_TEXTS = [
     "Wilkins provided the molecular basis for heredity. Genome sequencing has "
     "since confirmed common ancestry across all life on Earth and revealed the "
     "evolutionary relationships among species with extraordinary detail.",
-
     "The Renaissance was a cultural and intellectual movement that began in Italy "
     "in the fourteenth century and spread across Europe over the following two "
     "centuries, marking the transition from the medieval period to the modern era. "
@@ -156,7 +152,6 @@ FALLBACK_TEXTS = [
     "ideas by making books affordable and widely available for the first time. "
     "The period also saw major advances in astronomy, anatomy, and mathematics, "
     "laying the intellectual groundwork for the scientific revolution that followed.",
-
     "Music theory is the study of the principles and practices that govern how "
     "music is constructed and perceived. At its core are concepts such as pitch, "
     "rhythm, harmony, and form. Pitch classes are organised into scales, of which "
@@ -177,9 +172,13 @@ FALLBACK_TEXTS = [
 # Dataset loading
 # ---------------------------------------------------------------------------
 
+
 def load_chunks(
-    tokenizer, context_len: int, target_len: int,
-    max_chunks: int, skip: int = 0,
+    tokenizer,
+    context_len: int,
+    target_len: int,
+    max_chunks: int,
+    skip: int = 0,
 ):
     """
     Return a list of (context_ids, target_ids) tensors from WikiText-2 or
@@ -190,6 +189,7 @@ def load_chunks(
     """
     try:
         from datasets import load_dataset
+
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
         text = "\n\n".join(t for t in dataset["text"] if len(t.strip()) > 100)
         print("  Dataset : WikiText-2 test set (via `datasets`)")
@@ -201,22 +201,26 @@ def load_chunks(
         chars_needed = (skip + max_chunks + 2) * chunk_tokens * 5
         repeats = math.ceil(chars_needed / max(len(base), 1)) + 1
         text = (" " + base) * max(repeats, 2)
-        print("  Dataset : built-in fallback corpus  "
-              "(pip install datasets  for WikiText-2)")
+        print(
+            "  Dataset : built-in fallback corpus  "
+            "(pip install datasets  for WikiText-2)"
+        )
 
     import logging
+
     _hf_log = logging.getLogger("transformers")
-    _prev   = _hf_log.level
+    _prev = _hf_log.level
     _hf_log.setLevel(logging.ERROR)
-    tokens = tokenizer(text, return_tensors="pt", add_special_tokens=False
-                       )["input_ids"][0]
+    tokens = tokenizer(text, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
     _hf_log.setLevel(_prev)
     chunk = context_len + target_len
     chunks = []
-    start_tok = skip * chunk          # token offset corresponding to `skip` chunks
+    start_tok = skip * chunk  # token offset corresponding to `skip` chunks
     for i in range(start_tok, len(tokens) - chunk, chunk):
-        ctx = tokens[i: i + context_len].unsqueeze(0)
-        tgt = tokens[i + context_len: i + chunk].unsqueeze(0)
+        ctx = tokens[i : i + context_len].unsqueeze(0)
+        tgt = tokens[i + context_len : i + chunk].unsqueeze(0)
         chunks.append((ctx, tgt))
         if len(chunks) >= max_chunks:
             break
@@ -227,19 +231,21 @@ def load_chunks(
 # PPL computation
 # ---------------------------------------------------------------------------
 
+
 def compute_ppl(
     model, chunks, kvc=None, correction_rank: int = 0, label: str = ""
 ) -> float:
     """
     Compute perplexity under (optionally quantized) KV cache.
 
-    For each chunk: prefill context → (quantize cache) → score target tokens.
+    For each chunk: prefill context -> (quantize cache) -> score target tokens.
     """
     total_nll = 0.0
     total_tok = 0
     n = len(chunks)
 
     import sys
+
     tty = sys.stdout.isatty()
     for i, (ctx, tgt) in enumerate(chunks):
         if tty:
@@ -259,12 +265,12 @@ def compute_ppl(
         with torch.no_grad():
             out = model(tgt, past_key_values=cache, use_cache=False)
 
-        first_lp = F.log_softmax(prefill.logits[:, -1:, :], dim=-1)   # (1,1,V)
-        rest_lp  = F.log_softmax(out.logits[:, :-1, :],     dim=-1)   # (1,T-1,V)
-        all_lp   = torch.cat([first_lp, rest_lp], dim=1)              # (1,T,V)
-        nll = -all_lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)        # (1,T)
+        first_lp = F.log_softmax(prefill.logits[:, -1:, :], dim=-1)  # (1,1,V)
+        rest_lp = F.log_softmax(out.logits[:, :-1, :], dim=-1)  # (1,T-1,V)
+        all_lp = torch.cat([first_lp, rest_lp], dim=1)  # (1,T,V)
+        nll = -all_lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # (1,T)
         total_nll += nll.sum().item()
-        total_tok  += tgt.numel()
+        total_tok += tgt.numel()
 
     if tty:
         print(f"\r{' ' * 40}\r", end="", flush=True)  # clear progress line
@@ -275,23 +281,46 @@ def compute_ppl(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="KV-cache quantization perplexity benchmark"
     )
-    parser.add_argument("--model", default="distilgpt2",
-                        help="HuggingFace model name (default: distilgpt2)")
-    parser.add_argument("--context-len", type=int, default=128,
-                        help="Tokens used as KV cache context (default: 128)")
-    parser.add_argument("--target-len", type=int, default=64,
-                        help="Tokens scored against the cache (default: 64)")
-    parser.add_argument("--max-chunks", type=int, default=50,
-                        help="Number of text chunks to evaluate (default: 50)")
-    parser.add_argument("--correction-rank", type=int, default=0,
-                        help="Low-rank correction rank applied to quantized cache. "
-                             "0 = disabled, 4 = recommended  (default: 0)")
-    parser.add_argument("--half", action="store_true",
-                        help="Load model in float16 (faster, less memory for large models)")
+    parser.add_argument(
+        "--model",
+        default="distilgpt2",
+        help="HuggingFace model name (default: distilgpt2)",
+    )
+    parser.add_argument(
+        "--context-len",
+        type=int,
+        default=128,
+        help="Tokens used as KV cache context (default: 128)",
+    )
+    parser.add_argument(
+        "--target-len",
+        type=int,
+        default=64,
+        help="Tokens scored against the cache (default: 64)",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=50,
+        help="Number of text chunks to evaluate (default: 50)",
+    )
+    parser.add_argument(
+        "--correction-rank",
+        type=int,
+        default=0,
+        help="Low-rank correction rank applied to quantized cache. "
+        "0 = disabled, 4 = recommended  (default: 0)",
+    )
+    parser.add_argument(
+        "--half",
+        action="store_true",
+        help="Load model in float16 (faster, less memory for large models)",
+    )
     args = parser.parse_args()
 
     model, tok = load_model(args.model)
@@ -300,26 +329,29 @@ def main():
     _, _, _, head_dim = get_model_dims(model)
     n_outlier = max(4, head_dim // 4)
 
-    sep(f"KV-cache quantization PPL  —  {args.model}")
-    print(f"  context : {args.context_len} tokens  "
-          f"target : {args.target_len} tokens  "
-          f"chunks : {args.max_chunks}")
+    sep(f"KV-cache quantization PPL  -  {args.model}")
+    print(
+        f"  context : {args.context_len} tokens  "
+        f"target : {args.target_len} tokens  "
+        f"chunks : {args.max_chunks}"
+    )
     if args.correction_rank:
         print(f"  correction-rank : {args.correction_rank}")
 
     chunks = load_chunks(tok, args.context_len, args.target_len, args.max_chunks)
     print(f"  Loaded  : {len(chunks)} chunks\n")
 
-    # Calibration pool — skip past the eval window so no token overlap.
-    cal_chunks = load_chunks(tok, args.context_len, args.target_len,
-                             max_chunks=8, skip=args.max_chunks)
+    # Calibration pool - skip past the eval window so no token overlap.
+    cal_chunks = load_chunks(
+        tok, args.context_len, args.target_len, max_chunks=8, skip=args.max_chunks
+    )
     cal_ids = torch.cat([c for c, _ in cal_chunks], dim=0)
     with torch.no_grad():
         cal_out = model(cal_ids, use_cache=True)
     cal_kvs = _kvs_from_cache(cal_out.past_key_values)
-    T_cal   = cal_ids.shape[1]
-    all_k   = torch.cat([kv[0].reshape(-1, T_cal, head_dim) for kv in cal_kvs])
-    all_v   = torch.cat([kv[1].reshape(-1, T_cal, head_dim) for kv in cal_kvs])
+    T_cal = cal_ids.shape[1]
+    all_k = torch.cat([kv[0].reshape(-1, T_cal, head_dim) for kv in cal_kvs])
+    all_v = torch.cat([kv[1].reshape(-1, T_cal, head_dim) for kv in cal_kvs])
 
     # -----------------------------------------------------------------------
     sep("Results")
@@ -328,29 +360,38 @@ def main():
     sep()
 
     ppl_fp32 = compute_ppl(model, chunks, label="fp32")
-    print(f"  {'Float32 (unquant)':<{W}} {ppl_fp32:>8.2f}  {'—':>10}")
+    print(f"  {'Float32 (unquant)':<{W}} {ppl_fp32:>8.2f}  {'-':>10}")
 
     for bits in BITS_LIST:
         kvc = KVCacheQuantizer(
-            head_dim=head_dim, num_bits=bits,
-            use_outlier=True, n_outlier=n_outlier,
+            head_dim=head_dim,
+            num_bits=bits,
+            use_outlier=True,
+            n_outlier=n_outlier,
             outlier_bits=min(bits + 1, 4),
             regular_bits=max(bits - 1, 1),
         )
         kvc.calibrate(all_k, all_v)
 
         # Without correction
-        ppl_q = compute_ppl(model, chunks, kvc=kvc, correction_rank=0,
-                            label=f"{bits}-bit")
+        ppl_q = compute_ppl(
+            model, chunks, kvc=kvc, correction_rank=0, label=f"{bits}-bit"
+        )
         d = ppl_q - ppl_fp32
-        print(f"  {f'{bits}-bit  (avg {kvc.avg_bits:.2f} bpw)':<{W}} "
-              f"{ppl_q:>8.2f}  {d:>+10.2f}")
+        print(
+            f"  {f'{bits}-bit  (avg {kvc.avg_bits:.2f} bpw)':<{W}} "
+            f"{ppl_q:>8.2f}  {d:>+10.2f}"
+        )
 
         # With low-rank correction (if requested)
         if args.correction_rank > 0:
-            ppl_c = compute_ppl(model, chunks, kvc=kvc,
-                                correction_rank=args.correction_rank,
-                                label=f"{bits}-bit+rank-{args.correction_rank}")
+            ppl_c = compute_ppl(
+                model,
+                chunks,
+                kvc=kvc,
+                correction_rank=args.correction_rank,
+                label=f"{bits}-bit+rank-{args.correction_rank}",
+            )
             d_c = ppl_c - ppl_fp32
             label = f"{bits}-bit + rank-{args.correction_rank} correction"
             print(f"  {label:<{W}} {ppl_c:>8.2f}  {d_c:>+10.2f}")

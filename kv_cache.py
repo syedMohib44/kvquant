@@ -73,7 +73,9 @@ class KVCacheQuantizer(nn.Module):
             self.v_quant = OutlierKVQuant(head_dim, n_outlier, ob, rb, seed=seed + 100)
         else:
             self.k_quant = KVQuantIP(head_dim, num_bits, seed=seed, qjl_seed=seed + 1)
-            self.v_quant = KVQuantIP(head_dim, num_bits, seed=seed + 2, qjl_seed=seed + 3)
+            self.v_quant = KVQuantIP(
+                head_dim, num_bits, seed=seed + 2, qjl_seed=seed + 3
+            )
 
         self._calibrated = False
 

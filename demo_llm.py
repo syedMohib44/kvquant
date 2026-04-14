@@ -141,21 +141,54 @@ def _kvs_from_cache(native_cache):
 def _apply_lowrank_correction(
     x: torch.Tensor, x_hat: torch.Tensor, rank: int
 ) -> torch.Tensor:
-    """Add rank-r SVD correction to x_hat using residual (x - x_hat)."""
+    """Add rank-r SVD correction to x_hat using residual (x - x_hat).
+
+    The quantized cache x_hat has error R = x - x_hat. That error is not
+    random - it tends to be low-rank (a few directions account for most of
+    the energy). We approximate R with a rank-r SVD and add it back, recovering
+    most of the lost precision at a fraction of the storage cost.
+    """
+    # Save original shape (B, H, T, d) to restore at the end.
+    # The model expects this exact shape - we can't return anything different.
     orig_shape = x_hat.shape
-    # reshape to (N, T, d) for batched SVD
+
+    # SVD requires exactly 3 dims: (batch, rows, cols).
+    # The KV cache is 4D: (B, H, T, d) - B=batch, H=heads, T=tokens, d=head_dim.
+    # Flatten B and H into a single batch dimension N = B*H so SVD sees (N, T, d).
+    # reshape() is a free view - no data is copied.
     N = x_hat.reshape(-1, orig_shape[-2], orig_shape[-1]).shape[0]
+
+    # Compute the residual error: how far is the quantized cache from the real cache.
+    # Use float32 to avoid precision loss during subtraction (x_hat may be float16).
     R = (x.float() - x_hat.float()).reshape(N, orig_shape[-2], orig_shape[-1])
-    T = R.shape[1]
+    T = R.shape[1]  # number of tokens in the cache
+
+    # Clamp rank so it never exceeds what SVD can produce: min(T, d) - 1.
+    # Without this, SVD would crash on very short sequences (e.g. T=2, rank=4).
     r = min(rank, T - 1, orig_shape[-1] - 1)
     if r < 1:
+        # Sequence too short to apply any correction - return as-is.
         return x_hat
+
+    # Choose SVD method based on sequence length:
+    #   T >= 64 -> randomized SVD: faster (2.5x at T=256+), slight approximation
+    #   T <  64 -> exact SVD then manually truncate to top-r components
     if T >= 64:
         U, S, Vh = _randomized_svd(R, rank=r)
     else:
         U, S, Vh = torch.linalg.svd(R, full_matrices=False)
+        # SVD returns all singular components; keep only the top-r.
+        # These hold the most energy (singular values are sorted largest->smallest).
         U, S, Vh = U[..., :r], S[..., :r], Vh[..., :r, :]
+
+    # Reconstruct the rank-r approximation of the residual error.
+    # Equivalent to U @ diag(S) @ Vh but avoids allocating a diagonal matrix.
+    # S.unsqueeze(-2) broadcasts S from (N, r) to (N, 1, r) so it scales each
+    # row of U: (N, T, r) * (N, 1, r) = (N, T, r), then @ Vh (N, r, d) = (N, T, d).
     correction = (U * S.unsqueeze(-2)) @ Vh  # (N, T, d)
+
+    # Add correction to quantized cache, reshape back to (B, H, T, d),
+    # and cast back to the original dtype (e.g. float16).
     return (x_hat.float() + correction.reshape(orig_shape)).to(x_hat.dtype)
 
 
@@ -216,7 +249,7 @@ def _quantize_cache(native_cache, kvc, correction_rank: int = 0):
                 cache_q.key_cache[i], cache_q.value_cache[i] = _quant_pair(k, v)
         return cache_q
 
-    # Legacy tuple-of-tuples (immutable — rebuild)
+    # Legacy tuple-of-tuples (immutable - rebuild)
     if isinstance(native_cache, (tuple, list)):
         result = []
         for k, v in native_cache:
@@ -226,7 +259,7 @@ def _quantize_cache(native_cache, kvc, correction_rank: int = 0):
                 result.append((k, v))
         return tuple(result)
 
-    return cache_q  # unknown type — return deep copy as-is
+    return cache_q  # unknown type - return deep copy as-is
 
 
 # ---------------------------------------------------------------------------
@@ -290,9 +323,9 @@ def _apply_repetition_penalty(logits, generated_ids, penalty):
 
 def _clean(text):
     """Strip <think>…</think> reasoning blocks (closed or unclosed) and collapse whitespace."""
-    # Closed think block → drop entirely
+    # Closed think block -> drop entirely
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # Unclosed think block (hit token limit mid-think) → drop tag and all content after
+    # Unclosed think block (hit token limit mid-think) -> drop tag and all content after
     text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -302,7 +335,7 @@ def _clean(text):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KVQuant LLM demo — benchmark or interactive generation"
+        description="KVQuant LLM demo - benchmark or interactive generation"
     )
     parser.add_argument(
         "--model",
@@ -367,9 +400,9 @@ def main():
         print(f"  Model  : {args.model}")
         print(f"  Prompt : {args.prompt!r}")
         # Determine prompt mode:
-        #   chat template  — model has a chat template (instruct/chat models)
-        #   qa-format      — base model (no chat template), auto-wrap as Q:/A:
-        #   raw            — user passed --raw, or sentence-completion style
+        #   chat template  - model has a chat template (instruct/chat models)
+        #   qa-format      - base model (no chat template), auto-wrap as Q:/A:
+        #   raw            - user passed --raw, or sentence-completion style
         raw_prompt = args.prompt
         has_template = hasattr(tok, "apply_chat_template") and bool(tok.chat_template)
         use_template = has_template and not args.raw
@@ -405,13 +438,13 @@ def main():
         input_ids = enc["input_ids"]
         T_p = input_ids.shape[1]
 
-        # Single prefill pass — gets native cache (DynamicCache or HybridCache)
+        # Single prefill pass - gets native cache (DynamicCache or HybridCache)
         # and logits at the last prompt position.
         with torch.no_grad():
             prefill_out = model(input_ids, use_cache=True)
         native_cache_orig = prefill_out.past_key_values
 
-        # Calibration pool — use TEXTS corpus for better outlier-channel estimation.
+        # Calibration pool - use TEXTS corpus for better outlier-channel estimation.
         # The prompt alone is too short (< 20 tokens) to reliably identify outliers.
         cal_enc = tok(
             TEXTS,
@@ -463,7 +496,7 @@ def main():
         gen_only = true_ids[0, T_p:]
         print(f"  Unquant: {_clean(tok.decode(gen_only, skip_special_tokens=True))}\n")
 
-        # Quantized generation — one pass per bit-width
+        # Quantized generation - one pass per bit-width
         for bits in BITS_LIST:
             kvc = KVCacheQuantizer(
                 head_dim=head_dim,
@@ -485,7 +518,7 @@ def main():
             # Greedy decode: get the first-token logit from the QUANTIZED cache
             # by cropping to T_p-1 positions and running the last prompt token
             # through. Using the unquantized prefill logit here would make all
-            # bit-widths produce the same first token — hiding the real degradation.
+            # bit-widths produce the same first token - hiding the real degradation.
             past_crop = _crop_cache(past, T_p - 1)
             with torch.no_grad():
                 q1_out = model(

@@ -4,7 +4,7 @@
 
 ## Centroids
 
-Centroids are a small fixed set of representative values (e.g. 4 for 2-bit, 16 for 4-bit). Every real value in the vector gets replaced by its nearest centroid — that's quantization. The centroid index (2 bits) is stored instead of the full float (32 bits).
+Centroids are a small fixed set of representative values (e.g. 4 for 2-bit, 16 for 4-bit). Every real value in the vector gets replaced by its nearest centroid - that's quantization. The centroid index (2 bits) is stored instead of the full float (32 bits).
 
 The optimal centroid positions depend on the distribution of input values.
 
@@ -13,7 +13,7 @@ If data is uniform:         centroids are equally spaced
 If data is bell-shaped:     centroids cluster in the middle (more data there)
 If data is sphere marginal: centroids are slightly different from Gaussian bell
 
-Wrong distribution → wrong centroid positions → more error for the same 
+Wrong distribution -> wrong centroid positions -> more error for the same 
 
 # In code: how centroids are used
 
@@ -25,7 +25,7 @@ centroids = tensor([-0.87, -0.29, +0.29, +0.87])   # shape (4,) for 2-bit
 # We use binary search on the midpoints:
 boundaries = (centroids[:-1] + centroids[1:]) / 2   # [-0.58, 0.0, +0.58]
 index = torch.bucketize(y, boundaries)
-# y = 0.31 → falls in bucket 2 → index = 2
+# y = 0.31 -> falls in bucket 2 -> index = 2
 
 # ---- DEQUANTIZE: look up centroid value ----
 y_reconstructed = centroids[index]    # centroids[2] = +0.29
@@ -55,7 +55,7 @@ y_reconstructed = centroids[index]    # centroids[2] = +0.29
 | `SO(d)` | special orthogonal group | all proper rotations in d dimensions (det = +1, no reflections) |
 | `N(0, 1/d)` | Gaussian mean 0, variance 1/d | the distribution each rotated coordinate approximately follows |
 | `b` | bits | bits per coordinate used for quantization (1–4 in this codebase) |
-| `k` (codebook) | number of centroids | k = 2ᵇ - e.g. 4-bit → 16 centroids |
+| `k` (codebook) | number of centroids | k = 2ᵇ - e.g. 4-bit -> 16 centroids |
 | `T` | sequence length | number of tokens in the KV cache |
 | `d` | head dimension | size of each key/value vector (e.g. 64, 128, 256) |
 | `r` | rank | number of singular vectors used in low-rank correction |
@@ -77,7 +77,7 @@ S¹: unit circle in ℝ²        all [x,y] where x²+y²=1
 S²: unit sphere in ℝ³        all [x,y,z] where x²+y²+z²=1
 Sᵈ⁻¹: unit sphere in ℝᵈ     all k where ‖k‖=1
 
-k_unit = k / ‖k‖   →   projects any vector onto Sᵈ⁻¹
+k_unit = k / ‖k‖   ->   projects any vector onto Sᵈ⁻¹
 ```
 
 In code: `x_unit = x / x.norm()` - projecting onto Sᵈ⁻¹.
@@ -112,7 +112,7 @@ Every key vector `k ∈ ℝᵈ` in the KV cache is a point on (or near) the unit
 If `k` isn't unit-norm, it gets normalized first and the norm is saved separately.
 
 ```
-k  →  norm = ||k||  →  k_unit = k / norm   (on unit sphere Sᵈ⁻¹)
+k  ->  norm = ||k||  ->  k_unit = k / norm   (on unit sphere Sᵈ⁻¹)
                                   ↓
                               [quantize]
                                   ↓
@@ -172,7 +172,7 @@ def _lloyd_max(num_bits, dim, num_steps=2000, num_samples=500_000) -> Tensor:
     for _ in range(num_steps):
         # --- Assignment (binary search, O(n log k)) ---
         boundaries = ((centroids[:-1] + centroids[1:]) / 2).contiguous()  # (k-1,) midpoints
-        assignments = torch.bucketize(samples, boundaries)                 # (N,) each sample → bucket index
+        assignments = torch.bucketize(samples, boundaries)                 # (N,) each sample -> bucket index
 
         # --- Update (mean per bucket) ---
         new_centroids = torch.zeros(k)
@@ -235,7 +235,7 @@ def _make_qr_rotation(dim: int, seed: int) -> Tensor:
 
     # Enforce SO(d): det must be +1, not -1
     if torch.linalg.det(Q) < 0:
-        Q[:, 0] = -Q[:, 0]                    # flip one column → flips the determinant sign
+        Q[:, 0] = -Q[:, 0]                    # flip one column -> flips the determinant sign
 
     return Q   # (d, d) proper rotation matrix
 ```
@@ -254,7 +254,7 @@ def forward(self, x):  return x @ self.Pi.T   # rotate:   y = x Πᵀ
 def inverse(self, y):  return y @ self.Pi      # unrotate: x = y Π  (Π⁻¹ = Πᵀ for orthogonal)
 ```
 
-**Cost:** O(d²) per vector, stores `d²` floats (e.g. d=128 → 16,384 floats = 64KB).
+**Cost:** O(d²) per vector, stores `d²` floats (e.g. d=128 -> 16,384 floats = 64KB).
 
 ### `HadamardRotation` - structured, fast
 
@@ -350,7 +350,7 @@ class KVQuantMSE(nn.Module):
         # Build Lloyd-Max codebook for the true sphere marginal, shape (2**num_bits,)
         centroids = build_codebook(num_bits, dim)
         self.register_buffer("centroids", centroids)
-        # register_buffer → saved in state_dict, moved to GPU with .cuda(), not a parameter
+        # register_buffer -> saved in state_dict, moved to GPU with .cuda(), not a parameter
 ```
 
 **Quantize - step by step:**
@@ -537,7 +537,7 @@ outer indices less often. This non-uniformity means fixed-length codes waste bit
 ```
 H = -∑ pᵢ log₂(pᵢ)
 ```
-At b=4, d=128: H ≈ 3.765 bits vs 4 raw bits → ~5% free compression.
+At b=4, d=128: H ≈ 3.765 bits vs 4 raw bits -> ~5% free compression.
 
 ### Step 1 - Compute symbol probabilities
 
@@ -611,7 +611,7 @@ class HuffmanCodec:
         return torch.tensor(symbols, dtype=torch.long)
 ```
 
-The decode table is a dict: `{"0": 7, "10": 8, "110": 6, ...}` - codeword string → symbol integer.
+The decode table is a dict: `{"0": 7, "10": 8, "110": 6, ...}` - codeword string -> symbol integer.
 
 ```python
 def entropy_bits(num_bits, dim) -> float:
@@ -716,11 +716,11 @@ class KVCacheQuantizer(nn.Module):
                  n_outlier=32, outlier_bits=None, regular_bits=None, seed=0):
 
         if use_outlier:
-            ob = outlier_bits or min(num_bits + 1, 4)   # e.g. 3→4-bit outliers
-            rb = regular_bits or max(num_bits - 1, 1)   # e.g. 3→2-bit regular
+            ob = outlier_bits or min(num_bits + 1, 4)   # e.g. 3->4-bit outliers
+            rb = regular_bits or max(num_bits - 1, 1)   # e.g. 3->2-bit regular
             self.k_quant = OutlierKVQuant(head_dim, n_outlier, ob, rb, seed=seed)
             self.v_quant = OutlierKVQuant(head_dim, n_outlier, ob, rb, seed=seed+100)
-            # Different seeds → independent rotation matrices for K and V
+            # Different seeds -> independent rotation matrices for K and V
         else:
             self.k_quant = KVQuantIP(head_dim, num_bits, seed=seed,   qjl_seed=seed+1)
             self.v_quant = KVQuantIP(head_dim, num_bits, seed=seed+2, qjl_seed=seed+3)
@@ -784,7 +784,7 @@ def quantize(self, keys: Tensor, query: Tensor) -> AttentionWeightedQuantized:
     scores  = scores / math.sqrt(self.dim)
     weights = F.softmax(scores, dim=-1)                              # (N, T)
 
-    # Split: top fraction → hi_bits
+    # Split: top fraction -> hi_bits
     k_hi     = max(1, int(T * self.top_fraction))       # number of hi-attention tokens
     _, top_idx = weights.topk(k_hi, dim=-1)             # (N, k_hi) indices
     top_mask   = torch.zeros(N, T, dtype=torch.bool)
@@ -890,7 +890,7 @@ def push(self, k: Tensor, v: Tensor) -> None:
 **Why use reconstructed delta to update `_prev`?**
 
 If we used the true delta: `_k_prev = k` (true key)
-Then at get() time we'd accumulate reconstructed deltas on top of a true anchor →
+Then at get() time we'd accumulate reconstructed deltas on top of a true anchor ->
 the running sum would drift from what we stored.
 
 By using `_k_prev += dequantize(qk)`, both `push()` and `get()` see the same accumulated
@@ -980,7 +980,7 @@ def attend(self, attn_weights: Tensor) -> None:
         target_bits  = self._score_to_bits(new_score)   # which tier?
 
         if target_bits != self._k_entries[t].bits:
-            # Bit-width changed → must recompress
+            # Bit-width changed -> must recompress
             k_hat = self._dequantize(self._k_entries[t])   # decompress at old bit-width
             v_hat = self._dequantize(self._v_entries[t])
             qk    = self._quantize(k_hat, target_bits)     # recompress at new bit-width
@@ -996,17 +996,17 @@ def attend(self, attn_weights: Tensor) -> None:
     self._v_entries = new_v
 ```
 
-### Score → tier mapping
+### Score -> tier mapping
 
 ```python
 def _score_to_bits(self, score: float) -> int:
-    if score >= self.hi_threshold:      # e.g. ≥ 0.1   → 4-bit
+    if score >= self.hi_threshold:      # e.g. ≥ 0.1   -> 4-bit
         return self.hi_bits
-    if score >= self.lo_threshold:      # e.g. ≥ 0.01  → 3-bit
+    if score >= self.lo_threshold:      # e.g. ≥ 0.01  -> 3-bit
         return self.mid_bits
-    if score >= self.evict_threshold:   # e.g. ≥ 0.001 → 2-bit
+    if score >= self.evict_threshold:   # e.g. ≥ 0.001 -> 2-bit
         return self.lo_bits
-    return self.evict_bits              # e.g. < 0.001  → 1-bit (effectively evicted)
+    return self.evict_bits              # e.g. < 0.001  -> 1-bit (effectively evicted)
 ```
 
 **Hysteresis is implicit:** EMA smoothing means a token's score changes slowly.
@@ -1124,7 +1124,7 @@ def residual_rank_analysis(self, x: Tensor, max_rank: int = 16) -> Tensor:
     S       = S.squeeze(0)
     energy  = S ** 2
     return energy[:max_rank].cumsum(0) / energy.sum()
-    # e.g. [0.42, 0.61, 0.74, 0.83, ...] → rank-4 captures 83% of error energy
+    # e.g. [0.42, 0.61, 0.74, 0.83, ...] -> rank-4 captures 83% of error energy
 ```
 
 ---
@@ -1143,8 +1143,8 @@ Input k ∈ ℝ^(B,H,T,d)
          ▼
 [outlier.py - OutlierKVQuant.quantize()]
   var = x.var(dim=0)
-  outlier channels → sub-quantizer at outlier_bits
-  regular channels → sub-quantizer at regular_bits
+  outlier channels -> sub-quantizer at outlier_bits
+  regular channels -> sub-quantizer at regular_bits
          │
          ▼
 [quantizer.py - KVQuantMSE.quantize() or KVQuantIP.quantize()]
@@ -1181,8 +1181,8 @@ Input k ∈ ℝ^(B,H,T,d)
          ▼
 [attn_weighted.py - AttentionWeightedQuantizer.quantize()]
   weights = softmax(q @ K.T / sqrt(d))
-  top 50% tokens → hi_quantizer (4-bit)
-  bot 50% tokens → lo_quantizer (2-bit)        ← average still 3 bits
+  top 50% tokens -> hi_quantizer (4-bit)
+  bot 50% tokens -> lo_quantizer (2-bit)        ← average still 3 bits
 ```
 
 ---
@@ -1191,15 +1191,15 @@ Input k ∈ ℝ^(B,H,T,d)
 
 | Extension | What it exploits | Mechanism | Result |
 |---|---|---|---|
-| Attention-weighted | Tokens differ in importance | topk by softmax weight → different bit-widths | 47-70% reduction in attention-weighted distortion |
+| Attention-weighted | Tokens differ in importance | topk by softmax weight -> different bit-widths | 47-70% reduction in attention-weighted distortion |
 | Delta compression | Adjacent KV correlated | compress `kₜ - kₜ₋₁` not `kₜ` | 1.1-2.2× MSE improvement |
 | Low-rank correction | Quantization error is low-rank | truncated SVD of residual R | ~11% MSE at rank-4 (7.4% storage), ~19% at rank-8 |
-| Adaptive allocation | Token importance changes over time | EMA score → tier promotion/demotion | handles late-emerging important tokens |
-| Hadamard rotation | O(d²) → O(d log d) | butterfly FWHT, d-float sign mask | same guarantees, much faster and cheaper |
+| Adaptive allocation | Token importance changes over time | EMA score -> tier promotion/demotion | handles late-emerging important tokens |
+| Hadamard rotation | O(d²) -> O(d log d) | butterfly FWHT, d-float sign mask | same guarantees, much faster and cheaper |
 | True sphere marginal | Post-rotation distribution is Beta not Gaussian | sample ℝᵈ Gaussians, normalize, take one coord | tighter centroids at b=1,2 |
 | Bucketize lookup | Sorted centroids allow binary search | `torch.bucketize` on midpoints | 14-22× speedup over argmin expansion |
-| In-place FWHT | O(log d) allocations → 1 per level | one `a` buffer reused in butterfly | reduced memory pressure |
-| Outlier channels | Few channels dominate variance | calibrate → split → quantize separately | avoids destroying high-variance channels at low bits |
+| In-place FWHT | O(log d) allocations -> 1 per level | one `a` buffer reused in butterfly | reduced memory pressure |
+| Outlier channels | Few channels dominate variance | calibrate -> split -> quantize separately | avoids destroying high-variance channels at low bits |
 | Huffman coding | Index distribution is non-uniform | build tree from Voronoi cell areas | ~5% compression over raw bit representation |
 
 ---
@@ -1222,10 +1222,10 @@ nn.Module
 └── LowRankCorrection        (wraps any KVQuantMSE/KVQuantIP)
 
 Return types (all NamedTuples, composable):
-  QuantizedMSE    → indices, norms, shape
-  QuantizedIP     → indices, qjl_bits, r_norm, vec_norms, shape
-  CompressedMSE   → bits, norms, shape, codec, indices_len
-  OutlierQuantized → outlier_q, regular_q, outlier_idx, regular_idx, shape
-  AttentionWeightedQuantized → hi_q, lo_q, top_mask, shape, dim
-  CorrectedQuantized → base_q, U, V, shape
+  QuantizedMSE    -> indices, norms, shape
+  QuantizedIP     -> indices, qjl_bits, r_norm, vec_norms, shape
+  CompressedMSE   -> bits, norms, shape, codec, indices_len
+  OutlierQuantized -> outlier_q, regular_q, outlier_idx, regular_idx, shape
+  AttentionWeightedQuantized -> hi_q, lo_q, top_mask, shape, dim
+  CorrectedQuantized -> base_q, U, V, shape
 ```

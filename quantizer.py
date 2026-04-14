@@ -52,31 +52,33 @@ from .rotation import RandomRotation, HadamardRotation
 # Return types
 # ---------------------------------------------------------------------------
 
+
 class QuantizedMSE(NamedTuple):
-    indices: Tensor           # LongTensor  (..., d)
-    norms:   Tensor           # FloatTensor (..., 1)  - original vector norms
-    shape:   tuple            # original shape before flattening to (..., d)
+    indices: Tensor  # LongTensor  (..., d)
+    norms: Tensor  # FloatTensor (..., 1)  - original vector norms
+    shape: tuple  # original shape before flattening to (..., d)
 
 
 class CompressedMSE(NamedTuple):
-    bits:        list         # Huffman-encoded bit stream
-    norms:       Tensor       # FloatTensor (..., 1)
-    shape:       tuple
-    codec:       object       # HuffmanCodec instance
-    indices_len: int          # total number of indices encoded
+    bits: list  # Huffman-encoded bit stream
+    norms: Tensor  # FloatTensor (..., 1)
+    shape: tuple
+    codec: object  # HuffmanCodec instance
+    indices_len: int  # total number of indices encoded
 
 
 class QuantizedIP(NamedTuple):
-    indices:   Tensor         # LongTensor  (..., d)  - (b-1)-bit MSE indices
-    qjl_bits:  Tensor         # BoolTensor  (..., d)  - QJL sign bits
-    r_norm:    Tensor         # FloatTensor (..., 1)  - residual norm (normalised space)
-    vec_norms: Tensor         # FloatTensor (..., 1)  - input vector norms
-    shape:     tuple
+    indices: Tensor  # LongTensor  (..., d)  - (b-1)-bit MSE indices
+    qjl_bits: Tensor  # BoolTensor  (..., d)  - QJL sign bits
+    r_norm: Tensor  # FloatTensor (..., 1)  - residual norm (normalised space)
+    vec_norms: Tensor  # FloatTensor (..., 1)  - input vector norms
+    shape: tuple
 
 
 # ---------------------------------------------------------------------------
 # MSE-optimal quantizer
 # ---------------------------------------------------------------------------
+
 
 class KVQuantMSE(nn.Module):
     """
@@ -110,15 +112,16 @@ class KVQuantMSE(nn.Module):
         self.use_hadamard = False if use_hadamard is None else use_hadamard
 
         if self.use_hadamard:
-            assert (dim & (dim - 1)) == 0, \
-                "use_hadamard=True requires dim to be a power of 2"
+            assert (
+                dim & (dim - 1)
+            ) == 0, "use_hadamard=True requires dim to be a power of 2"
             self.rotation = HadamardRotation(dim, seed)
         else:
             self.rotation = RandomRotation(dim, seed)
 
         # Centroids and pre-computed boundaries for fast bucketize
         centroids, boundaries = build_codebook(num_bits, dim)
-        self.register_buffer("centroids",  centroids)   # (k,)
+        self.register_buffer("centroids", centroids)  # (k,)
         self.register_buffer("boundaries", boundaries)  # (k-1,)
 
     # ------------------------------------------------------------------
@@ -140,10 +143,10 @@ class KVQuantMSE(nn.Module):
         x_unit = x_flat / norms
 
         # Rotate
-        y = self.rotation(x_unit)                                   # (N, d)
+        y = self.rotation(x_unit)  # (N, d)
 
-        # Nearest centroid via binary search — boundaries cached from build_codebook
-        indices = torch.bucketize(y, self.boundaries)               # (N, d)
+        # Nearest centroid via binary search - boundaries cached from build_codebook
+        indices = torch.bucketize(y, self.boundaries)  # (N, d)
 
         return QuantizedMSE(
             indices=indices.reshape(*shape[:-1], self.dim),
@@ -165,8 +168,8 @@ class KVQuantMSE(nn.Module):
         idx_flat = q.indices.reshape(N, self.dim)
         norms_flat = q.norms.reshape(N, 1)
 
-        y_tilde = self.centroids[idx_flat]                         # (N, d)
-        x_unit_hat = self.rotation.inverse(y_tilde)                # (N, d)
+        y_tilde = self.centroids[idx_flat]  # (N, d)
+        x_unit_hat = self.rotation.inverse(y_tilde)  # (N, d)
 
         # Restore scale
         x_hat = x_unit_hat * norms_flat
@@ -186,8 +189,8 @@ class KVQuantMSE(nn.Module):
         Skips the norm-restore multiply and the QuantizedMSE allocation.
         Used internally by KVQuantIP.dequantize() where norms are always 1.
         """
-        y_tilde = self.centroids[idx_flat]          # (N, d)
-        return self.rotation.inverse(y_tilde)       # (N, d)
+        y_tilde = self.centroids[idx_flat]  # (N, d)
+        return self.rotation.inverse(y_tilde)  # (N, d)
 
     def forward(self, x: Tensor) -> Tensor:
         """Quantize then immediately dequantize."""
@@ -205,11 +208,17 @@ class KVQuantMSE(nn.Module):
         Useful for measuring actual storage cost after entropy coding.
         """
         from .entropy import HuffmanCodec
+
         q = self.quantize(x)
         codec = HuffmanCodec(self.num_bits, self.dim)
         bits = codec.encode(q.indices)
-        return CompressedMSE(bits=bits, norms=q.norms, shape=q.shape,
-                             codec=codec, indices_len=q.indices.numel())
+        return CompressedMSE(
+            bits=bits,
+            norms=q.norms,
+            shape=q.shape,
+            codec=codec,
+            indices_len=q.indices.numel(),
+        )
 
     def extra_repr(self) -> str:
         rot = "hadamard" if self.use_hadamard else "qr"
@@ -219,6 +228,7 @@ class KVQuantMSE(nn.Module):
 # ---------------------------------------------------------------------------
 # Inner-product-optimal quantizer (two-stage)
 # ---------------------------------------------------------------------------
+
 
 class KVQuantIP(nn.Module):
     """
@@ -264,7 +274,7 @@ class KVQuantIP(nn.Module):
         gen = torch.Generator()
         gen.manual_seed(qjl_seed)
         S = torch.randn(dim, dim, generator=gen)
-        self.register_buffer("S", S)   # (d, d)
+        self.register_buffer("S", S)  # (d, d)
 
     # ------------------------------------------------------------------
     def quantize(self, x: Tensor) -> QuantizedIP:
@@ -287,21 +297,21 @@ class KVQuantIP(nn.Module):
 
         # --- Stage 1: MSE quantize with (b-1) bits (on unit-norm vector) ---
         if self.mse_quantizer is not None:
-            # x_unit is already normalised — use the fast path that skips the
+            # x_unit is already normalised - use the fast path that skips the
             # internal norm() + clamp() + div() and avoids allocating QuantizedMSE.
-            indices   = self.mse_quantizer._quantize_unit(x_unit)    # (N, d)
+            indices = self.mse_quantizer._quantize_unit(x_unit)  # (N, d)
             x_hat_unit = self.mse_quantizer._dequantize_unit(indices)  # (N, d)
         else:
             x_hat_unit = torch.zeros_like(x_unit)
             indices = torch.zeros(N, self.dim, dtype=torch.long, device=x_flat.device)
 
         # --- Stage 2: QJL on unit-norm residual ---
-        r_unit = x_unit - x_hat_unit                         # (N, d)
-        r_norm = r_unit.norm(dim=-1, keepdim=True)            # (N, 1)
+        r_unit = x_unit - x_hat_unit  # (N, d)
+        r_norm = r_unit.norm(dim=-1, keepdim=True)  # (N, 1)
 
         # sign(S @ r_unit), S is (d, d) - computed as r_unit @ S.T
-        qjl_proj = r_unit @ self.S.T                          # (N, d)
-        qjl_bits = qjl_proj > 0                               # (N, d) bool
+        qjl_proj = r_unit @ self.S.T  # (N, d)
+        qjl_bits = qjl_proj > 0  # (N, d) bool
 
         return QuantizedIP(
             indices=indices.reshape(*shape[:-1], self.dim),
@@ -330,17 +340,21 @@ class KVQuantIP(nn.Module):
             # and avoid allocating a (N, 1) ones tensor on every call.
             x_hat_unit = self.mse_quantizer._dequantize_unit(idx_flat)
         else:
-            x_hat_unit = torch.zeros(N, self.dim, device=self.S.device, dtype=self.S.dtype)
+            x_hat_unit = torch.zeros(
+                N, self.dim, device=self.S.device, dtype=self.S.dtype
+            )
 
         # --- QJL residual correction ---
         # Unbiasedness of QJL (Lemma 4):
         #   E[<y, (sqrt(pi/2)/d) * r_norm * S.T @ sign(S @ r)>] = <y, r>
-        signs = 2.0 * bits_flat - 1.0                        # {-1, +1}
+        signs = 2.0 * bits_flat - 1.0  # {-1, +1}
         # signs @ S  ≡ per-row  S.T @ sign(S @ r)
-        correction = (math.sqrt(math.pi / 2.0) / self.dim) * r_norm_flat * (signs @ self.S)
+        correction = (
+            (math.sqrt(math.pi / 2.0) / self.dim) * r_norm_flat * (signs @ self.S)
+        )
 
         # Combine and restore original scale
-        x_tilde_unit = x_hat_unit + correction                # (N, d)
+        x_tilde_unit = x_hat_unit + correction  # (N, d)
         x_tilde = x_tilde_unit * vec_norms_flat
 
         return x_tilde.reshape(q.shape)
@@ -358,7 +372,7 @@ class KVQuantIP(nn.Module):
             y: (..., d) query vectors.
         """
         x_tilde = self.forward(x)
-        true_ip  = (x * y).sum(-1)
+        true_ip = (x * y).sum(-1)
         approx_ip = (x_tilde * y).sum(-1)
         return ((true_ip - approx_ip) ** 2).mean()
 

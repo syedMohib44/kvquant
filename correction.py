@@ -70,7 +70,7 @@ def _randomized_svd(
     N, m, n = A.shape
     k = min(rank + n_oversampling, min(m, n))
 
-    # Random Gaussian sketch: Y = A @ Omega  →  (N, m, k)
+    # Random Gaussian sketch: Y = A @ Omega -> (N, m, k)
     Omega = torch.randn(N, n, k, device=A.device, dtype=A.dtype)
     Y = A @ Omega
 
@@ -82,20 +82,20 @@ def _randomized_svd(
         Y = A @ Z
 
     # Final orthonormal basis for range(A)
-    Q, _ = torch.linalg.qr(Y)                       # (N, m, k)
-    # Project into small space and run exact SVD there — cheap: O(k²·n)
-    B = Q.transpose(-2, -1) @ A                      # (N, k, n)
+    Q, _ = torch.linalg.qr(Y)  # (N, m, k)
+    # Project into small space and run exact SVD there - cheap: O(k²·n)
+    B = Q.transpose(-2, -1) @ A  # (N, k, n)
     U_hat, S, Vh = torch.linalg.svd(B, full_matrices=False)
-    U = Q @ U_hat                                    # (N, m, k)
+    U = Q @ U_hat  # (N, m, k)
 
     return U[..., :rank], S[..., :rank], Vh[..., :rank, :]
 
 
 class CorrectedQuantized(NamedTuple):
-    base_q:  QuantizedMSE | QuantizedIP   # compressed base
-    U:       Tensor                        # (T, r)  left singular vectors * singular values
-    V:       Tensor                        # (d, r)  right singular vectors
-    shape:   tuple
+    base_q: QuantizedMSE | QuantizedIP  # compressed base
+    U: Tensor  # (T, r)  left singular vectors * singular values
+    V: Tensor  # (d, r)  right singular vectors
+    shape: tuple
 
 
 class LowRankCorrection(nn.Module):
@@ -137,11 +137,11 @@ class LowRankCorrection(nn.Module):
         """
         shape = x.shape
         # Flatten to (N*T, d) for the quantizer, then reshape residual to (N, T, d)
-        x_2d = x.reshape(-1, self.dim)                    # (NT, d)
+        x_2d = x.reshape(-1, self.dim)  # (NT, d)
 
-        base_q  = self.quantizer.quantize(x_2d)
-        x_hat   = self.quantizer.dequantize(base_q)       # (NT, d)
-        residual = (x_2d - x_hat).reshape(*shape)          # (..., T, d)
+        base_q = self.quantizer.quantize(x_2d)
+        x_hat = self.quantizer.dequantize(base_q)  # (NT, d)
+        residual = (x_2d - x_hat).reshape(*shape)  # (..., T, d)
 
         residual_flat = residual.reshape(-1, shape[-2], self.dim)  # (N, T, d)
         r = min(self.rank, min(shape[-2], self.dim))
@@ -156,13 +156,13 @@ class LowRankCorrection(nn.Module):
         # U: (N, T, r)  S: (N, r)  Vh: (N, r, d)
 
         # Absorb S into U:  U_scaled = U * S  so correction = U_scaled @ Vh
-        U_scaled = U * S.unsqueeze(-2)                    # (N, T, r)
-        V = Vh.transpose(-2, -1)                          # (N, d, r)
+        U_scaled = U * S.unsqueeze(-2)  # (N, T, r)
+        V = Vh.transpose(-2, -1)  # (N, d, r)
 
         return CorrectedQuantized(
             base_q=base_q,
-            U=U_scaled.reshape(*shape[:-1], r),           # (..., T, r)
-            V=V.reshape(*shape[:-2], self.dim, r),        # (..., d, r)
+            U=U_scaled.reshape(*shape[:-1], r),  # (..., T, r)
+            V=V.reshape(*shape[:-2], self.dim, r),  # (..., d, r)
             shape=shape,
         )
 
@@ -192,14 +192,14 @@ class LowRankCorrection(nn.Module):
         """
         x_2d = x.reshape(-1, self.dim)
         base_q = self.quantizer.quantize(x_2d)
-        x_hat  = self.quantizer.dequantize(base_q)
-        R = (x_2d - x_hat).reshape(1, -1, self.dim)   # (1, N, d)
+        x_hat = self.quantizer.dequantize(base_q)
+        R = (x_2d - x_hat).reshape(1, -1, self.dim)  # (1, N, d)
 
         rank = min(max_rank, min(R.shape[-2], self.dim))
         _, S, _ = _randomized_svd(R, rank=rank)
         S = S.squeeze(0)
-        energy = S ** 2
-        total  = energy.sum()
+        energy = S**2
+        total = energy.sum()
         cumulative = energy.cumsum(0) / total
         return cumulative
 

@@ -36,15 +36,15 @@ from .quantizer import KVQuantMSE, QuantizedMSE
 
 
 # Bit-width tiers
-_TIERS = [4, 3, 2, 1]   # hi -> lo
+_TIERS = [4, 3, 2, 1]  # hi -> lo
 
 
 class _CacheEntry(NamedTuple):
-    q:              QuantizedMSE   # compressed KV
-    bits:           int            # current bit-width
-    score:          float          # importance score (EMA of attention weights)
-    pending_bits:   int            # target tier being waited on (hysteresis)
-    pending_steps:  int            # consecutive steps in pending_bits tier
+    q: QuantizedMSE  # compressed KV
+    bits: int  # current bit-width
+    score: float  # importance score (EMA of attention weights)
+    pending_bits: int  # target tier being waited on (hysteresis)
+    pending_steps: int  # consecutive steps in pending_bits tier
 
 
 class AdaptiveKVCache(nn.Module):
@@ -83,23 +83,25 @@ class AdaptiveKVCache(nn.Module):
         seed: int = 0,
     ) -> None:
         super().__init__()
-        self.head_dim  = head_dim
-        self.hi_bits   = hi_bits
-        self.mid_bits  = mid_bits
-        self.lo_bits   = lo_bits
+        self.head_dim = head_dim
+        self.hi_bits = hi_bits
+        self.mid_bits = mid_bits
+        self.lo_bits = lo_bits
         self.evict_bits = evict_bits
-        self.hi_threshold    = hi_threshold
-        self.lo_threshold    = lo_threshold
+        self.hi_threshold = hi_threshold
+        self.lo_threshold = lo_threshold
         self.evict_threshold = evict_threshold
-        self.ema_decay        = ema_decay
+        self.ema_decay = ema_decay
         self.hysteresis_steps = hysteresis_steps
 
         # One quantizer per bit-width tier
-        self._quantizers = nn.ModuleDict({
-            str(b): KVQuantMSE(head_dim, b, seed=seed + b)
-            for b in (hi_bits, mid_bits, lo_bits, evict_bits)
-            if b >= 1
-        })
+        self._quantizers = nn.ModuleDict(
+            {
+                str(b): KVQuantMSE(head_dim, b, seed=seed + b)
+                for b in (hi_bits, mid_bits, lo_bits, evict_bits)
+                if b >= 1
+            }
+        )
 
         self._k_entries: list[_CacheEntry] = []
         self._v_entries: list[_CacheEntry] = []
@@ -115,10 +117,24 @@ class AdaptiveKVCache(nn.Module):
         """
         qk = self._quantize(k, self.hi_bits)
         qv = self._quantize(v, self.hi_bits)
-        self._k_entries.append(_CacheEntry(q=qk, bits=self.hi_bits, score=1.0,
-                                           pending_bits=self.hi_bits, pending_steps=0))
-        self._v_entries.append(_CacheEntry(q=qv, bits=self.hi_bits, score=1.0,
-                                           pending_bits=self.hi_bits, pending_steps=0))
+        self._k_entries.append(
+            _CacheEntry(
+                q=qk,
+                bits=self.hi_bits,
+                score=1.0,
+                pending_bits=self.hi_bits,
+                pending_steps=0,
+            )
+        )
+        self._v_entries.append(
+            _CacheEntry(
+                q=qv,
+                bits=self.hi_bits,
+                score=1.0,
+                pending_bits=self.hi_bits,
+                pending_steps=0,
+            )
+        )
 
     def attend(self, attn_weights: Tensor) -> None:
         """
@@ -138,15 +154,15 @@ class AdaptiveKVCache(nn.Module):
         new_k, new_v = [], []
         for t in range(T):
             ek = self._k_entries[t]
-            new_score  = self.ema_decay * ek.score + (1 - self.ema_decay) * w[t]
-            want_bits  = self._score_to_bits(new_score)
+            new_score = self.ema_decay * ek.score + (1 - self.ema_decay) * w[t]
+            want_bits = self._score_to_bits(new_score)
 
             # Hysteresis: only commit to a new tier after hysteresis_steps
             # consecutive steps in that tier.  Avoids expensive recompression
             # triggered by transient attention spikes.
             if want_bits == ek.bits:
-                # Staying in the same tier — reset pending counter
-                new_pending_bits  = ek.bits
+                # Staying in the same tier - reset pending counter
+                new_pending_bits = ek.bits
                 new_pending_steps = 0
                 qk = ek.q
                 qv = self._v_entries[t].q
@@ -160,29 +176,41 @@ class AdaptiveKVCache(nn.Module):
                     v_hat = self._dequantize(self._v_entries[t])
                     qk = self._quantize(k_hat, want_bits)
                     qv = self._quantize(v_hat, want_bits)
-                    actual_bits       = want_bits
-                    new_pending_bits  = want_bits
+                    actual_bits = want_bits
+                    new_pending_bits = want_bits
                     new_pending_steps = 0
                 else:
-                    # Not yet confirmed — keep current compression
+                    # Not yet confirmed - keep current compression
                     qk = ek.q
                     qv = self._v_entries[t].q
-                    actual_bits      = ek.bits
+                    actual_bits = ek.bits
                     new_pending_bits = want_bits
             else:
-                # New tier being requested — start fresh hysteresis counter
-                new_pending_bits  = want_bits
+                # New tier being requested - start fresh hysteresis counter
+                new_pending_bits = want_bits
                 new_pending_steps = 1
                 qk = ek.q
                 qv = self._v_entries[t].q
                 actual_bits = ek.bits
 
-            new_k.append(_CacheEntry(q=qk, bits=actual_bits, score=new_score,
-                                     pending_bits=new_pending_bits,
-                                     pending_steps=new_pending_steps))
-            new_v.append(_CacheEntry(q=qv, bits=actual_bits, score=new_score,
-                                     pending_bits=new_pending_bits,
-                                     pending_steps=new_pending_steps))
+            new_k.append(
+                _CacheEntry(
+                    q=qk,
+                    bits=actual_bits,
+                    score=new_score,
+                    pending_bits=new_pending_bits,
+                    pending_steps=new_pending_steps,
+                )
+            )
+            new_v.append(
+                _CacheEntry(
+                    q=qv,
+                    bits=actual_bits,
+                    score=new_score,
+                    pending_bits=new_pending_bits,
+                    pending_steps=new_pending_steps,
+                )
+            )
 
         self._k_entries = new_k
         self._v_entries = new_v
@@ -239,10 +267,10 @@ class AdaptiveKVCache(nn.Module):
         n = len(qs)
         BH = qs[0].indices.reshape(-1, self.head_dim).shape[0]
 
-        all_idx   = torch.cat([q.indices.reshape(-1, self.head_dim) for q in qs])
-        all_norms = torch.cat([q.norms.reshape(-1, 1)               for q in qs])
-        combined  = QuantizedMSE(all_idx, all_norms, (n * BH, self.head_dim))
-        result    = quantizer.dequantize(combined)      # (n*BH, head_dim)
+        all_idx = torch.cat([q.indices.reshape(-1, self.head_dim) for q in qs])
+        all_norms = torch.cat([q.norms.reshape(-1, 1) for q in qs])
+        combined = QuantizedMSE(all_idx, all_norms, (n * BH, self.head_dim))
+        result = quantizer.dequantize(combined)  # (n*BH, head_dim)
         return result.reshape(n, BH, self.head_dim)
 
     def reset(self) -> None:
@@ -283,6 +311,8 @@ class AdaptiveKVCache(nn.Module):
         return self._quantizers[str(entry.bits)].dequantize(entry.q)
 
     def extra_repr(self) -> str:
-        return (f"head_dim={self.head_dim}, tiers=({self.hi_bits},{self.mid_bits},"
-                f"{self.lo_bits},{self.evict_bits}), length={self.length}, "
-                f"avg_bits={self.avg_bits():.2f}")
+        return (
+            f"head_dim={self.head_dim}, tiers=({self.hi_bits},{self.mid_bits},"
+            f"{self.lo_bits},{self.evict_bits}), length={self.length}, "
+            f"avg_bits={self.avg_bits():.2f}"
+        )

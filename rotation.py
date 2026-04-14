@@ -27,6 +27,7 @@ from torch import Tensor
 # Dense QR rotation  (original)
 # ---------------------------------------------------------------------------
 
+
 class RandomRotation(nn.Module):
     """
     Fixed random orthogonal rotation Pi (belongs to) R^{d×d} via QR decomposition.
@@ -60,6 +61,7 @@ class RandomRotation(nn.Module):
 # Structured Hadamard rotation  (paper Section 3, practical variant)
 # ---------------------------------------------------------------------------
 
+
 class HadamardRotation(nn.Module):
     """
     Structured random rotation via randomised Walsh-Hadamard transform.
@@ -84,8 +86,9 @@ class HadamardRotation(nn.Module):
 
     def __init__(self, dim: int, seed: int = 0) -> None:
         super().__init__()
-        assert dim > 0 and (dim & (dim - 1)) == 0, \
-            f"HadamardRotation requires dim to be a power of 2, got {dim}"
+        assert (
+            dim > 0 and (dim & (dim - 1)) == 0
+        ), f"HadamardRotation requires dim to be a power of 2, got {dim}"
         self.dim = dim
         self.seed = seed
 
@@ -93,7 +96,7 @@ class HadamardRotation(nn.Module):
         gen.manual_seed(seed)
         # Random (+/-)1 diagonal signs
         signs = (torch.randint(0, 2, (dim,), generator=gen) * 2 - 1).float()
-        self.register_buffer("signs", signs)   # (d,)
+        self.register_buffer("signs", signs)  # (d,)
 
     # ------------------------------------------------------------------
     def forward(self, x: Tensor) -> Tensor:
@@ -113,6 +116,7 @@ class HadamardRotation(nn.Module):
 # Fast Walsh-Hadamard Transform  (in-place, iterative, no external deps)
 # ---------------------------------------------------------------------------
 
+
 def _fwht(x: Tensor) -> Tensor:
     """
     Normalised Fast Walsh-Hadamard Transform along the last dimension.
@@ -128,6 +132,18 @@ def _fwht(x: Tensor) -> Tensor:
     h = 1
     while h < d:
         # Butterfly step: reshape to (..., d/2h, 2h), update in-place
+
+        # Concrete example with shape (3, 4) and slice 2:
+        #
+        # x = tensor([[1, 2, 3, 4],
+        #            [5, 6, 7, 8],
+        #            [9, 10, 11, 12]])
+        #
+        # x[:, :2]
+        #  [[1, 2],
+        #  [5, 6],
+        #  [9, 10]]    # all rows, first 2 columns
+
         x = x.reshape(*x.shape[:-1], d // (2 * h), 2 * h)
         a = x[..., :h] + x[..., h:]
         x[..., h:] = x[..., :h] - x[..., h:]
@@ -141,6 +157,7 @@ def _fwht(x: Tensor) -> Tensor:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_qr_rotation(dim: int, seed: int) -> Tensor:
     """Return a Haar-uniform random orthogonal matrix via QR decomposition."""
     gen = torch.Generator()
@@ -148,7 +165,7 @@ def _make_qr_rotation(dim: int, seed: int) -> Tensor:
     G = torch.randn(dim, dim, generator=gen)
     Q, R = torch.linalg.qr(G)
     signs = torch.sign(torch.diag(R))
-    Q = Q * signs.unsqueeze(0)   # (d, d)
+    Q = Q * signs.unsqueeze(0)  # (d, d)
     # Enforce det = +1 so Q is a proper rotation (SO(d)) not a reflection
     if torch.linalg.det(Q) < 0:
         Q[:, 0] = -Q[:, 0]
