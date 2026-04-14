@@ -48,7 +48,7 @@ which directly bounds the error in attention score computation.
 
 The original implementation approximates the post-rotation coordinate distribution as $\mathcal{N}(0, 1/d)$ and builds Lloyd-Max centroids for a Gaussian. But the true marginal, after rotating a unit-sphere vector, is:
 $$f(t) \;=\; C_d \cdot (1 - t^2)^{(d-3)/2}, \qquad t \in [-1,\, 1]$$
-This is a Beta-type distribution that only converges to a Gaussian for large $d$. At small $d$ and low bit-widths the difference is meaningful. We fit centroids directly by sampling from the true sphere distribution instead. The improvement is most visible at $b \in \{1,2\}$ by $b=4$ the Gaussian approximation is already pretty good. Centroids are cached by (num_bits, dim) after first computation.
+This is a Beta-type distribution that only converges to a Gaussian for large $d$. At small $d$ and low bit-widths the difference is meaningful. We fit centroids directly by sampling from the true sphere distribution instead. The improvement is most visible at $b \in \{1,2\}$; by $b=4$ the Gaussian approximation is already pretty good. Centroids are cached by (num_bits, dim) after first computation.
 
 #### 2.2.2 SO(d) Rotation
 
@@ -204,7 +204,7 @@ Results on distilgpt2 (3-bit):
 | 4 | 0.25125 | 0.20710 | 1.2x |
 | 5 | 0.17647 | 0.16796 | 1.1x |
 
-Earlier layers benefit more, which makes sense they tend to have smoother, more predictable KV trajectories than the later layers.
+Earlier layers benefit more, which makes sense — they tend to have smoother, more predictable KV trajectories than the later layers.
 
 ### 3.3 Adaptive Bit Allocation
 
@@ -321,7 +321,7 @@ We evaluate perplexity (PPL) under KV cache quantization using the generation sc
 | distilgpt2 | +276.64 | **+10.89** | +21.44 | **+4.27** | +1.71 | **+0.67** |
 | gpt2-medium | +173.61 | **+5.95** | +6.02 | **+1.55** | +1.10 | **+0.47** |
 
-Rank-4 correction recovers approximately **96% of the 2-bit PPL degradation** on distilgpt2 (276.64 → 10.89) and **97%** on gpt2-medium (173.61 → 5.95). At 4-bit the corrected cache is within 0.5–0.7 PPL of FP32. Results are monotonically better at every bit-width, confirming that correction is always beneficial regardless of the quantization budget. (TinyLlama-1.1B-Chat is omitted from Table 2: its 3-bit and 4-bit degradation is already so small that rank-4 correction is below measurement noise at 50 chunks.)
+Rank-4 correction recovers approximately **96% of the 2-bit PPL degradation** on distilgpt2 (276.64 -> 10.89) and **97%** on gpt2-medium (173.61 -> 5.95). At 4-bit the corrected cache is within 0.5–0.7 PPL of FP32. Results are monotonically better at every bit-width, confirming that correction is always beneficial regardless of the quantization budget. (TinyLlama-1.1B-Chat is omitted from Table 2: its 3-bit and 4-bit degradation is already so small that rank-4 correction is below measurement noise at 50 chunks.)
 
 **Notable result.** For gpt2-medium, 2-bit + rank-4 (ΔPPL = +5.95) is within 0.07 PPL of plain 3-bit without correction (+6.02). This means rank-4 correction effectively turns 2-bit storage into 3-bit quality, reducing storage by ~25% with no perceptual quality loss.
 
@@ -353,7 +353,7 @@ None of these require modifying the model or changing the training procedure. Th
 
 These are runtime optimizations applied after the paper's algorithms were finalized. They do not change any results - the quality numbers in Sections 3–3.4 are unchanged - but they reduce wall-clock time substantially.
 
-#### 7.1 Batched `get()` in `AdaptiveKVCache`
+#### 9.1 Batched `get()` in `AdaptiveKVCache`
 
 **Problem.** The original `get()` called `dequantize()` once per cached token, resulting in $T$ sequential Python dispatch calls and $T$ small matrix multiplies. For $T=128$ this was 5.4 ms, growing linearly with sequence length.
 
@@ -390,7 +390,7 @@ def _batch_dequantize(self, quantizer, qs):
 
 For $T=128$ with 4 tiers this reduces from 128 Python dispatch calls to ~4, giving roughly 4x reduction in `get()` overhead and better BLAS utilisation.
 
-#### 7.2 Randomized SVD with Power Iteration in `LowRankCorrection`
+#### 9.2 Randomized SVD with Power Iteration in `LowRankCorrection`
 
 **Problem.** The full `torch.linalg.svd` in `LowRankCorrection.quantize()` is $O(T \cdot d^2)$ and allocates a $(T, d)$ temporary. For $T=512$, $d=128$ this dominates the quantize step.
 
@@ -434,7 +434,7 @@ else:
 | T=256 | 3.19 ms | 1.28 ms | 2.5x |
 | T=512 | 6.37 ms | 2.44 ms | 2.6x |
 
-#### 7.3 `_dequantize_unit` Fast Path in `KVQuantIP`
+#### 9.3 `_dequantize_unit` Fast Path in `KVQuantIP`
 
 **Problem.** `KVQuantIP.dequantize()` calls `self.mse_quantizer.dequantize(q_mse)` to recover the MSE component. But since the input to the MSE stage is already unit-normalised, the stored norms are always 1.0 - allocating a `(N, 1)` ones tensor and multiplying by it on every call is pure overhead.
 
@@ -459,7 +459,7 @@ x_hat_unit = self.mse_quantizer._dequantize_unit(idx_flat)   # no alloc
 
 The saving is modest for large batches (1.08x at $N=4096$, $d=128$) but eliminates one unnecessary allocation per call.
 
-#### 7.4 Boundary Caching in `build_codebook`
+#### 9.4 Boundary Caching in `build_codebook`
 
 The $k-1$ centroid midpoints (quantization boundaries used by `torch.bucketize`) were previously recomputed on every `KVQuantMSE` instantiation. They are now computed once and cached alongside the centroids:
 
@@ -488,7 +488,7 @@ self.register_buffer("boundaries", boundaries)
 
 The saving is negligible in practice (the $k-1$ additions are trivial), but it removes a recompute and makes the caching contract explicit.
 
-#### 7.5 First-Token Accuracy in Quantized Generation
+#### 9.5 First-Token Accuracy in Quantized Generation
 
 **Problem.** During quantized generation in `demo_llm.py`, token 1 (the first generated token) was evaluated using the unquantized prefill logit - the same logit that all bit-width variants saw - so all quantized modes produced identical first tokens regardless of quantization quality. Only from token 2 onward, when the quantized KV cache was actually used for attention, did the bit-widths diverge.
 
