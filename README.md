@@ -1,8 +1,8 @@
-# KVQUANT++
+# KVQUANT
 
 **Attention-aware KV cache quantization for LLM inference.**
 
-KVQUANT++ extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) with four novel extensions and several implementation improvements. It achieves near-optimal KV cache compression by combining information-theoretically grounded vector quantization with transformer-specific structure exploitation.
+KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) with four novel extensions and several implementation improvements. It achieves near-optimal KV cache compression by combining information-theoretically grounded vector quantization with transformer-specific structure exploitation.
 
 ---
 
@@ -86,7 +86,7 @@ Codebook indices are non-uniformly distributed after rotation. Huffman coding re
 
 ### 9. Full Pipeline Comparison
 
-End-to-end comparison of baseline KVQuant vs the combined KVQUANT++ pipeline across all layers and bit-widths.
+End-to-end comparison of baseline KVQuant vs the combined KVQUANT pipeline across all layers and bit-widths.
 
 ![Pipeline Comparison](plots/9_pipeline_comparison.png)
 
@@ -230,7 +230,7 @@ pytest
 
 ## Implementation improvements over reference
 
-| | Reference | KVQUANT++ |
+| | Reference | KVQUANT |
 |---|---|---|
 | Codebook distribution | Gaussian approximation | **True sphere marginal** |
 | Rotation | May produce reflections (det = −1) | **SO(d) enforced** (det = +1) |
@@ -281,7 +281,7 @@ python -m kvquant.demo_llm --prompt "Hi how are you?"
 
 ```bibtex
 @misc{kvquantpp2025,
-  title   = {KVQUANT++: Attention-Aware and Structure-Exploiting Extensions
+  title   = {KVQUANT: Attention-Aware and Structure-Exploiting Extensions
              to Near-Optimal Vector Quantization for KV Cache Compression},
   year    = {2025},
   note    = {Extensions of KVQuant (Zandieh et al., arXiv:2504.19874)}
