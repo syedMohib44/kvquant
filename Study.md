@@ -1,4 +1,4 @@
-# KVQuant++ - Complete Code-Level Study
+# KVQuant - Complete Code-Level Study
 
 ---
 

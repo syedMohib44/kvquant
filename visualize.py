@@ -1,5 +1,5 @@
 """
-KVQuant++ Visualizations.
+KVQuant Visualizations.
 
 Generates plots explaining how each component works using real distilgpt2 data.
 
@@ -12,6 +12,7 @@ import os
 import torch
 import torch.nn.functional as F
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -38,30 +39,32 @@ PLOTS_DIR = os.path.join(os.path.dirname(__file__), "plots")
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
 plt.style.use("seaborn-v0_8-paper")
-plt.rcParams.update({
-    "figure.facecolor": "white",
-    "axes.facecolor": "white",
-    "font.size": 11,
-    "axes.titlesize": 12,
-    "axes.labelsize": 11,
-    "legend.fontsize": 9,
-    "xtick.labelsize": 10,
-    "ytick.labelsize": 10,
-    "figure.dpi": 150,
-    "savefig.dpi": 300,
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-})
+plt.rcParams.update(
+    {
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "font.size": 11,
+        "axes.titlesize": 12,
+        "axes.labelsize": 11,
+        "legend.fontsize": 9,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    }
+)
 
 COLORS = {
-    "blue":   "#2166ac",
-    "green":  "#1a9641",
+    "blue": "#2166ac",
+    "green": "#1a9641",
     "orange": "#d73027",
-    "red":    "#d73027",
+    "red": "#d73027",
     "purple": "#762a83",
-    "teal":   "#4dac26",
+    "teal": "#4dac26",
     "yellow": "#f4a582",
-    "gray":   "#888888",
+    "gray": "#888888",
 }
 
 
@@ -188,7 +191,7 @@ def plot_codebook():
     torch.manual_seed(42)
     g = torch.randn(50000, d)
     u = g / g.norm(dim=-1, keepdim=True)
-    x_sphere = u[:, 0].numpy()   # one coordinate of a uniform unit vector
+    x_sphere = u[:, 0].numpy()  # one coordinate of a uniform unit vector
 
     # Gaussian approximation for comparison
     x_gauss = (torch.randn(50000) / math.sqrt(d)).numpy()
@@ -372,12 +375,12 @@ def plot_awq(kvs, attns, head_dim, n_heads):
     scores = (q_vec.reshape(B * H, 1, d) @ k_flat.transpose(-2, -1)).squeeze(1)
     attn_tok = F.softmax(scores / math.sqrt(d), dim=-1)  # (B*H, T)
 
-    err_uni = ((k_flat - k_uni.reshape(B * H, T, d)) ** 2).mean(-1)   # (B*H, T)
-    err_awq = ((k_flat - k_awq.reshape(B * H, T, d)) ** 2).mean(-1)   # (B*H, T)
+    err_uni = ((k_flat - k_uni.reshape(B * H, T, d)) ** 2).mean(-1)  # (B*H, T)
+    err_awq = ((k_flat - k_awq.reshape(B * H, T, d)) ** 2).mean(-1)  # (B*H, T)
 
     # Weight each token's error by its attention probability
-    wdist_uni = (attn_tok * err_uni).mean(0).detach().numpy()   # (T,)
-    wdist_awq = (attn_tok * err_awq).mean(0).detach().numpy()   # (T,)
+    wdist_uni = (attn_tok * err_uni).mean(0).detach().numpy()  # (T,)
+    wdist_awq = (attn_tok * err_awq).mean(0).detach().numpy()  # (T,)
 
     axes[2].plot(
         range(T),
@@ -775,9 +778,7 @@ def plot_entropy():
         alpha=0.85,
     )
     for i, (b, s) in enumerate(zip(bits_list, savings)):
-        axes[0].text(
-            i, s + 0.05, f"{s:.1f}%", ha="center", fontsize=10, color="black"
-        )
+        axes[0].text(i, s + 0.05, f"{s:.1f}%", ha="center", fontsize=10, color="black")
     axes[0].set_title(
         "Huffman Coding Savings vs Bit-Width\n(d=128, distilgpt2 distribution)"
     )
@@ -917,12 +918,12 @@ def plot_ratio_check():
 
     ratios_qr, ratios_had = [], []
     for b in bits_list:
-        lower = 1.0 / (4 ** b)
-        q_qr  = KVQuantMSE(d, b, use_hadamard=False)
+        lower = 1.0 / (4**b)
+        q_qr = KVQuantMSE(d, b, use_hadamard=False)
         q_had = KVQuantMSE(d, b, use_hadamard=True)
-        mse_qr  = ((x - q_qr(x))  ** 2).mean(-1).mean().item()
+        mse_qr = ((x - q_qr(x)) ** 2).mean(-1).mean().item()
         mse_had = ((x - q_had(x)) ** 2).mean(-1).mean().item()
-        ratios_qr.append(mse_qr  / lower)
+        ratios_qr.append(mse_qr / lower)
         ratios_had.append(mse_had / lower)
 
     bound = math.sqrt(3) * math.pi / 2
@@ -930,22 +931,58 @@ def plot_ratio_check():
     fig, ax = plt.subplots(figsize=(8, 5))
     x_pos = np.arange(len(bits_list))
     w = 0.3
-    ax.bar(x_pos - w / 2, ratios_qr,  w, label="KVQuant QR",       color=COLORS["green"],  alpha=0.85)
-    ax.bar(x_pos + w / 2, ratios_had, w, label="KVQuant Hadamard",  color=COLORS["orange"], alpha=0.85)
-    ax.axhline(bound, color=COLORS["red"],  linestyle="--",
-               linewidth=2, label=f"Paper upper bound (sqrt3·pi/2 ≈ {bound:.2f})")
-    ax.axhline(1.0, color=COLORS["gray"], linestyle=":", linewidth=1.5, label="Lower bound (1.0)")
+    ax.bar(
+        x_pos - w / 2,
+        ratios_qr,
+        w,
+        label="KVQuant QR",
+        color=COLORS["green"],
+        alpha=0.85,
+    )
+    ax.bar(
+        x_pos + w / 2,
+        ratios_had,
+        w,
+        label="KVQuant Hadamard",
+        color=COLORS["orange"],
+        alpha=0.85,
+    )
+    ax.axhline(
+        bound,
+        color=COLORS["red"],
+        linestyle="--",
+        linewidth=2,
+        label=f"Paper upper bound (sqrt3·pi/2 ≈ {bound:.2f})",
+    )
+    ax.axhline(
+        1.0,
+        color=COLORS["gray"],
+        linestyle=":",
+        linewidth=1.5,
+        label="Lower bound (1.0)",
+    )
 
     for i, (r_qr, r_had) in enumerate(zip(ratios_qr, ratios_had)):
-        ax.text(i - w / 2, r_qr  * 1.15, f"{r_qr:.3f}",  ha="center", va="bottom", fontsize=8)
-        ax.text(i + w / 2, r_had * 1.15, f"{r_had:.3f}", ha="center", va="bottom", fontsize=8)
+        ax.text(
+            i - w / 2, r_qr * 1.15, f"{r_qr:.3f}", ha="center", va="bottom", fontsize=8
+        )
+        ax.text(
+            i + w / 2,
+            r_had * 1.15,
+            f"{r_had:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
 
     ax.set_yscale("log")
     ax.set_ylim(0.001, bound * 5)
     ax.set_xticks(x_pos)
     ax.set_xticklabels([f"{b}-bit" for b in bits_list])
     ax.set_ylabel("Distortion ratio   actual_MSE / (1/4^b)   [log scale]")
-    ax.set_title("2.7× Bound Verification: Distortion Ratio vs Bit-Width\n(d=128 unit sphere - ratio must stay ≤ sqrt3·pi/2 ≈ 2.72)")
+    ax.set_title(
+        "2.7× Bound Verification: Distortion Ratio vs Bit-Width\n(d=128 unit sphere - ratio must stay ≤ sqrt3·pi/2 ≈ 2.72)"
+    )
     ax.legend()
     ax.grid(axis="y", which="both")
     plt.tight_layout()
@@ -961,7 +998,9 @@ def plot_perplexity_validation():
 
     tok = AutoTokenizer.from_pretrained("distilgpt2")
     tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained("distilgpt2", attn_implementation="eager")
+    model = AutoModelForCausalLM.from_pretrained(
+        "distilgpt2", attn_implementation="eager"
+    )
     model.eval()
 
     texts = [
@@ -974,11 +1013,11 @@ def plot_perplexity_validation():
 
     # (label, use_outlier, num_bits, outlier_bits, regular_bits)
     configs = [
-        ("2-bit",   False, 2, None, None),
-        ("2.5-bit", True,  3, 3,    2),
-        ("3-bit",   False, 3, None, None),
-        ("3.5-bit", True,  3, 4,    3),
-        ("4-bit",   False, 4, None, None),
+        ("2-bit", False, 2, None, None),
+        ("2.5-bit", True, 3, 3, 2),
+        ("3-bit", False, 3, None, None),
+        ("3.5-bit", True, 3, 4, 3),
+        ("4-bit", False, 4, None, None),
     ]
 
     head_dim = model.config.n_embd // model.config.n_head  # 64
@@ -987,8 +1026,9 @@ def plot_perplexity_validation():
         """Run prefix forward; return (pkv, kvs_list) where kvs_list[i] = (K, V) per layer."""
         with torch.no_grad():
             pkv = model(prefix_ids, use_cache=True).past_key_values
-        kvs = [(pkv.layers[i].keys, pkv.layers[i].values)
-               for i in range(len(pkv.layers))]
+        kvs = [
+            (pkv.layers[i].keys, pkv.layers[i].values) for i in range(len(pkv.layers))
+        ]
         return pkv, kvs
 
     def _inject_quantized(prefix_ids, pairs):
@@ -996,17 +1036,17 @@ def plot_perplexity_validation():
         with torch.no_grad():
             pkv_q = model(prefix_ids, use_cache=True).past_key_values
         for i, (k_hat, v_hat) in enumerate(pairs):
-            pkv_q.layers[i].keys   = k_hat
+            pkv_q.layers[i].keys = k_hat
             pkv_q.layers[i].values = v_hat
         return pkv_q
 
     # -- Process each text individually (no padding) -----------------------
     baseline_nlls = []
-    config_nlls   = {name: [] for name, *_ in configs}
+    config_nlls = {name: [] for name, *_ in configs}
 
     for text in texts:
         ids = tok(text, return_tensors="pt")["input_ids"]  # (1, T)
-        T   = ids.shape[1]
+        T = ids.shape[1]
         T_split = T // 2
         if T_split < 2:
             continue
@@ -1022,9 +1062,12 @@ def plot_perplexity_validation():
 
         for name, use_outlier, num_bits, ob, rb in configs:
             kvc = KVCacheQuantizer(
-                head_dim=head_dim, num_bits=num_bits,
-                use_outlier=use_outlier, n_outlier=16,
-                outlier_bits=ob, regular_bits=rb,
+                head_dim=head_dim,
+                num_bits=num_bits,
+                use_outlier=use_outlier,
+                n_outlier=16,
+                outlier_bits=ob,
+                regular_bits=rb,
             )
             # calibrate always (required even for non-outlier configs)
             k_cal = torch.cat([kv[0] for kv in kvs_ref], dim=1)
@@ -1043,17 +1086,28 @@ def plot_perplexity_validation():
 
     baseline_ppl = math.exp(sum(baseline_nlls) / len(baseline_nlls))
     labels = [name for name, *_ in configs]
-    ppls   = [math.exp(sum(config_nlls[n]) / len(config_nlls[n])) for n in labels]
+    ppls = [math.exp(sum(config_nlls[n]) / len(config_nlls[n])) for n in labels]
 
     # -- Plot --------------------------------------------------------------
-    bar_colors = [COLORS["red"], COLORS["orange"], COLORS["blue"], COLORS["teal"], COLORS["green"]]
+    bar_colors = [
+        COLORS["red"],
+        COLORS["orange"],
+        COLORS["blue"],
+        COLORS["teal"],
+        COLORS["green"],
+    ]
     x_pos = np.arange(len(labels))
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
     # Left: absolute PPL
     axes[0].bar(x_pos, ppls, color=bar_colors, alpha=0.85)
-    axes[0].axhline(baseline_ppl, color="black", linestyle="--", linewidth=2,
-                    label=f"Baseline (no quant) = {baseline_ppl:.1f}")
+    axes[0].axhline(
+        baseline_ppl,
+        color="black",
+        linestyle="--",
+        linewidth=2,
+        label=f"Baseline (no quant) = {baseline_ppl:.1f}",
+    )
     for i, p in enumerate(ppls):
         axes[0].text(i, p + 0.3, f"{p:.1f}", ha="center", va="bottom", fontsize=9)
     axes[0].set_xticks(x_pos)
@@ -1066,14 +1120,20 @@ def plot_perplexity_validation():
     # Right: ratio PPL / baseline
     rel = [p / baseline_ppl for p in ppls]
     axes[1].bar(x_pos, rel, color=bar_colors, alpha=0.85)
-    axes[1].axhline(1.0,  color="black",        linestyle="--", linewidth=2,  label="Baseline (1.00×)")
-    axes[1].axhline(1.05, color=COLORS["gray"], linestyle=":",  linewidth=1.5, label="5% degradation")
+    axes[1].axhline(
+        1.0, color="black", linestyle="--", linewidth=2, label="Baseline (1.00×)"
+    )
+    axes[1].axhline(
+        1.05, color=COLORS["gray"], linestyle=":", linewidth=1.5, label="5% degradation"
+    )
     for i, v in enumerate(rel):
         axes[1].text(i, v + 0.005, f"{v:.2f}×", ha="center", va="bottom", fontsize=9)
     axes[1].set_xticks(x_pos)
     axes[1].set_xticklabels(labels)
     axes[1].set_ylabel("PPL ratio  (quantized / baseline)")
-    axes[1].set_title("Relative PPL Degradation\n(paper: 3.5-bit ≈ neutral, 2.5-bit ≈ marginal)")
+    axes[1].set_title(
+        "Relative PPL Degradation\n(paper: 3.5-bit ≈ neutral, 2.5-bit ≈ marginal)"
+    )
     axes[1].legend()
     axes[1].grid(axis="y")
 

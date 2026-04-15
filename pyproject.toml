@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kvquant"
 version = "0.1.0"
-description = "Attention-aware KV cache quantization for LLM inference (KVQuant++ extensions)"
+description = "Attention-aware KV cache quantization for LLM inference (KVQuant extensions)"
 readme = "PAPER.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
