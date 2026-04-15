@@ -48,6 +48,8 @@ which directly bounds the error in attention score computation.
 
 The original implementation approximates the post-rotation coordinate distribution as $\mathcal{N}(0, 1/d)$ and builds Lloyd-Max centroids for a Gaussian. But the true marginal, after rotating a unit-sphere vector, is:
 $$f(t) \;=\; C_d \cdot (1 - t^2)^{(d-3)/2}, \qquad t \in [-1,\, 1]$$
+![Figure 1: True sphere marginal vs Gaussian approximation at d=8 and d=64](figures/fig1_distribution.png)
+
 This is a Beta-type distribution that only converges to a Gaussian for large $d$. At small $d$ and low bit-widths the difference is meaningful. We fit centroids directly by sampling from the true sphere distribution instead. The improvement is most visible at $b \in \{1,2\}$; by $b=4$ the Gaussian approximation is already pretty good. Centroids are cached by (num_bits, dim) after first computation.
 
 #### 2.2.2 SO(d) Rotation
@@ -184,6 +186,8 @@ Results on distilgpt2 (3-bit avg):
 
 56.5% average reduction in attention-weighted distortion, which is the quantity that actually determines how much the model's outputs change.
 
+![Figure 2: Attention-weighted bit assignment and per-layer distortion reduction](figures/fig2_awq.png)
+
 ### 3.2 Delta Compression
 
 During autoregressive generation, the KV vectors for adjacent tokens are correlated often strongly. The delta $\|\mathbf{k}_t - \mathbf{k}_{t-1}\|$ is typically much smaller than $\|\mathbf{k}_t\|$. Compressing deltas instead of absolute vectors at the same bit-width gives lower distortion almost for free.
@@ -251,6 +255,8 @@ Results ($T=360$, $d=64$):
 | 4 | 0.01982 | 0.01863 | 0.01769 | 0.01607 |
 
 Roughly 11% reduction at rank-4 and 19% at rank-8, consistent across bit-widths.
+
+![Figure 3: Low-rank correction stores rank-r SVD of the residual at 7.4% of full storage](figures/fig3_lowrank.png)
 
 ---
 
@@ -324,6 +330,8 @@ We evaluate perplexity (PPL) under KV cache quantization using the generation sc
 Rank-4 correction recovers approximately **96% of the 2-bit PPL degradation** on distilgpt2 (276.64 -> 10.89) and **97%** on gpt2-medium (173.61 -> 5.95). At 4-bit the corrected cache is within 0.5–0.7 PPL of FP32. Results are monotonically better at every bit-width, confirming that correction is always beneficial regardless of the quantization budget. (TinyLlama-1.1B-Chat is omitted from Table 2: its 3-bit and 4-bit degradation is already so small that rank-4 correction is below measurement noise at 50 chunks.)
 
 **Notable result.** For gpt2-medium, 2-bit + rank-4 (ΔPPL = +5.95) is within 0.07 PPL of plain 3-bit without correction (+6.02). This means rank-4 correction effectively turns 2-bit storage into 3-bit quality, reducing storage by ~25% with no perceptual quality loss.
+
+![Figure 4: PPL degradation by bit-width (left) and effect of rank-4 correction (right)](figures/fig4_ppl.png)
 
 ---
 
@@ -531,6 +539,8 @@ The crop-and-rerun costs one extra forward pass (through all layers, but with a 
 ```
 
 The first generated token is now `Paris` at all quantized bit-widths, matching the float32 reference. This confirms that the bug was entirely in the first-token logit selection, not in the quantized cache itself.
+
+![Figure 5: Before and after the first-token fix — crop cache to T_p−1 and re-run last prompt token](figures/fig5_firsttoken.png)
 
 ---
 
