@@ -10,7 +10,7 @@ vs scalar: d * b_scalar bits/vector
 
 For head_dim=64, M=16, b=4:  16*4 = 64 bits/vector  = 1 bit/dim effective
 vs 4-bit scalar:              64*4 = 256 bits/vector = 4 bits/dim
-→ 4x compression at the same subspace bit-width.
+-> 4x compression at the same subspace bit-width.
 
 The rotation is applied before splitting into subspaces so that information
 is spread evenly across dimensions before partitioning.
@@ -31,15 +31,17 @@ from .rotation import HadamardRotation
 # Output container
 # ---------------------------------------------------------------------------
 
+
 class QuantizedPQ(NamedTuple):
-    codes: Tensor   # (N, M)  int64 — one subspace code per vector per subspace
-    norms: Tensor   # (N, 1)  float — original L2 norms, restored at dequantize
-    shape: tuple    # original input shape (..., d)
+    codes: Tensor  # (N, M)  int64  one subspace code per vector per subspace
+    norms: Tensor  # (N, 1)  float  original L2 norms, restored at dequantize
+    shape: tuple  # original input shape (..., d)
 
 
 # ---------------------------------------------------------------------------
 # K-means helper
 # ---------------------------------------------------------------------------
+
 
 def _kmeans_plusplus_init(x: Tensor, K: int) -> Tensor:
     """
@@ -53,15 +55,15 @@ def _kmeans_plusplus_init(x: Tensor, K: int) -> Tensor:
 
     for _ in range(1, K):
         # Squared distance from each point to its nearest chosen centroid
-        c_stack = torch.stack(centroids)                      # (c, d)
-        sq_dists = torch.cdist(x, c_stack) ** 2              # (N, c)
-        min_sq_dists = sq_dists.min(dim=-1).values            # (N,)
+        c_stack = torch.stack(centroids)  # (c, d)
+        sq_dists = torch.cdist(x, c_stack) ** 2  # (N, c)
+        min_sq_dists = sq_dists.min(dim=-1).values  # (N,)
         # Sample next centroid with probability ∝ squared distance
         probs = min_sq_dists / min_sq_dists.sum().clamp(min=1e-10)
         idx = torch.multinomial(probs, 1).item()
         centroids.append(x[idx])
 
-    return torch.stack(centroids)                             # (K, d)
+    return torch.stack(centroids)  # (K, d)
 
 
 def _kmeans(
@@ -75,7 +77,7 @@ def _kmeans(
 
     Uses k-means++ initialisation (Arthur & Vassilvitskii, 2007) for better
     starting codebooks, squared-L2 distances for assignment (standard in PQ
-    literature — same assignments as L2 since sqrt is monotonic, but consistent
+    literature  same assignments as L2 since sqrt is monotonic, but consistent
     with the mean-update step which minimises squared L2 loss), and early
     stopping when the objective change falls below tol.
 
@@ -89,9 +91,9 @@ def _kmeans(
 
     prev_obj = float("inf")
     for _ in range(num_iters):
-        # Assignment: squared L2 → argmin (same as L2 argmin, consistent with mean update)
-        sq_dists = torch.cdist(x, centroids) ** 2            # (N, K)
-        assignments = sq_dists.argmin(dim=-1)                 # (N,)
+        # Assignment: squared L2 -> argmin (same as L2 argmin, consistent with mean update)
+        sq_dists = torch.cdist(x, centroids) ** 2  # (N, K)
+        assignments = sq_dists.argmin(dim=-1)  # (N,)
 
         # Objective: mean within-cluster squared distance (for convergence check)
         obj = sq_dists.gather(1, assignments.unsqueeze(1)).mean().item()
@@ -100,7 +102,7 @@ def _kmeans(
         prev_obj = obj
 
         # Update: mean of assigned points (optimal centroid under squared L2 loss)
-        new_c = torch.zeros_like(centroids)                   # (K, d)
+        new_c = torch.zeros_like(centroids)  # (K, d)
         counts = torch.zeros(K, device=x.device)
         new_c.scatter_add_(0, assignments.unsqueeze(1).expand(-1, d), x)
         counts.scatter_add_(0, assignments, torch.ones(N, device=x.device))
@@ -118,6 +120,7 @@ def _kmeans(
 # ---------------------------------------------------------------------------
 # ProductQuantizer
 # ---------------------------------------------------------------------------
+
 
 class ProductQuantizer(nn.Module):
     """
@@ -141,14 +144,14 @@ class ProductQuantizer(nn.Module):
         seed: int = 0,
     ) -> None:
         super().__init__()
-        assert dim % num_subspaces == 0, (
-            f"dim ({dim}) must be divisible by num_subspaces ({num_subspaces})"
-        )
+        assert (
+            dim % num_subspaces == 0
+        ), f"dim ({dim}) must be divisible by num_subspaces ({num_subspaces})"
         self.dim = dim
         self.M = num_subspaces
         self.b = bits_per_subspace
-        self.K = 2 ** bits_per_subspace       # codebook entries per subspace
-        self.sub_dim = dim // num_subspaces    # dimensions per subspace
+        self.K = 2**bits_per_subspace  # codebook entries per subspace
+        self.sub_dim = dim // num_subspaces  # dimensions per subspace
 
         # Hadamard rotation spreads information evenly before subspace split
         self.rotation = HadamardRotation(dim, seed=seed)
@@ -166,22 +169,22 @@ class ProductQuantizer(nn.Module):
 
         Args:
             x: Float tensor of shape (N, dim) or (..., dim).
-               Should be a representative sample — the actual prefill KV
+               Should be a representative sample  the actual prefill KV
                vectors work well.
         """
         flat = x.reshape(-1, self.dim).float()
 
         # Unit-normalise then rotate (same preprocessing as quantize)
         norms = flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        y = self.rotation(flat / norms)                     # (N, dim)
-        y_split = y.reshape(-1, self.M, self.sub_dim)       # (N, M, sub_dim)
+        y = self.rotation(flat / norms)  # (N, dim)
+        y_split = y.reshape(-1, self.M, self.sub_dim)  # (N, M, sub_dim)
 
         books = []
         for m in range(self.M):
-            sub = y_split[:, m, :].contiguous()             # (N, sub_dim)
-            books.append(_kmeans(sub, self.K))              # (K, sub_dim)
+            sub = y_split[:, m, :].contiguous()  # (N, sub_dim)
+            books.append(_kmeans(sub, self.K))  # (K, sub_dim)
 
-        self.codebooks = torch.stack(books)                 # (M, K, sub_dim)
+        self.codebooks = torch.stack(books)  # (M, K, sub_dim)
 
     # ------------------------------------------------------------------
     # Encode / decode
@@ -201,23 +204,23 @@ class ProductQuantizer(nn.Module):
             raise RuntimeError("Call calibrate() before quantize().")
 
         shape = x.shape
-        flat = x.reshape(-1, self.dim).float()               # (N, dim)
+        flat = x.reshape(-1, self.dim).float()  # (N, dim)
         N = flat.shape[0]
 
         norms = flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        y = self.rotation(flat / norms)                      # (N, dim)
-        y_split = y.reshape(N, self.M, self.sub_dim)         # (N, M, sub_dim)
+        y = self.rotation(flat / norms)  # (N, dim)
+        y_split = y.reshape(N, self.M, self.sub_dim)  # (N, M, sub_dim)
 
         codes = torch.zeros(N, self.M, dtype=torch.long, device=x.device)
-        books = self.codebooks.to(x.device)                  # (M, K, sub_dim)
+        books = self.codebooks.to(x.device)  # (M, K, sub_dim)
 
         for m in range(self.M):
             # Pairwise distances between N sub-vectors and K centroids
             dists = torch.cdist(
-                y_split[:, m, :].contiguous(),               # (N, sub_dim)
-                books[m],                                    # (K, sub_dim)
-            )                                                # (N, K)
-            codes[:, m] = dists.argmin(dim=-1)               # (N,)
+                y_split[:, m, :].contiguous(),  # (N, sub_dim)
+                books[m],  # (K, sub_dim)
+            )  # (N, K)
+            codes[:, m] = dists.argmin(dim=-1)  # (N,)
 
         return QuantizedPQ(codes=codes, norms=norms, shape=shape)
 
@@ -232,18 +235,18 @@ class ProductQuantizer(nn.Module):
             Float tensor of shape q.shape.
         """
         N = q.codes.shape[0]
-        books = self.codebooks.to(q.codes.device)            # (M, K, sub_dim)
+        books = self.codebooks.to(q.codes.device)  # (M, K, sub_dim)
 
         # Gather centroids for each subspace
         y_hat = torch.zeros(N, self.M, self.sub_dim, device=q.codes.device)
         for m in range(self.M):
-            y_hat[:, m, :] = books[m][q.codes[:, m]]        # (N, sub_dim)
+            y_hat[:, m, :] = books[m][q.codes[:, m]]  # (N, sub_dim)
 
         y_hat = y_hat.reshape(N, self.dim)
 
         # Inverse rotation then restore original norms.
         # Note: ||y_hat|| is approximately 1 but not exact due to PQ error
-        # across subspaces. We intentionally do NOT re-normalise here —
+        # across subspaces. We intentionally do NOT re-normalise here
         # attention scores depend on the DIRECTION of K, not magnitude, so
         # preserving direction is more important than exact norm reconstruction.
         x_hat = self.rotation.inverse(y_hat) * q.norms.to(q.codes.device)
@@ -282,8 +285,9 @@ class ProductQuantizer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# ProductKVCache — drop-in replacement for KVCacheQuantizer
+# ProductKVCache  drop-in replacement for KVCacheQuantizer
 # ---------------------------------------------------------------------------
+
 
 class ProductKVCache(nn.Module):
     """
@@ -305,17 +309,19 @@ class ProductKVCache(nn.Module):
         seed: int = 0,
     ) -> None:
         super().__init__()
-        self.k_quant = ProductQuantizer(head_dim, num_subspaces, bits_per_subspace, seed)
-        self.v_quant = ProductQuantizer(head_dim, num_subspaces, bits_per_subspace, seed + 1)
+        self.k_quant = ProductQuantizer(
+            head_dim, num_subspaces, bits_per_subspace, seed
+        )
+        self.v_quant = ProductQuantizer(
+            head_dim, num_subspaces, bits_per_subspace, seed + 1
+        )
 
     def calibrate(self, k: Tensor, v: Tensor) -> None:
         """Train codebooks from prefill K, V tensors."""
         self.k_quant.calibrate(k.reshape(-1, k.shape[-1]))
         self.v_quant.calibrate(v.reshape(-1, v.shape[-1]))
 
-    def compress_kv(
-        self, k: Tensor, v: Tensor
-    ) -> tuple[QuantizedPQ, QuantizedPQ]:
+    def compress_kv(self, k: Tensor, v: Tensor) -> tuple[QuantizedPQ, QuantizedPQ]:
         return self.k_quant.quantize(k), self.v_quant.quantize(v)
 
     def decompress_kv(
