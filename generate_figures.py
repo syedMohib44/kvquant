@@ -342,7 +342,8 @@ def arrow(ax, x0, y0, x1, y1, color="black"):
         "",
         xy=(x1, y1),
         xytext=(x0, y0),
-        arrowprops=dict(arrowstyle="->", color=color, lw=1.3),
+        arrowprops=dict(arrowstyle="->", color=color, lw=1.3,
+                        shrinkA=4, shrinkB=4),
     )
 
 
@@ -405,8 +406,8 @@ for ax, title, good in zip(axes, ["BEFORE (bug)", "AFTER (fix)"], [False, True])
             "#d5f0cd",
             fontsize=8,
         )
-        arrow(ax, 2, 2.6, 2, 2.5)
-        arrow(ax, 2, 1.8, 2, 1.5)
+        arrow(ax, 2, 2.6, 2, 2.5)   # Quantize bottom → crop top
+        arrow(ax, 2, 1.8, 2, 1.5)   # crop bottom → logits top
 
 fig.suptitle(
     "Figure 5. First-token fix: crop the quantized cache to T_p−1, re-run the last prompt token.\n"
