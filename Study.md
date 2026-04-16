@@ -1229,3 +1229,8 @@ Return types (all NamedTuples, composable):
   AttentionWeightedQuantized -> hi_q, lo_q, top_mask, shape, dim
   CorrectedQuantized -> base_q, U, V, shape
 ```
+
+## Product Quant
+https://medium.com/nlp-experiment/product-quantization-d66fdb860047
+https://www.pinecone.io/learn/series/faiss/product-quantization/
+https://github.com/jvdd/pqknn/blob/main/product_quantization/PQKNN.py
