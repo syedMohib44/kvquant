@@ -8,6 +8,7 @@ from .attn_weighted import AttentionWeightedQuantizer, weighted_distortion
 from .delta import DeltaKVCache
 from .adaptive import AdaptiveKVCache
 from .correction import LowRankCorrection
+from .product_quantizer import ProductQuantizer, ProductKVCache, QuantizedPQ
 
 __all__ = [
     # codebook
@@ -37,4 +38,8 @@ __all__ = [
     "DeltaKVCache",
     "AdaptiveKVCache",
     "LowRankCorrection",
+    # product quantization
+    "ProductQuantizer",
+    "ProductKVCache",
+    "QuantizedPQ",
 ]

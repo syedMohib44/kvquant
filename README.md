@@ -180,6 +180,8 @@ python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is the capit
 python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "What is the capital of France?" --max-new-tokens 20 --correction-rank 4
 # Test for Mac M1
 OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is the capital of France?" --max-new-tokens 20
+# Product Quant (PQ) good with accuracy this will use PQ instead of BS 
+python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is Nihilism?" --max-new-tokens 100 --product-quant
 #########################
 
 python -m kvquant.demo_extensions   # all 4 extensions on real data

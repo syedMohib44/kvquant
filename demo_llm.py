@@ -108,8 +108,8 @@ def _kvs_from_cache(native_cache):
     """
     Extract list of (k, v) tensors from whatever cache type the model returned.
     Handles three formats:
-      • new DynamicCache  (transformers >= ~4.50): .layers[i].keys / .values
-      • old DynamicCache  (transformers ~4.38-4.49): .key_cache[i] / .value_cache[i]
+      • new DynamicCache  (transformers >= 4.50): .layers[i].keys / .values
+      • old DynamicCache  (transformers 4.38-4.49): .key_cache[i] / .value_cache[i]
       • tuple-of-tuples   (transformers < 4.38): ((k0,v0), (k1,v1), …)
     Skips None / missing entries (linear-attn / sliding-window layers).
     """
@@ -378,6 +378,13 @@ def main():
         "(0 = disabled, 4 = recommended). Reduces quantization error at the "
         "cost of storing r*(T+d) extra floats per layer.",
     )
+    parser.add_argument(
+        "--product-quant",
+        action="store_true",
+        help="Also run Product Quantization (M=16 subspaces x 4 bits = 1 bit/dim "
+        "effective, 4x smaller than 4-bit scalar). Shown as an extra PQ(1b) "
+        "line after the scalar bit-width results.",
+    )
     args = parser.parse_args()
 
     model, tok = load_model(args.model)
@@ -511,8 +518,14 @@ def main():
             # _quantize_cache deep-copies native_cache and quantizes K,V in-place.
             # For hybrid models the Mamba/linear-attn state is preserved in the copy,
             # so the subsequent forward passes work without error.
+            #
+            # Correction rank is applied selectively: at 4-bit the quantization
+            # residual is already small (0.011 MSE bound), so a rank-4 SVD picks
+            # up numerical noise rather than signal and can hurt quality. At 2-bit
+            # and 3-bit the residual is large and structured, so correction helps.
+            effective_rank = args.correction_rank if bits < 4 else 0
             past = _quantize_cache(
-                native_cache_orig, kvc, correction_rank=args.correction_rank
+                native_cache_orig, kvc, correction_rank=effective_rank
             )
 
             # Greedy decode: get the first-token logit from the QUANTIZED cache
@@ -549,6 +562,73 @@ def main():
             gen_ids = torch.cat(generated, dim=1)
             print(
                 f"  {bits}-bit  : {_clean(tok.decode(gen_ids[0], skip_special_tokens=True))}"
+            )
+
+        # Product Quantization run (optional, --product-quant flag)
+        if args.product_quant:
+            from .product_quantizer import ProductKVCache
+
+            # PQ config: M=16 subspaces x b=8 bits  →  128 bits/vector = 2 bits/dim.
+            # M (subspaces), b (bits each)
+            #
+            # Space consequences:
+            #   + Per-vector storage is HALVED vs 4-bit scalar (128 vs 256 bits).
+            #   + Fixed codebook overhead: M × K × sub_dim = 16 × 256 × 4 = 16,384
+            #     floats (64 KB) per K/V quantizer. Negligible at >500 tokens.
+            #
+            # Time consequences:
+            #   - Calibration: k-means++ × M subspaces (one-time at prefill, seconds).
+            #   - Encode (per new token): O(N × M × K × sub_dim) with K=256 centroids
+            #     vs O(N × d × 16) for 4-bit scalar 16× slower per append.
+            #     Current impl uses M sequential cdist calls (Python loop); a batched
+            #     version would close most of this gap.
+            #     Decode: O(N × d) table lookups same as scalar.
+            #     Attention: same cost if KV is reconstructed before Q·Kᵀ.
+            #     Asymmetric distance (precompute q to centroid per subspace, then
+            #     sum M lookups) avoids reconstruction entirely and is faster.
+            #
+            # Other combinations worth trying
+            # num_subspaces=8, bits_per_subspace=8
+            # num_subspaces=16, bits_per_subspace=4
+            # num_subspaces=8, bits_per_subspace=4
+
+            pq_kvc = ProductKVCache(head_dim, num_subspaces=16, bits_per_subspace=8)
+            pq_kvc.calibrate(all_k_p, all_v_p)
+
+            past = _quantize_cache(native_cache_orig, pq_kvc, correction_rank=0)
+            past_crop = _crop_cache(past, T_p - 1)
+            with torch.no_grad():
+                q1_out = model(
+                    input_ids[:, -1:], past_key_values=past_crop, use_cache=False
+                )
+            first_logits_pq = q1_out.logits[:, -1, :].clone()
+            if newline_id >= 0:
+                first_logits_pq[:, newline_id] = float("-inf")
+            generated = [first_logits_pq.argmax(-1, keepdim=True)]
+            seen_ids = input_ids[0].tolist()
+
+            for _ in range(args.max_new_tokens - 1):
+                with torch.no_grad():
+                    step = model(generated[-1], past_key_values=past, use_cache=True)
+                logits_s = step.logits[:, -1, :].clone()
+                if newline_id >= 0:
+                    logits_s[:, newline_id] = float("-inf")
+                logits_s = _apply_repetition_penalty(
+                    logits_s, seen_ids, args.repetition_penalty
+                )
+                next_tok = logits_s.argmax(-1, keepdim=True)
+                seen_ids.append(next_tok.item())
+                generated.append(next_tok)
+                past = step.past_key_values
+                if next_tok.item() == tok.eos_token_id:
+                    break
+
+            gen_ids = torch.cat(generated, dim=1)
+            ratio = pq_kvc.k_quant.compression_ratio()
+            eff = pq_kvc.effective_bits_per_dim
+            print(
+                f"  PQ({eff:.0f}b) : {_clean(tok.decode(gen_ids[0], skip_special_tokens=True))}"
+                f"\n           [M={pq_kvc.k_quant.M} subspaces x {pq_kvc.k_quant.b} bits, {ratio:.1f}x smaller than 4-bit scalar]"
             )
 
         sep()

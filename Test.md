@@ -183,6 +183,26 @@ python -m kvquant.demo_llm  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0  --prompt
 ----------------------------------------------------------------
 
 
+#################################################################################
+python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is Nihilism?" --max-new-tokens 100 --product-quant
+
+---- Interactive generation ------------------------------------
+  Model  : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Prompt : 'What is Nihilism?'
+  Mode   : chat template
+
+  Unquant: Nihilism, also known as nihility or nothingness philosophy, refers to the belief that all values and meaning in life are ultimately illusory. It rejects traditional philosophical concepts such as truth, knowledge, morality, beauty, goodwill, etc., arguing instead for a lack of any ultimate reality beyond human experience itself (i.e., subjective perception). The term "nihilation" comes from Latin roots: nihi- means not; hila
+
+  2-bit  : - Simply a necla, for now. I have not responded to the question mark), and it's been asked of what you are from anarchist or other responses: at least in response to your questions about censoring yourself as well (what do people say) -nix- howl! I don’t know if this means anything but...it seems like something that has no meaning can be considered by some when they hear "Never" on their
+  3-bit  : Yes, I can provide you with an explanation of the word "nihility" in context. The term nihilation (also spelled as: nilification) refers to a state or condition where there are no values and meaningful relationships exist between people's actions; it means that everything has been stripped away from life by humanity itself - this concept was first introduced into English language literature during World War II when German philosopher Friedrich Nietzsche used his book Beyond Good
+  4-bit  : Nihility, or nihilation in Latin and Greek mythology, refers to the state of being without anything. In philosophy, it describes a view that rejects all values such as truth, goodness, beauty, meaningfulness, purpose, etc., which are considered essential for human flourishing (or "nihilo" means nothing). The term has been used by various philosophers throughout history including Friedrich Schiller's poem Die Rache des Unglücklichen ("The P
+  PQ(2b) : Nihilism, also known as nihility or negation of existence (from the Greek word "nihilo," meaning nothing), refers to a philosophical and cultural movement that rejects all values such as truth, morality, beauty, knowledge, etc. The goal of this philosophy is not just an absence but rather its complete rejection in favor for non-existence itself - which can be seen by many people today who are skeptics about everything including religion, politics, science
+           [M=16 subspaces x 8 bits, 2.0x smaller than 4-bit scalar]
+
+### With PQ instead of Binary Search(BS) it results are outstanding.
+----------------------------------------------------------------
+
+
 
 # Mac M1
 #################################################################################

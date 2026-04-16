@@ -213,7 +213,7 @@ print("Saved figures/fig3_lowrank.png")
 
 
 # ---------------------------------------------------------------------------
-# Figure 4 — PPL vs bit-width
+# Figure 5 — PPL vs bit-width
 # ---------------------------------------------------------------------------
 
 models = ["distilgpt2", "gpt2-medium", "TinyLlama-1.1B"]
@@ -292,20 +292,20 @@ ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 
 fig.suptitle(
-    "Figure 4. Left: PPL degradation across models and bit-widths (log scale).\n"
+    "Figure 5. Left: PPL degradation across models and bit-widths (log scale).\n"
     "Right: rank-4 correction recovers 96–97% of 2-bit degradation.",
     fontsize=10,
     y=0.01,
     va="bottom",
 )
 fig.tight_layout(rect=[0, 0.12, 1, 1])
-fig.savefig("figures/fig4_ppl.png", bbox_inches="tight")
+fig.savefig("figures/fig5_ppl.png", bbox_inches="tight")
 plt.close(fig)
-print("Saved figures/fig4_ppl.png")
+print("Saved figures/fig5_ppl.png")
 
 
 # ---------------------------------------------------------------------------
-# Figure 5 — First-token fix (_crop_cache)
+# Figure 6 — First-token fix (_crop_cache)
 # ---------------------------------------------------------------------------
 
 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -388,37 +388,148 @@ for ax, title, good in zip(axes, ["BEFORE (bug)", "AFTER (fix)"], [False, True])
         )
     else:
         # Fix: crop + re-run
+        # crop box: bottom=1.5, top=2.2  → 0.4-unit gap below Quantize (bottom=2.6)
         draw_box(
             ax,
-            (0.3, 1.8),
+            (0.3, 1.5),
             3.4,
             0.7,
             "crop cache to T_p−1\nre-run last prompt token",
             "#fffacc",
             fontsize=8,
         )
+        # logits box: bottom=0.5, top=1.2 → 0.3-unit gap below crop (bottom=1.5)
         draw_box(
             ax,
-            (0.3, 0.8),
+            (0.3, 0.5),
             3.4,
             0.7,
             "first_logits = quantized output\n(different per bit-width [OK])",
             "#d5f0cd",
             fontsize=8,
         )
-        arrow(ax, 2, 2.6, 2, 2.5)   # Quantize bottom → crop top
-        arrow(ax, 2, 1.8, 2, 1.5)   # crop bottom → logits top
+        arrow(ax, 2, 2.6, 2, 2.2)   # Quantize bottom (2.6) → crop top (2.2)
+        arrow(ax, 2, 1.5, 2, 1.2)   # crop bottom (1.5) → logits top (1.2)
 
 fig.suptitle(
-    "Figure 5. First-token fix: crop the quantized cache to T_p−1, re-run the last prompt token.\n"
+    "Figure 6. First-token fix: crop the quantized cache to T_p−1, re-run the last prompt token.\n"
     "Before: all bit-widths share the same unquantized logit. After: each uses its own quantized logit.",
     fontsize=10,
     y=0.01,
     va="bottom",
 )
 fig.tight_layout(rect=[0, 0.10, 1, 1])
-fig.savefig("figures/fig5_firsttoken.png", bbox_inches="tight")
+fig.savefig("figures/fig6_firsttoken.png", bbox_inches="tight")
 plt.close(fig)
-print("Saved figures/fig5_firsttoken.png")
+print("Saved figures/fig6_firsttoken.png")
+
+
+# ---------------------------------------------------------------------------
+# Figure 4 — Product Quantization: schematic + quality vs storage
+# ---------------------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+# --- Left panel: PQ encoding schematic ---
+ax = axes[0]
+ax.set_xlim(0, 10)
+ax.set_ylim(0, 6)
+ax.axis("off")
+ax.set_title("PQ Encoding (d=64, M=4 shown for clarity)", fontsize=10)
+
+# Original vector bar (top)
+ax.add_patch(mpatches.FancyBboxPatch(
+    (0.5, 4.8), 9, 0.8, boxstyle="round,pad=0.05",
+    linewidth=1.2, edgecolor="#333", facecolor="#cce5ff"
+))
+ax.text(5, 5.2, r"$\mathbf{k} \in \mathbb{R}^{d}$  (post-rotation)", ha="center", va="center", fontsize=10)
+
+# Four subvector blocks
+sub_colors = ["#4c72b0", "#55a868", "#c44e52", "#8172b2"]
+sub_labels = [r"$\mathbf{k}^{(1)}$", r"$\mathbf{k}^{(2)}$", r"$\mathbf{k}^{(3)}$", r"$\mathbf{k}^{(4)}$"]
+sub_x = [0.5, 2.9, 5.3, 7.7]
+sub_w = 2.1
+
+for i, (x, col, lbl) in enumerate(zip(sub_x, sub_colors, sub_labels)):
+    # subvector box
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (x, 3.1), sub_w, 0.8, boxstyle="round,pad=0.05",
+        linewidth=1.2, edgecolor=col, facecolor=col + "44"
+    ))
+    ax.text(x + sub_w / 2, 3.5, lbl, ha="center", va="center", fontsize=10, color=col)
+    # arrow from big bar to subvector
+    ax.annotate("", xy=(x + sub_w / 2, 3.9), xytext=(x + sub_w / 2, 4.8),
+                arrowprops=dict(arrowstyle="->", color=col, lw=1.2, shrinkA=3, shrinkB=3))
+    # codebook box below
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (x, 1.1), sub_w, 1.2, boxstyle="round,pad=0.05",
+        linewidth=1.2, edgecolor=col, facecolor="#f8f8f8"
+    ))
+    ax.text(x + sub_w / 2, 1.85, fr"$\mathcal{{C}}_{i+1}$" + "\n256 centroids", ha="center", va="center",
+            fontsize=8, color=col)
+    # arrow from subvector to codebook
+    ax.annotate("", xy=(x + sub_w / 2, 2.3), xytext=(x + sub_w / 2, 3.1),
+                arrowprops=dict(arrowstyle="->", color=col, lw=1.2, shrinkA=3, shrinkB=3))
+    # code label below codebook
+    ax.text(x + sub_w / 2, 0.7, fr"code $c^{{({i+1})}}$" + "\n8 bits", ha="center", va="center",
+            fontsize=8, color="#333")
+    ax.annotate("", xy=(x + sub_w / 2, 0.95), xytext=(x + sub_w / 2, 1.1),
+                arrowprops=dict(arrowstyle="->", color=col, lw=1.0, shrinkA=2, shrinkB=2))
+
+# Total bits label
+ax.text(5, 0.1, r"Total: $M \times b = 16 \times 8 = 128$ bits/vector  (2 bits/dim)",
+        ha="center", va="center", fontsize=9, style="italic",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff9db", edgecolor="#ccc"))
+
+# --- Right panel: quality vs storage bar chart ---
+ax2 = axes[1]
+
+methods  = ["4-bit scalar", "3-bit scalar", "PQ\n(M=16,b=8)", "2-bit scalar"]
+bits_vec = [256, 192, 128, 128]
+coherent = [True, True, True, False]   # False = broken generation
+
+bar_colors = ["#4c72b0" if c else "#c44e52" for c in coherent]
+# PQ gets a distinct highlight
+bar_colors[2] = "#55a868"
+
+bars = ax2.bar(methods, bits_vec, color=bar_colors, edgecolor="white", linewidth=0.8, width=0.55)
+
+# Annotate bars with coherent/broken labels
+quality_labels = ["Excellent", "Good", "Coherent\n(same as 3-bit)", "Broken"]
+for bar, lbl, col in zip(bars, quality_labels, bar_colors):
+    ypos = bar.get_height() + 4
+    ax2.text(bar.get_x() + bar.get_width() / 2, ypos, lbl,
+             ha="center", va="bottom", fontsize=8, color=col)
+
+ax2.set_ylabel("bits per vector")
+ax2.set_ylim(0, 310)
+ax2.set_title("Storage vs Generation Quality\n(TinyLlama, d=64, 100 tokens)", fontsize=10)
+ax2.spines["top"].set_visible(False)
+ax2.spines["right"].set_visible(False)
+
+# Highlight the equal-storage comparison (PQ vs 2-bit scalar)
+ax2.annotate("", xy=(3, 128), xytext=(2, 128),
+             arrowprops=dict(arrowstyle="<->", color="#888", lw=1.2))
+ax2.text(2.5, 135, "same storage\n2x quality gap", ha="center", va="bottom", fontsize=7.5, color="#555")
+
+# Legend patches
+legend_patches = [
+    mpatches.Patch(color="#4c72b0", label="Coherent (scalar)"),
+    mpatches.Patch(color="#55a868", label="Coherent (PQ)"),
+    mpatches.Patch(color="#c44e52", label="Broken"),
+]
+ax2.legend(handles=legend_patches, fontsize=8, loc="upper right")
+
+fig.suptitle(
+    "Figure 4. Left: PQ splits a d-dim KV vector into M subvectors, each encoded via its own k-means codebook.\n"
+    "Right: at 2 bits/dim, PQ (green) produces coherent output while same-budget scalar (red) collapses.",
+    fontsize=10,
+    y=0.01,
+    va="bottom",
+)
+fig.tight_layout(rect=[0, 0.10, 1, 1])
+fig.savefig("figures/fig4_pq.png", bbox_inches="tight")
+plt.close(fig)
+print("Saved figures/fig4_pq.png")
 
 print("\nAll figures saved to figures/")
