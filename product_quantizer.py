@@ -58,7 +58,7 @@ def _kmeans_plusplus_init(x: Tensor, K: int) -> Tensor:
         c_stack = torch.stack(centroids)  # (c, d)
         sq_dists = torch.cdist(x, c_stack) ** 2  # (N, c)
         min_sq_dists = sq_dists.min(dim=-1).values  # (N,)
-        # Sample next centroid with probability ∝ squared distance
+        # Sample next centroid with probability alpha squared distance
         probs = min_sq_dists / min_sq_dists.sum().clamp(min=1e-10)
         idx = torch.multinomial(probs, 1).item()
         centroids.append(x[idx])

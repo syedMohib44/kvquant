@@ -30,7 +30,7 @@ KVQuant achieves per-element MSE well within the theoretical upper bound `(sqrt3
 
 ### 2. Codebook Centroids (True Sphere Distribution)
 
-Unlike the original KVQuant which uses a Gaussian approximation, we fit Lloyd-Max centroids directly to the **true unit-sphere marginal distribution** `f(t) ∝ (1 - t^2)^{(d-3)/2}`. This gives tighter quantization, especially at low bit-widths and small `d`.
+Unlike the original KVQuant which uses a Gaussian approximation, we fit Lloyd-Max centroids directly to the **true unit-sphere marginal distribution** `f(t) alpha (1 - t^2)^{(d-3)/2}`. This gives tighter quantization, especially at low bit-widths and small `d`.
 
 ![Codebook Centroids](plots/2_codebook_centroids.png)
 

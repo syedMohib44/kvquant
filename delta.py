@@ -19,6 +19,15 @@ bits.
 DeltaKVCache manages the anchor + delta stream for a single generation
 sequence.  It integrates directly with KVQuantIP so inner products
 (attention scores) remain unbiased.
+
+Optimisations vs naive implementation:
+  - Incremental reconstruction: reconstructed vectors are accumulated in
+    push() so get() is O(1) (just stack) instead of O(T) per call.
+    Trade-off: stores T float32 reconstructions permanently alongside
+    the compressed deltas faster but uses more RAM at long contexts.
+  - _anchors is a set for O(1) membership test instead of O(T) list scan.
+  - Adaptive anchoring: re-anchor when delta/vector ratio exceeds
+    anchor_threshold, limiting error accumulation at sequence change-points.
 """
 
 from __future__ import annotations
@@ -48,11 +57,14 @@ class DeltaKVCache(nn.Module):
         K_hat, V_hat = cache.get()
 
     Args:
-        head_dim:  Dimension per attention head.
-        num_bits:  Bits per coordinate for delta quantization.
-        anchor_every: Re-anchor every N tokens (limits error accumulation).
-                      Default 0 = only anchor at t=0.
-        seed:      RNG seed.
+        head_dim:         Dimension per attention head.
+        num_bits:         Bits per coordinate for delta quantization.
+        anchor_every:     Re-anchor every N tokens (limits error accumulation).
+                          Default 0 = only anchor at t=0.
+        anchor_threshold: Adaptive re-anchor when ||delta|| / ||k|| exceeds
+                          this ratio. 0.0 = disabled (default). Combines with
+                          anchor_every whichever triggers first wins.
+        seed:             RNG seed.
     """
 
     def __init__(
@@ -60,24 +72,31 @@ class DeltaKVCache(nn.Module):
         head_dim: int,
         num_bits: int = 3,
         anchor_every: int = 0,
+        anchor_threshold: float = 0.0,
         seed: int = 0,
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
         self.num_bits = num_bits
         self.anchor_every = anchor_every
+        self.anchor_threshold = anchor_threshold
 
         self.k_quantizer = KVQuantIP(head_dim, num_bits, seed=seed, qjl_seed=seed + 1)
         self.v_quantizer = KVQuantIP(
             head_dim, num_bits, seed=seed + 2, qjl_seed=seed + 3
         )
 
-        # Compressed storage
-        self._k_store: list[QuantizedIP | Tensor] = []  # QuantizedIP or anchor Tensor
+        # Compressed delta storage
+        self._k_store: list[QuantizedIP | Tensor] = []
         self._v_store: list[QuantizedIP | Tensor] = []
+
+        # Incrementally maintained reconstructions  makes get() O(1)
+        self._k_reconstructed: list[Tensor] = []
+        self._v_reconstructed: list[Tensor] = []
+
         self._k_prev: Tensor | None = None  # last reconstructed k (for delta)
         self._v_prev: Tensor | None = None
-        self._anchors: list[int] = []  # indices of anchor tokens
+        self._anchors: set[int] = set()  # O(1) membership test
 
     # ------------------------------------------------------------------
     def push(self, k: Tensor, v: Tensor) -> None:
@@ -91,11 +110,19 @@ class DeltaKVCache(nn.Module):
         t = len(self._k_store)
         is_anchor = (t == 0) or (self.anchor_every > 0 and t % self.anchor_every == 0)
 
+        # Adaptive anchoring: re-anchor when delta is large relative to vector
+        # magnitude  limits error accumulation at rapid sequence change-points.
+        if not is_anchor and self.anchor_threshold > 0.0 and self._k_prev is not None:
+            dk_probe = k - self._k_prev
+            if dk_probe.norm() / k.norm().clamp(min=1e-8) > self.anchor_threshold:
+                is_anchor = True
+
         if is_anchor:
-            # Store anchor at full float32 (small - one vector per head)
+            # Store anchor at full float32 (one vector per head  small)
             self._k_store.append(k.detach().clone())
             self._v_store.append(v.detach().clone())
-            self._anchors.append(t)
+            self._anchors.add(t)
+            # _k_prev is the exact anchor  new tensor each time, safe to store
             self._k_prev = k.detach().clone()
             self._v_prev = v.detach().clone()
         else:
@@ -108,45 +135,39 @@ class DeltaKVCache(nn.Module):
             self._k_store.append(qk)
             self._v_store.append(qv)
 
-            # Update prev with reconstructed delta (propagate error correctly)
+            # Update prev with reconstructed delta (propagate error correctly).
+            # Addition returns a new tensor each time  reference stored in
+            # _k_reconstructed is not aliased to _k_prev after reassignment.
             self._k_prev = self._k_prev + self.k_quantizer.dequantize(qk)
             self._v_prev = self._v_prev + self.v_quantizer.dequantize(qv)
 
+        # Accumulate reconstruction incrementally so get() is O(1)
+        self._k_reconstructed.append(self._k_prev)
+        self._v_reconstructed.append(self._v_prev)
+
     def get(self) -> tuple[Tensor, Tensor]:
         """
-        Reconstruct the full KV cache by decoding anchor + accumulated deltas.
+        Return the full reconstructed KV cache.
+
+        O(1)  reconstructions are maintained incrementally in push().
 
         Returns:
             K_hat: Tensor of shape (T, ..., head_dim)
             V_hat: Tensor of shape (T, ..., head_dim)
         """
-        T = len(self._k_store)
-        if T == 0:
+        if not self._k_reconstructed:
             raise RuntimeError("Cache is empty - call push() first.")
-
-        k_list, v_list = [], []
-        k_running = None
-        v_running = None
-
-        for t in range(T):
-            if t in self._anchors:
-                k_running = self._k_store[t]  # full-precision anchor
-                v_running = self._v_store[t]
-            else:
-                dk = self.k_quantizer.dequantize(self._k_store[t])
-                dv = self.v_quantizer.dequantize(self._v_store[t])
-                k_running = k_running + dk
-                v_running = v_running + dv
-
-            k_list.append(k_running)
-            v_list.append(v_running)
-
-        return torch.stack(k_list, dim=0), torch.stack(v_list, dim=0)
+        return (
+            torch.stack(self._k_reconstructed, dim=0),
+            torch.stack(self._v_reconstructed, dim=0),
+        )
 
     def reset(self) -> None:
         """Clear the cache (start of a new sequence)."""
         self._k_store.clear()
         self._v_store.clear()
+        self._k_reconstructed.clear()
+        self._v_reconstructed.clear()
         self._k_prev = None
         self._v_prev = None
         self._anchors.clear()
@@ -170,5 +191,7 @@ class DeltaKVCache(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"head_dim={self.head_dim}, num_bits={self.num_bits}, "
-            f"anchor_every={self.anchor_every}, length={self.length}"
+            f"anchor_every={self.anchor_every}, "
+            f"anchor_threshold={self.anchor_threshold}, "
+            f"length={self.length}"
         )

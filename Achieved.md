@@ -15,7 +15,7 @@ The inner product variant matters because attention scores are q·kᵀ / √d. Y
 What's Wrong With It (and what you fixed)
 Bug Fixes
 Bug	Problem	Your Fix
-Codebook distribution	Used Gaussian N(0,1/d) to fit Lloyd-Max centroids. True post-rotation marginal is f(t) ∝ (1-t²)^((d-3)/2) - a Beta, not a Gaussian. Matters most at b=1,2.	Sample from true sphere marginal directly
+Codebook distribution	Used Gaussian N(0,1/d) to fit Lloyd-Max centroids. True post-rotation marginal is f(t) alpha (1-t²)^((d-3)/2) - a Beta, not a Gaussian. Matters most at b=1,2.	Sample from true sphere marginal directly
 SO(d) rotation	QR gives orthogonal matrix but ~50% chance det=-1 (reflection, not rotation). Reflection flips handedness, wrong distribution claim.	Sign-flip first column when det(Q) < 0
 Codebook lookup	argmin over expanded (N, d, k) tensor = O(N·d·k) with huge temp allocation. Lloyd-Max centroids are sorted so binary search suffices.	torch.bucketize on midpoints = O(N·d·log k), 14-22× faster
 Performance Improvement

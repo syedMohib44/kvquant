@@ -401,3 +401,123 @@ class TestKVCacheQuantizer:
         err = ((k - k_hat) ** 2).mean().item()
         # Loose upper bound: error must be less than variance of k (~1.0)
         assert err < 1.5, f"bits={bits}: K reconstruction error {err:.4f} too large"
+
+
+# ---------------------------------------------------------------------------
+# DeltaKVCache — Fix 1, 2, 3
+# ---------------------------------------------------------------------------
+
+from kvquant.delta import DeltaKVCache  # noqa: E402
+
+
+class TestDeltaKVCache:
+    """Tests for the three delta.py optimisations."""
+
+    # ── Fix 2 ────────────────────────────────────────────────────────────
+    def test_anchors_is_set(self):
+        """Fix 2: _anchors must be a set for O(1) membership lookup."""
+        cache = DeltaKVCache(head_dim=D, num_bits=3)
+        assert isinstance(cache._anchors, set), "_anchors must be a set"
+
+    def test_anchor_add_not_append(self):
+        """Fix 2: pushing tokens uses set.add(), positions are correct."""
+        cache = DeltaKVCache(head_dim=D, num_bits=3, anchor_every=2)
+        for _ in range(5):
+            cache.push(torch.randn(D), torch.randn(D))
+        # t=0 always anchor; anchor_every=2 adds t=2,4
+        assert 0 in cache._anchors
+        assert 2 in cache._anchors
+        assert 4 in cache._anchors
+
+    # ── Fix 1 ────────────────────────────────────────────────────────────
+    def test_incremental_lists_populated(self):
+        """Fix 1: _k_reconstructed grows by one entry per push()."""
+        cache = DeltaKVCache(head_dim=D, num_bits=3)
+        for i in range(7):
+            cache.push(torch.randn(D), torch.randn(D))
+            assert len(cache._k_reconstructed) == i + 1
+            assert len(cache._v_reconstructed) == i + 1
+
+    def test_get_output_shape(self):
+        """Fix 1: get() returns (T, head_dim) after T pushes."""
+        T = 12
+        cache = DeltaKVCache(head_dim=D, num_bits=3)
+        for _ in range(T):
+            cache.push(torch.randn(D), torch.randn(D))
+        K, V = cache.get()
+        assert K.shape == (T, D)
+        assert V.shape == (T, D)
+
+    def test_anchor_reconstructed_exactly(self):
+        """Fix 1: anchor tokens are stored float32 — reconstruction error is zero."""
+        cache = DeltaKVCache(head_dim=D, num_bits=3)
+        k0 = torch.randn(D)
+        cache.push(k0, torch.randn(D))
+        K, _ = cache.get()
+        assert torch.allclose(K[0], k0, atol=1e-6), "Anchor token not reconstructed exactly"
+
+    def test_get_called_twice_same_result(self):
+        """Fix 1: get() is idempotent — calling it twice gives identical tensors."""
+        cache = DeltaKVCache(head_dim=D, num_bits=3)
+        for _ in range(8):
+            cache.push(torch.randn(D), torch.randn(D))
+        K1, V1 = cache.get()
+        K2, V2 = cache.get()
+        assert torch.equal(K1, K2)
+        assert torch.equal(V1, V2)
+
+    def test_reset_clears_incremental_lists(self):
+        """Fix 1: reset() clears _k_reconstructed and _v_reconstructed."""
+        cache = DeltaKVCache(head_dim=D, num_bits=3)
+        for _ in range(5):
+            cache.push(torch.randn(D), torch.randn(D))
+        cache.reset()
+        assert len(cache._k_reconstructed) == 0
+        assert len(cache._v_reconstructed) == 0
+        assert len(cache._anchors) == 0
+
+    # ── Fix 3 ────────────────────────────────────────────────────────────
+    def test_adaptive_threshold_zero_disables(self):
+        """Fix 3: anchor_threshold=0.0 (default) never triggers adaptively."""
+        cache = DeltaKVCache(head_dim=D, num_bits=3, anchor_threshold=0.0)
+        base = torch.randn(D)
+        for _ in range(10):
+            cache.push(base * 100, torch.randn(D))  # same direction, huge magnitude
+        # Only t=0 should be an anchor
+        assert cache._anchors == {0}
+
+    def test_adaptive_threshold_triggers_on_large_delta(self):
+        """Fix 3: anchor_threshold triggers when ||delta||/||k|| exceeds threshold."""
+        cache = DeltaKVCache(head_dim=D, num_bits=3, anchor_threshold=0.3)
+        base = torch.randn(D)
+        # Stable tokens: tiny delta
+        for _ in range(4):
+            cache.push(base + 0.001 * torch.randn(D), torch.randn(D))
+        assert len(cache._anchors) == 1  # only t=0
+
+        # Large jump: delta >> vector
+        cache.push(torch.randn(D) * 10, torch.randn(D))
+        assert len(cache._anchors) == 2  # adaptive anchor triggered
+
+    def test_adaptive_reduces_mse_on_drift(self):
+        """Fix 3: adaptive anchoring lowers MSE when sequence drifts suddenly."""
+        torch.manual_seed(0)
+        T = 30
+        keys = []
+        k = torch.randn(D)
+        for t in range(T):
+            k = torch.randn(D) * 4 if t == 15 else k + 0.05 * torch.randn(D)
+            keys.append(k.clone())
+
+        def mse(threshold=0.0):
+            cache = DeltaKVCache(head_dim=D, num_bits=3, anchor_threshold=threshold)
+            for ki in keys:
+                cache.push(ki, torch.zeros(D))
+            K_hat, _ = cache.get()
+            return ((torch.stack(keys) - K_hat) ** 2).mean().item()
+
+        mse_no_adapt = mse(threshold=0.0)
+        mse_adaptive = mse(threshold=0.4)
+        assert mse_adaptive < mse_no_adapt, (
+            f"Adaptive MSE {mse_adaptive:.5f} should be < no-adapt MSE {mse_no_adapt:.5f}"
+        )
