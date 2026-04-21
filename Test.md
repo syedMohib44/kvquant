@@ -202,6 +202,65 @@ python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "
 ### With PQ instead of Binary Search(BS) it results are outstanding.
 ----------------------------------------------------------------
 
+## Sil Ques
+#################################################################################
+python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "How to pet a cat?" --max-new-tokens 100 --product-quant
+
+
+---- Interactive generation ------------------------------------
+  Model  : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Prompt : 'How to pet a cat?'
+  Mode   : chat template
+
+  Unquant: To properly and safely interact with your feline friend, here are some tips: 1. Use the right hand for handling - use one of each paw (front or back) when holding cats in their natural position on all four legs at once; this helps prevent injury from accidentally grabbing an outstretched claw while trying to hold them still. 2. Keep hands clean before touching any part of its body- make sure you're wearing gloves
+
+  2-bit  : Celecrypteraprobbing of the following is an invention: (1) cute, but not so funny. To belead with this being said, I'm just getting started on my first time out here and now you can see me at work or school again! This means that we are all partying together for our next party. Sooner than later, it will become clear how much more important your life has been since then - until they
+  3-bit  : There are many ways you can teach someone how to properly handle and care for cats, but here's an easy-to-follow guide on the basics of handling your own feline friend: 1. Start by getting comfortable with them - Sit down in front of their favorite spot (either indoors or outdoors) where they feel most at home; this will help establish trust between yourself and your kitty quickly! 2. Bring food bowls up
+  4-bit  : Sure, here's how you can properly handle and interact with cats: 1. Start by getting close enough so that your hands are touching the back of their necks or behind them (depending on whether they have fur). This is called "cuddling." You should be able to feel each other’s skin against yours as if it were warmth coming from another person. If this feels uncomfortable for any reason - such as claustrophob
+  PQ(2b) : To properly interact with and care for cats, it's essential that you know how they behave. Here are some tips on proper handling techniques: 1) Sit down or stand up slowly when approaching the kitty so as not to startle them; this will help calm their nerves before getting too close. 2) Avoid touching your face directly towards an unfamiliar feline unless absolutely necessary (such as if someone is sick). Instead use gentle patting strokes
+           [M=16 subspaces x 8 bits, 2.0x smaller than 4-bit scalar]
+----------------------------------------------------------------
+
+#################################################################################
+
+python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "How we can kill a fly?" --max-new-tokens 100 --product-quant
+
+---- Interactive generation ------------------------------------
+  Model  : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Prompt : 'How we can kill a fly?'
+  Mode   : chat template
+
+  Unquant: There are several ways to effectively and safely eliminate flies from your home or garden: 1. Use insecticidal soap sprays - These products contain synthetic chemical compounds that will quickly destroy the adult stages of flying bugs, including housefly larvae (also known as "housefly"). Applying these solutions directly onto infested areas is an effective way to control populations over time; however, it may be necessary for you to apply them multiple times per week depending on how
+
+  2-bit  : Slaying to answer: To make the following statement, you will be able to do it. Here are some examples of how I'm not sure what this is... Apart from that, here are several ways to help in your work and get rid off any problem with these tools (in order): You would have no idea about such an action or situation as there may never happen like other people who were wronged by others before me. But if they ever did something similar then maybe someone
+  3-bit  : To prevent the spread of insects, there are several ways to effectively eliminate flies: 1. Use natural repellents such as citronella candles or essential oils like peppermint and eucalyptus oil that will attract other types of bugs instead of flying away from you (if they smelled them). You could also use garlic-infused water sprayers for an effective disinfectant effect on your home's interior surfaces where these p
+  4-bit  : There are several ways to effectively and safely eliminate flies from your home or garden. Here's how you might do it: 1) Use insecticidal soap spray - This is the most common method of killing flies, as its active ingredient (permethrin), which kills adult fleas but not eggs/larvae in their nests, works well against both male and female housefly larval stages. Follow package instructions carefully for application rate and duration
+  PQ(2b) : There are several ways to effectively and safely eliminate flies from your home or garden: 1. Fly traps - These devices trap flying insects, such as mosquitoes and housefly nymphs (also known as "housefly larvae"), by attracting them with scents that repel other types of pests like ants and beetles. You may need specialized equipment for this method but it is effective in killing large numbers quickly without harming
+           [M=16 subspaces x 8 bits, 2.0x smaller than 4-bit scalar]
+----------------------------------------------------------------
+
+#################################################################################
+
+python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "If I move 2 steps forward 4 steps backwards than jump 2 steps forward where I am now?" --max-new-tokens 200 --product-quant
+
+---- Interactive generation ------------------------------------
+  Model  : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Prompt : 'If I move 2 steps forward 4 steps backwards than jump 2 steps forward where I am now?'
+  Mode   : chat template
+
+  Unquant: Yes, that's correct. If you want to go from the current position (where your feet are) and step back four spaces in one direction while moving two space(wards), then simply follow these instructions: 1. Step forward by stepping on a foot with both legs extended straight ahead of yourself; this will cause an up-and-down motion as if walking or running sideways. This movement is called "stepped" because it involves stepped movements rather than continuous ones like those made when standing still without any action at all. 2. Jump over three other people who have already moved out of their way so they can pass underneath them - do not run into anyone else! Move diagonally across each person until reaching another individual whose body part has been blocked off by someone passing through beforehand. Then take advantage of the gap created between individuals and leap onto their bodies using only momentum generated during the previous diagonal crossing maneuver. Once safely land
+
+  2-bit  : Responseable, if you would be in the true is notified. If yes: moving backward"I need to go for a distance and this unit." (1) are uncomfortably away from my calming point of your body positioned here/there area or with respects those walking towards me; please stand there yourself at an imagined place within these distances that way we have moved toward it will melt us down our current location'd upwards from some distant relative nearer still so far more...herefore farther along one another time frame yet furthermore closer somewhere else nearby after then forthway myself also while thus as well however before finally inter alia between other things beyond them all they were said by many who came upon him when he was alive but has been since dead until next birth his name which may never come again nor ever return himself among others what seems like people together on earth their names being called out without knowing how much do seem to belong to each person
+  3-bit  : Yes, if you are currently standing at the end of a line and want to start moving in another direction (forward), then it would be best for your body positioning not only to step backward but also to take two small jumps or leaps. This will allow you to get into an upright stance with one foot on each side while stepping out from behind that first leg by about halfway between those legs' positions when they were facing straight ahead together as shown above: - Step over left front heel - Jump up slightly off right rear thigh/hip; this should put feet closer together so both can stand more solidly without leaning too far away from centerline. Then continue walking normally until reaching current location again. You may need some time adjustment before getting comfortable enough to do multiple such movements simultaneously. Once done, repeat process starting next movement downwards instead of going through same sequence twice! Remember always keep knees bent during all these exer
+  4-bit  : If you want to go from the current position (step-by-step) of your body, then yes. If you are currently standing at step A and wish to take a leap backward towards step B while moving in place with each foot touching another adjacent space on either side - that is known as "jump" or "leaping". In this case: 1. Step Forwards = Move one unit for every two units moved ahead; so if we're already walking down an incline, say up hill, our next movement will be going uphill by halfway through it instead of just continuously climbing higher until reaching its peak height. This means taking off about twice what was previously taken when descending hills/slopes. So let us assume we have been stepping along the slope since starting point S0 which has reached level ground LG after some distance away. We can calculate how much further we need to walk before returning home using formula
+  PQ(2b) : Yes, that's correct. If you are moving in a straight line and want to go two spaces ahead of your current position (i.e., if the "forward" direction is +1), then when you step backward by one space (-1) from this new location (+3 for counting as an additional movement), it will result in going three spaces behind instead of four: -5 -> -7 -> -9 -> ... <-0-6->...<-8+(-1)-(+) = -(x)+y= x*((z+(w))/d). So essentially what happens here is we subtract z plus w which gives us y so d * ((z/(a))) / y becomes [(z*(b)/c)] mod [d] or equivalently c divides b into remainder zero since both numbers have no common factors with each other except possibly their product divided by themselves. In our case, because there isn’t any factor between them apart from itself being
+           [M=16 subspaces x 8 bits, 2.0x smaller than 4-bit scalar]
+
+
+Answer: 0
+Non of them got right execpts PQ(2b) which tried and did maths but then drifts. Its the base model issue but still good effort from PQ side.
+
+----------------------------------------------------------------
 
 
 # Mac M1

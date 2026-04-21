@@ -133,7 +133,7 @@ class TestRotation:
 
 
 # ===========================================================================
-# quantizer.py  -  KVQuantMSE
+# quantizer.py   KVQuantMSE
 # ===========================================================================
 
 
@@ -195,7 +195,7 @@ class TestKVQuantMSE:
 
 
 # ===========================================================================
-# quantizer.py  -  KVQuantIP
+# quantizer.py   KVQuantIP
 # ===========================================================================
 
 
@@ -214,18 +214,18 @@ class TestKVQuantIP:
         y = y / y.norm(dim=-1, keepdim=True)
         q = KVQuantIP(D, num_bits=b, seed=b * 10, qjl_seed=b * 10 + 1)
         x_tilde = q(unit_vectors)
-        bias = ((unit_vectors * y).sum(-1) - (x_tilde * y).sum(-1)).mean().abs().item()
+        bias = ((unit_vectors * y).sum(-1)(x_tilde * y).sum(-1)).mean().abs().item()
         assert bias < 0.02, f"b={b}: IP bias {bias:.5f} too large"
 
     @pytest.mark.parametrize("b", [1, 2, 3, 4])
     def test_ip_variance_bound(self, b, unit_vectors):
-        """Var[<y, x'> - <y,x>] must be below the paper's upper bound."""
+        """Var[<y, x'> <y,x>] must be below the paper's upper bound."""
         torch.manual_seed(b + 100)
         y = torch.randn_like(unit_vectors)
         y = y / y.norm(dim=-1, keepdim=True)
         q = KVQuantIP(D, num_bits=b, seed=b * 20, qjl_seed=b * 20 + 1)
         x_tilde = q(unit_vectors)
-        err = (unit_vectors * y).sum(-1) - (x_tilde * y).sum(-1)
+        err = (unit_vectors * y).sum(-1)(x_tilde * y).sum(-1)
         var = err.var().item()
         upper_var = math.sqrt(3) * math.pi**2 / D / 4**b * 1.2  # 20% tolerance
         assert (
@@ -404,7 +404,7 @@ class TestKVCacheQuantizer:
 
 
 # ---------------------------------------------------------------------------
-# DeltaKVCache — Fix 1, 2, 3
+# DeltaKVCache Fix 1, 2, 3
 # ---------------------------------------------------------------------------
 
 from kvquant.delta import DeltaKVCache  # noqa: E402
@@ -449,15 +449,17 @@ class TestDeltaKVCache:
         assert V.shape == (T, D)
 
     def test_anchor_reconstructed_exactly(self):
-        """Fix 1: anchor tokens are stored float32 — reconstruction error is zero."""
+        """Fix 1: anchor tokens are stored float32 reconstruction error is zero."""
         cache = DeltaKVCache(head_dim=D, num_bits=3)
         k0 = torch.randn(D)
         cache.push(k0, torch.randn(D))
         K, _ = cache.get()
-        assert torch.allclose(K[0], k0, atol=1e-6), "Anchor token not reconstructed exactly"
+        assert torch.allclose(
+            K[0], k0, atol=1e-6
+        ), "Anchor token not reconstructed exactly"
 
     def test_get_called_twice_same_result(self):
-        """Fix 1: get() is idempotent — calling it twice gives identical tensors."""
+        """Fix 1: get() is idempotent calling it twice gives identical tensors."""
         cache = DeltaKVCache(head_dim=D, num_bits=3)
         for _ in range(8):
             cache.push(torch.randn(D), torch.randn(D))
@@ -518,6 +520,6 @@ class TestDeltaKVCache:
 
         mse_no_adapt = mse(threshold=0.0)
         mse_adaptive = mse(threshold=0.4)
-        assert mse_adaptive < mse_no_adapt, (
-            f"Adaptive MSE {mse_adaptive:.5f} should be < no-adapt MSE {mse_no_adapt:.5f}"
-        )
+        assert (
+            mse_adaptive < mse_no_adapt
+        ), f"Adaptive MSE {mse_adaptive:.5f} should be < no-adapt MSE {mse_no_adapt:.5f}"
