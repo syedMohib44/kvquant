@@ -8,7 +8,7 @@ TurboQuant (Zandieh et al., 2025) is a compelling approach to KV cache compressi
 
 We introduce five extensions attention-weighted quantization, delta compression, adaptive bit allocation, low-rank error correction, and product quantization each targeting a different structural property of transformer attention that the original method leaves on the table. Along the way, we also corrected several issues in the original implementation: the codebook was fitted to a Gaussian approximation rather than the actual sphere marginal distribution; the QR decomposition could silently produce a reflection instead of a rotation; the nearest-centroid search was doing $O(N \cdot d \cdot k)$ work when a binary search suffices; and the inner-product quantizer was applying a redundant second normalisation pass on vectors already on the unit sphere.
 
-On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47–70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1–2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim — the same storage as 2-bit scalar, which collapses — matching 3-bit scalar quality. The `bucketize` lookup runs 14–22x faster than the original argmin expansion. Four additional improvements are described: k-means++ codebook initialisation (75% lower init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5% at 0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4% vs same-budget plain), and Hadamard rotation exposed as a configurable parameter ($O(d \log d)$ vs $O(d^2)$).
+On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47–70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1–2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim the same storage as 2-bit scalar, which collapses matching 3-bit scalar quality. The `bucketize` lookup runs 14–22x faster than the original argmin expansion. Four additional improvements are described: k-means++ codebook initialisation (75% lower init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5% at 0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4% vs same-budget plain), and Hadamard rotation exposed as a configurable parameter ($O(d \log d)$ vs $O(d^2)$).
 
 ---
 
@@ -52,7 +52,7 @@ $$f(t) \;=\; C_d \cdot (1 - t^2)^{(d-3)/2}, \qquad t \in [-1,\, 1]$$
 
 This is a Beta-type distribution that only converges to a Gaussian for large $d$. At small $d$ and low bit-widths the difference is meaningful. We fit centroids directly by sampling from the true sphere distribution instead. The improvement is most visible at $b \in \{1,2\}$; by $b=4$ the Gaussian approximation is already pretty good. Centroids are cached by (num\_bits, dim) after first computation.
 
-**k-means++ initialisation.** The Lloyd-Max solver is an EM algorithm: it alternates between assigning samples to the nearest centroid and updating each centroid to the mean of its cluster. Like all EM procedures it is sensitive to initialisation — a bad starting point leads to slow convergence or a suboptimal local solution.
+**k-means++ initialisation.** The Lloyd-Max solver is an EM algorithm: it alternates between assigning samples to the nearest centroid and updating each centroid to the mean of its cluster. Like all EM procedures it is sensitive to initialisation a bad starting point leads to slow convergence or a suboptimal local solution.
 
 The original implementation seeds centroids with `torch.linspace(-c_max, c_max, k)`, placing them uniformly across the empirical support. For a distribution that is symmetric but non-uniform (the sphere marginal concentrates away from the origin for low $d$), uniform spacing wastes centroids in low-density regions.
 
@@ -189,7 +189,7 @@ The same asymmetry propagates through `OutlierKVQuant` via a new `quantizer_cls`
 | IP/MSE (asymmetric) at 2.5 bpw | 2.5 | 2.1816 | **0.002086** |
 | IP/IP at 2.0 bpw | 2.0 | 3.1417 | 0.045147 |
 
-At 2.5 bits/dim the asymmetric config reduces V MSE by **61.5%** versus the 3-bit IP/IP baseline — using 0.5 fewer bits — and by **95.4%** versus the same-budget 2-bit IP/IP baseline. The K IP-error increase reflects the lower per-dimension bit budget; for inner products the IP quantizer remains unbiased regardless.
+At 2.5 bits/dim the asymmetric config reduces V MSE by **61.5%** versus the 3-bit IP/IP baseline using 0.5 fewer bits and by **95.4%** versus the same-budget 2-bit IP/IP baseline. The K IP-error increase reflects the lower per-dimension bit budget; for inner products the IP quantizer remains unbiased regardless.
 
 **Problem.** `build_codebook()` returned `centroids.clone()` and `boundaries.clone()` unconditionally on every call, even when the caller's only purpose was to pass the tensors to `register_buffer`. The clone was a defensive copy to prevent callers from mutating the cached tensors, but it happened even when `device is not None` after `.to()` had already returned a fresh tensor.
 
@@ -270,9 +270,9 @@ Results on distilgpt2 (3-bit):
 | 4 | 0.25125 | 0.20710 | 1.2x |
 | 5 | 0.17647 | 0.16796 | 1.1x |
 
-Earlier layers benefit more, which makes sense — they tend to have smoother, more predictable KV trajectories than the later layers.
+Earlier layers benefit more, which makes sense they tend to have smoother, more predictable KV trajectories than the later layers.
 
-**Delta + outlier combination.** Delta compression and outlier-aware quantization are complementary and can be stacked. Outlier channels — those with disproportionately high variance — also tend to be the channels with the largest delta magnitudes. Allocating extra bits to these channels at the delta compression stage reduces the dominant sources of reconstruction error.
+**Delta + outlier combination.** Delta compression and outlier-aware quantization are complementary and can be stacked. Outlier channels those with disproportionately high variance also tend to be the channels with the largest delta magnitudes. Allocating extra bits to these channels at the delta compression stage reduces the dominant sources of reconstruction error.
 
 `DeltaKVCache` accepts `use_outlier=True`, which replaces the internal KVQuantIP/KVQuantMSE pair with `OutlierKVQuant` instances calibrated on the delta distribution. The asymmetric rule from §2.2.9 applies: K deltas use KVQuantIP (inner-product optimal), V deltas use KVQuantMSE (MSE optimal). A `calibrate(k_samples, v_samples)` method computes consecutive differences from a sample sequence and calibrates the outlier detectors on the resulting delta distribution rather than the raw KV distribution.
 

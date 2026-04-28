@@ -93,11 +93,11 @@ class DeltaKVCache(nn.Module):
             no = n_outlier if n_outlier > 0 else max(1, head_dim // 4)
             ob = min(num_bits + 1, 4)
             rb = max(num_bits - 1, 1)
-            # K deltas: KVQuantIP — inner-product optimal (reconstructed K used in Q@K^T)
+            # K deltas: KVQuantIP inner-product optimal (reconstructed K used in Q@K^T)
             self.k_quantizer = OutlierKVQuant(
                 head_dim, no, ob, rb, seed=seed, quantizer_cls=KVQuantIP
             )
-            # V deltas: KVQuantMSE — MSE optimal (reconstructed V used in weighted sum)
+            # V deltas: KVQuantMSE MSE optimal (reconstructed V used in weighted sum)
             self.v_quantizer = OutlierKVQuant(
                 head_dim, no, ob, rb, seed=seed + 100, quantizer_cls=KVQuantMSE
             )

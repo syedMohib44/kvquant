@@ -77,23 +77,23 @@ class KVCacheQuantizer(nn.Module):
         if use_outlier:
             ob = outlier_bits if outlier_bits is not None else min(num_bits + 1, 4)
             rb = regular_bits if regular_bits is not None else max(num_bits - 1, 1)
-            # K: KVQuantIP  — inner-product optimal (attention scores use Q @ K^T)
+            # K: KVQuantIP  inner-product optimal (attention scores use Q @ K^T)
             self.k_quant = OutlierKVQuant(
                 head_dim, n_outlier, ob, rb, seed=seed,
                 quantizer_cls=KVQuantIP, use_hadamard=use_hadamard,
             )
-            # V: KVQuantMSE — MSE optimal (output is weighted sum of V)
+            # V: KVQuantMSE MSE optimal (output is weighted sum of V)
             self.v_quant = OutlierKVQuant(
                 head_dim, n_outlier, ob, rb, seed=seed + 100,
                 quantizer_cls=KVQuantMSE, use_hadamard=use_hadamard,
             )
         else:
-            # K: KVQuantIP — preserves inner products for attention scores
+            # K: KVQuantIP preserves inner products for attention scores
             self.k_quant = KVQuantIP(
                 head_dim, num_bits, seed=seed, qjl_seed=seed + 1,
                 use_hadamard=use_hadamard,
             )
-            # V: KVQuantMSE — minimises reconstruction MSE for output values
+            # V: KVQuantMSE minimises reconstruction MSE for output values
             self.v_quant = KVQuantMSE(
                 head_dim, num_bits, seed=seed + 2,
                 use_hadamard=use_hadamard,
