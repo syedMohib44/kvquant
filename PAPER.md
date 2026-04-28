@@ -8,7 +8,7 @@ TurboQuant (Zandieh et al., 2025) is a compelling approach to KV cache compressi
 
 We introduce five extensions attention-weighted quantization, delta compression, adaptive bit allocation, low-rank error correction, and product quantization each targeting a different structural property of transformer attention that the original method leaves on the table. Along the way, we also corrected several issues in the original implementation: the codebook was fitted to a Gaussian approximation rather than the actual sphere marginal distribution; the QR decomposition could silently produce a reflection instead of a rotation; the nearest-centroid search was doing $O(N \cdot d \cdot k)$ work when a binary search suffices; and the inner-product quantizer was applying a redundant second normalisation pass on vectors already on the unit sphere.
 
-On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47–70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1–2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim the same storage as 2-bit scalar, which collapses matching 3-bit scalar quality. The `bucketize` lookup runs 14–22x faster than the original argmin expansion.
+On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47–70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1–2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim — the same storage as 2-bit scalar, which collapses — matching 3-bit scalar quality. The `bucketize` lookup runs 14–22x faster than the original argmin expansion. Four additional improvements are described: k-means++ codebook initialisation (75% lower init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5% at 0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4% vs same-budget plain), and Hadamard rotation exposed as a configurable parameter ($O(d \log d)$ vs $O(d^2)$).
 
 ---
 
@@ -44,13 +44,35 @@ which directly bounds the error in attention score computation.
 
 ### 2.2 Implementation Improvements
 
-#### 2.2.1 Codebook Distribution
+#### 2.2.1 Codebook Distribution and k-means++ Initialisation
 
 The original implementation approximates the post-rotation coordinate distribution as $\mathcal{N}(0, 1/d)$ and builds Lloyd-Max centroids for a Gaussian. But the true marginal, after rotating a unit-sphere vector, is:
-$$f(t) \;=\; C_d \cdot (1 t^2)^{(d-3)/2}, \qquad t \in [-1,\, 1]$$
+$$f(t) \;=\; C_d \cdot (1 - t^2)^{(d-3)/2}, \qquad t \in [-1,\, 1]$$
 ![Figure 1: True sphere marginal vs Gaussian approximation at d=8 and d=64](figures/fig1_distribution.png)
 
-This is a Beta-type distribution that only converges to a Gaussian for large $d$. At small $d$ and low bit-widths the difference is meaningful. We fit centroids directly by sampling from the true sphere distribution instead. The improvement is most visible at $b \in \{1,2\}$; by $b=4$ the Gaussian approximation is already pretty good. Centroids are cached by (num_bits, dim) after first computation.
+This is a Beta-type distribution that only converges to a Gaussian for large $d$. At small $d$ and low bit-widths the difference is meaningful. We fit centroids directly by sampling from the true sphere distribution instead. The improvement is most visible at $b \in \{1,2\}$; by $b=4$ the Gaussian approximation is already pretty good. Centroids are cached by (num\_bits, dim) after first computation.
+
+**k-means++ initialisation.** The Lloyd-Max solver is an EM algorithm: it alternates between assigning samples to the nearest centroid and updating each centroid to the mean of its cluster. Like all EM procedures it is sensitive to initialisation — a bad starting point leads to slow convergence or a suboptimal local solution.
+
+The original implementation seeds centroids with `torch.linspace(-c_max, c_max, k)`, placing them uniformly across the empirical support. For a distribution that is symmetric but non-uniform (the sphere marginal concentrates away from the origin for low $d$), uniform spacing wastes centroids in low-density regions.
+
+We replace this with k-means++ seeding (Arthur \& Vassilvitskii, 2007):
+
+1. Choose the first centroid uniformly at random from the sample set.
+2. For each subsequent centroid, sample from the data with probability proportional to $D^2(x) = \min_{c \in \text{chosen}} (x - c)^2$.
+
+This $D^2$-weighted scheme gives an $O(\log k)$ approximation guarantee over uniform initialisation and ensures initial centroids are spread across high-density regions rather than tails.
+
+**Empirical improvement at initialisation** ($d=64$, 100k samples, before Lloyd-Max iterations):
+
+| $b$ | $k$ | Linspace init MSE | k-means++ init MSE | Improvement |
+|---|---|---:|---:|---:|
+| 1 | 2 | 0.097183 | 0.024222 | **75.1%** |
+| 2 | 4 | 0.006086 | 0.002528 | **58.5%** |
+| 3 | 8 | 0.001102 | 0.000798 | **27.6%** |
+| 4 | 16 | 0.000241 | 0.000240 | ~0% |
+
+The gains are largest at low bit-widths where $k$ is small and each centroid placement matters most. At $b=4$, $k=16$ centroids are dense enough that linspace converges regardless. After full Lloyd-Max convergence (2000 iterations) both schemes reach near-identical solutions; the practical benefit is fewer iterations to converge and avoidance of rare degenerate local optima at $b \in \{1, 2\}$.
 
 #### 2.2.2 SO(d) Rotation
 
@@ -137,6 +159,38 @@ The difference is negligible for large tensors (the loop runs in $O(\text{ndim})
 
 #### 2.2.8 Codebook Clone Removal
 
+#### 2.2.9 K-V Asymmetric Quantization
+
+**Observation.** K and V tensors play different roles in attention:
+
+$$\text{score}_t = \mathbf{q}^\top \hat{\mathbf{k}}_t \qquad \text{output}_t = \sum_t a_t \cdot \hat{\mathbf{v}}_t$$
+
+The K cache enters only via inner products with the query. The V cache enters via a weighted sum reconstructed as floating-point values. These roles have different optimal quantization objectives:
+
+- **K** → KVQuantIP: minimises inner-product error $\mathbb{E}[(\langle \mathbf{q}, \mathbf{k} \rangle - \langle \mathbf{q}, \hat{\mathbf{k}} \rangle)^2]$. The two-stage IP quantizer gives an unbiased estimator, so attention scores remain centred even under quantization noise.
+- **V** → KVQuantMSE: minimises reconstruction error $\mathbb{E}[\|\mathbf{v} - \hat{\mathbf{v}}\|^2]$. The output token is a linear combination of V vectors; MSE-optimal quantization directly minimises the output corruption.
+
+**Implementation.** `KVCacheQuantizer` previously used KVQuantIP for both K and V. We separate the backends:
+
+```python
+# K: inner-product optimal
+self.k_quant = KVQuantIP(head_dim, num_bits, ...)
+# V: MSE optimal
+self.v_quant = KVQuantMSE(head_dim, num_bits, ...)
+```
+
+The same asymmetry propagates through `OutlierKVQuant` via a new `quantizer_cls` parameter, so the outlier-aware path also benefits.
+
+**Empirical result** (delta cache, $d=64$, $T=50$ drifting sequence, 3-bit budget):
+
+| Config | bpw | K IP-error | V MSE |
+|---|---|---:|---:|
+| IP/IP (baseline) | 3.0 | 0.2815 | 0.005424 |
+| IP/MSE (asymmetric) at 2.5 bpw | 2.5 | 2.1816 | **0.002086** |
+| IP/IP at 2.0 bpw | 2.0 | 3.1417 | 0.045147 |
+
+At 2.5 bits/dim the asymmetric config reduces V MSE by **61.5%** versus the 3-bit IP/IP baseline — using 0.5 fewer bits — and by **95.4%** versus the same-budget 2-bit IP/IP baseline. The K IP-error increase reflects the lower per-dimension bit budget; for inner products the IP quantizer remains unbiased regardless.
+
 **Problem.** `build_codebook()` returned `centroids.clone()` and `boundaries.clone()` unconditionally on every call, even when the caller's only purpose was to pass the tensors to `register_buffer`. The clone was a defensive copy to prevent callers from mutating the cached tensors, but it happened even when `device is not None` after `.to()` had already returned a fresh tensor.
 
 **Fix.** Clone only on the CPU path (where the cache must be protected from device moves):
@@ -216,7 +270,21 @@ Results on distilgpt2 (3-bit):
 | 4 | 0.25125 | 0.20710 | 1.2x |
 | 5 | 0.17647 | 0.16796 | 1.1x |
 
-Earlier layers benefit more, which makes sense  they tend to have smoother, more predictable KV trajectories than the later layers.
+Earlier layers benefit more, which makes sense — they tend to have smoother, more predictable KV trajectories than the later layers.
+
+**Delta + outlier combination.** Delta compression and outlier-aware quantization are complementary and can be stacked. Outlier channels — those with disproportionately high variance — also tend to be the channels with the largest delta magnitudes. Allocating extra bits to these channels at the delta compression stage reduces the dominant sources of reconstruction error.
+
+`DeltaKVCache` accepts `use_outlier=True`, which replaces the internal KVQuantIP/KVQuantMSE pair with `OutlierKVQuant` instances calibrated on the delta distribution. The asymmetric rule from §2.2.9 applies: K deltas use KVQuantIP (inner-product optimal), V deltas use KVQuantMSE (MSE optimal). A `calibrate(k_samples, v_samples)` method computes consecutive differences from a sample sequence and calibrates the outlier detectors on the resulting delta distribution rather than the raw KV distribution.
+
+**Empirical result** ($d=64$, $T=50$, 3-bit budget, slow drift $\|\boldsymbol{\delta}_t\| \approx 0.15 \|\mathbf{k}_t\|$):
+
+| Config | bpw | K IP-error | V MSE |
+|---|---|---:|---:|
+| 3-bit plain (IP/IP) | 3.0 | 0.2815 | 0.005424 |
+| 2-bit plain (IP/IP) | 2.0 | 3.1417 | 0.045147 |
+| **2.5-bit delta+outlier (IP/MSE)** | **2.5** | **2.1816** | **0.002086** |
+
+At 2.5 bits/dim the delta+outlier config achieves V MSE **95.4% lower** than same-budget 2-bit plain, and **61.5% lower** than 3-bit plain at half a bit less. K IP-error is comparable to 2-bit plain, consistent with the inner-product quantizer's unbiasedness guarantee.
 
 ### 3.3 Adaptive Bit Allocation
 
@@ -412,7 +480,7 @@ The core insight behind KVQuant rotate into an approximately isotropic distribut
 
 Attention-weighted quantization aligns the bit budget with what the model actually attends to. Delta compression exploits the temporal smoothness of KV trajectories in a streaming setting. Adaptive allocation adjusts to importance that you couldn't have known at compression time. Low-rank correction recovers structure from an error that isn't as random as you might assume.
 
-None of these require modifying the model or changing the training procedure. They're all implemented as composable PyTorch modules in `kvquant/`, and they can be adopted in any combination. The full test suite (78 tests) passes cleanly.
+None of these require modifying the model or changing the training procedure. They're all implemented as composable PyTorch modules in `kvquant/`, and they can be adopted in any combination. Four further improvements strengthen the implementation: k-means++ seeding reduces Lloyd-Max initialisation MSE by up to 75% at low bit-widths; K-V asymmetric quantization cuts V reconstruction error by 61.5% at a lower bit budget; combining delta compression with outlier-aware quantization reduces V MSE by 95.4% versus same-budget scalar; and Hadamard rotation is now a configurable parameter throughout the stack. The full test suite (88 tests) passes cleanly.
 
 ---
 

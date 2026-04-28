@@ -32,13 +32,12 @@ Optimisations vs naive implementation:
 
 from __future__ import annotations
 
-from typing import NamedTuple
-
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .quantizer import KVQuantIP, QuantizedIP
+from .quantizer import KVQuantIP, KVQuantMSE, QuantizedIP
+from .outlier import OutlierKVQuant, OutlierQuantized
 
 
 class DeltaKVCache(nn.Module):
@@ -64,6 +63,12 @@ class DeltaKVCache(nn.Module):
         anchor_threshold: Adaptive re-anchor when ||delta|| / ||k|| exceeds
                           this ratio. 0.0 = disabled (default). Combines with
                           anchor_every whichever triggers first wins.
+        use_outlier:      If True, uses OutlierKVQuant for delta quantization.
+                          Outlier channels in deltas are quantized at higher
+                          bit-width for better reconstruction. Requires calling
+                          calibrate() before push(). Default False.
+        n_outlier:        Number of outlier channels (use_outlier=True only).
+                          0 = auto (head_dim // 4).
         seed:             RNG seed.
     """
 
@@ -73,6 +78,8 @@ class DeltaKVCache(nn.Module):
         num_bits: int = 3,
         anchor_every: int = 0,
         anchor_threshold: float = 0.0,
+        use_outlier: bool = False,
+        n_outlier: int = 0,
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -80,15 +87,29 @@ class DeltaKVCache(nn.Module):
         self.num_bits = num_bits
         self.anchor_every = anchor_every
         self.anchor_threshold = anchor_threshold
+        self._use_outlier = use_outlier
 
-        self.k_quantizer = KVQuantIP(head_dim, num_bits, seed=seed, qjl_seed=seed + 1)
-        self.v_quantizer = KVQuantIP(
-            head_dim, num_bits, seed=seed + 2, qjl_seed=seed + 3
-        )
+        if use_outlier:
+            no = n_outlier if n_outlier > 0 else max(1, head_dim // 4)
+            ob = min(num_bits + 1, 4)
+            rb = max(num_bits - 1, 1)
+            # K deltas: KVQuantIP — inner-product optimal (reconstructed K used in Q@K^T)
+            self.k_quantizer = OutlierKVQuant(
+                head_dim, no, ob, rb, seed=seed, quantizer_cls=KVQuantIP
+            )
+            # V deltas: KVQuantMSE — MSE optimal (reconstructed V used in weighted sum)
+            self.v_quantizer = OutlierKVQuant(
+                head_dim, no, ob, rb, seed=seed + 100, quantizer_cls=KVQuantMSE
+            )
+        else:
+            self.k_quantizer = KVQuantIP(head_dim, num_bits, seed=seed, qjl_seed=seed + 1)
+            self.v_quantizer = KVQuantIP(
+                head_dim, num_bits, seed=seed + 2, qjl_seed=seed + 3
+            )
 
         # Compressed delta storage
-        self._k_store: list[QuantizedIP | Tensor] = []
-        self._v_store: list[QuantizedIP | Tensor] = []
+        self._k_store: list[QuantizedIP | OutlierQuantized | Tensor] = []
+        self._v_store: list[QuantizedIP | OutlierQuantized | Tensor] = []
 
         # Incrementally maintained reconstructions  makes get() O(1)
         self._k_reconstructed: list[Tensor] = []
@@ -97,6 +118,28 @@ class DeltaKVCache(nn.Module):
         self._k_prev: Tensor | None = None  # last reconstructed k (for delta)
         self._v_prev: Tensor | None = None
         self._anchors: set[int] = set()  # O(1) membership test
+
+    # ------------------------------------------------------------------
+    def calibrate(self, k_samples: Tensor, v_samples: Tensor) -> None:
+        """
+        Calibrate outlier detection on the delta distribution.
+
+        Required before push() when use_outlier=True.  No-op otherwise.
+
+        Args:
+            k_samples: Key tensors of shape (T, ..., head_dim) or (N, head_dim).
+                       Consecutive deltas are computed automatically if T > 1.
+            v_samples: Value tensors, same shape as k_samples.
+        """
+        if not self._use_outlier:
+            return
+        fk = k_samples.reshape(-1, self.head_dim)
+        fv = v_samples.reshape(-1, self.head_dim)
+        # Calibrate on delta distribution, not raw vectors
+        dk = fk[1:] - fk[:-1] if fk.shape[0] > 1 else fk
+        dv = fv[1:] - fv[:-1] if fv.shape[0] > 1 else fv
+        self.k_quantizer.calibrate(dk)
+        self.v_quantizer.calibrate(dv)
 
     # ------------------------------------------------------------------
     def push(self, k: Tensor, v: Tensor) -> None:
@@ -184,8 +227,16 @@ class DeltaKVCache(nn.Module):
         """
         norms = []
         for t, item in enumerate(self._k_store):
-            if t not in self._anchors and isinstance(item, QuantizedIP):
+            if t in self._anchors:
+                continue
+            if isinstance(item, QuantizedIP):
                 norms.append(item.vec_norms.mean().item())
+            elif isinstance(item, OutlierQuantized):
+                # OutlierQuantized wraps sub-quantizer results; use outlier
+                # sub-component norms as a proxy (KVQuantIP stores vec_norms).
+                oq = item.outlier_q
+                if isinstance(oq, QuantizedIP):
+                    norms.append(oq.vec_norms.mean().item())
         return torch.tensor(norms) if norms else torch.tensor([])
 
     def extra_repr(self) -> str:

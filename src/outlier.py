@@ -24,18 +24,18 @@ import torch.nn as nn
 from torch import Tensor
 from typing import NamedTuple
 
-from .quantizer import KVQuantIP, QuantizedIP
+from .quantizer import KVQuantIP, KVQuantMSE, QuantizedIP, QuantizedMSE
 
 
 class OutlierQuantized(NamedTuple):
-    outlier_q: QuantizedIP  # quantized outlier channels  (first n_outlier cols)
-    regular_q: QuantizedIP  # quantized regular channels  (remaining cols)
+    outlier_q: QuantizedIP | QuantizedMSE  # quantized outlier channels  (first n_outlier cols)
+    regular_q: QuantizedIP | QuantizedMSE  # quantized regular channels  (remaining cols)
     shape: tuple  # original shape (..., d)
 
 
 class OutlierKVQuant(nn.Module):
     """
-    TurboQuant with per-channel outlier handling.
+    KVQuant with per-channel outlier handling.
 
     Calibrate once with a representative batch, then quantize/dequantize.
 
@@ -45,6 +45,11 @@ class OutlierKVQuant(nn.Module):
         outlier_bits:   Bits per coordinate for outlier channels.
         regular_bits:   Bits per coordinate for regular channels.
         seed:           Base RNG seed (outlier and regular use seed and seed+1).
+        quantizer_cls:  KVQuantIP (default, inner-product optimal) or KVQuantMSE
+                        (MSE optimal).  Use KVQuantIP for K tensors and KVQuantMSE
+                        for V tensors to match each tensor's role in attention.
+        use_hadamard:   Use structured Hadamard rotation instead of dense QR.
+                        Requires dim to be a power of 2.  Faster for large d.
     """
 
     def __init__(
@@ -54,6 +59,8 @@ class OutlierKVQuant(nn.Module):
         outlier_bits: int = 3,
         regular_bits: int = 2,
         seed: int = 0,
+        quantizer_cls: type = KVQuantIP,
+        use_hadamard: bool = False,
     ) -> None:
         super().__init__()
         assert n_outlier < dim, "n_outlier must be less than dim"
@@ -63,10 +70,12 @@ class OutlierKVQuant(nn.Module):
         self.n_regular = dim - n_outlier
         self.outlier_bits = outlier_bits
         self.regular_bits = regular_bits
+        self._quantizer_cls = quantizer_cls
+        self._use_hadamard = use_hadamard
 
         # Quantizers - created lazily after calibration sets their dims
-        self._outlier_q: KVQuantIP | None = None
-        self._regular_q: KVQuantIP | None = None
+        self._outlier_q: KVQuantIP | KVQuantMSE | None = None
+        self._regular_q: KVQuantIP | KVQuantMSE | None = None
         self._seed = seed
 
         # perm:     original -> contiguous order  (outliers first, then regular)
@@ -110,20 +119,28 @@ class OutlierKVQuant(nn.Module):
         self.perm = perm
         self.inv_perm = inv_perm
 
-        # Build sub-quantizers with correct sub-dimensions
-        self._outlier_q = KVQuantIP(
-            dim=self.n_outlier,
-            num_bits=self.outlier_bits,
-            seed=self._seed,
-            qjl_seed=self._seed + 1,
-        ).to(x.device)
-
-        self._regular_q = KVQuantIP(
-            dim=self.n_regular,
-            num_bits=self.regular_bits,
-            seed=self._seed + 2,
-            qjl_seed=self._seed + 3,
-        ).to(x.device)
+        # Build sub-quantizers with correct sub-dimensions.
+        # KVQuantIP preserves inner products (optimal for K tensors).
+        # KVQuantMSE minimises reconstruction error (optimal for V tensors).
+        h = self._use_hadamard
+        if self._quantizer_cls is KVQuantMSE:
+            self._outlier_q = KVQuantMSE(
+                dim=self.n_outlier, num_bits=self.outlier_bits,
+                seed=self._seed, use_hadamard=h,
+            ).to(x.device)
+            self._regular_q = KVQuantMSE(
+                dim=self.n_regular, num_bits=self.regular_bits,
+                seed=self._seed + 2, use_hadamard=h,
+            ).to(x.device)
+        else:  # KVQuantIP (default)
+            self._outlier_q = KVQuantIP(
+                dim=self.n_outlier, num_bits=self.outlier_bits,
+                seed=self._seed, qjl_seed=self._seed + 1, use_hadamard=h,
+            ).to(x.device)
+            self._regular_q = KVQuantIP(
+                dim=self.n_regular, num_bits=self.regular_bits,
+                seed=self._seed + 2, qjl_seed=self._seed + 3, use_hadamard=h,
+            ).to(x.device)
 
         self._calibrated = True
 

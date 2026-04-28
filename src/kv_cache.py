@@ -27,12 +27,12 @@ import torch.nn as nn
 from torch import Tensor
 from typing import NamedTuple
 
-from .quantizer import KVQuantIP, QuantizedIP
+from .quantizer import KVQuantIP, KVQuantMSE, QuantizedIP, QuantizedMSE
 from .outlier import OutlierKVQuant, OutlierQuantized
 
 
-# Accept either quantized representation
-CompressedKV = QuantizedIP | OutlierQuantized
+# Accept any quantized representation (K uses IP, V uses MSE)
+CompressedKV = QuantizedIP | QuantizedMSE | OutlierQuantized
 
 
 class KVCacheQuantizer(nn.Module):
@@ -40,16 +40,22 @@ class KVCacheQuantizer(nn.Module):
     Compress and decompress transformer KV cache tensors with KVQuant.
 
     Args:
-        head_dim:    Dimension per attention head (d in the paper).
-        num_bits:    Average bits per coordinate.
-        use_outlier: If True, uses OutlierKVQuant with automatic
-                     outlier detection (recommended for LLM KV caches).
-        n_outlier:   Number of outlier channels (only if use_outlier=True).
+        head_dim:     Dimension per attention head (d in the paper).
+        num_bits:     Average bits per coordinate.
+        use_outlier:  If True, uses OutlierKVQuant with automatic
+                      outlier detection (recommended for LLM KV caches).
+        n_outlier:    Number of outlier channels (only if use_outlier=True).
         outlier_bits: Bit-width for outlier channels.
         regular_bits: Bit-width for regular channels.
-                     If use_outlier=False, both K and V are quantized at
-                     num_bits with KVQuantIP.
-        seed:        Base RNG seed.
+        use_hadamard: Use structured Hadamard rotation (O(d log d)) instead of
+                      dense QR (O(d^2)).  Requires head_dim to be a power of 2.
+                      Faster for large d on GPU; negligible difference for d<=64.
+        seed:         Base RNG seed.
+
+    K-V asymmetry
+    -------------
+    K uses KVQuantIP (inner-product optimal) - minimises attention score error.
+    V uses KVQuantMSE (MSE optimal)          - minimises output reconstruction error.
     """
 
     def __init__(
@@ -60,6 +66,7 @@ class KVCacheQuantizer(nn.Module):
         n_outlier: int = 32,
         outlier_bits: int | None = None,
         regular_bits: int | None = None,
+        use_hadamard: bool = False,
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -70,12 +77,26 @@ class KVCacheQuantizer(nn.Module):
         if use_outlier:
             ob = outlier_bits if outlier_bits is not None else min(num_bits + 1, 4)
             rb = regular_bits if regular_bits is not None else max(num_bits - 1, 1)
-            self.k_quant = OutlierKVQuant(head_dim, n_outlier, ob, rb, seed=seed)
-            self.v_quant = OutlierKVQuant(head_dim, n_outlier, ob, rb, seed=seed + 100)
+            # K: KVQuantIP  — inner-product optimal (attention scores use Q @ K^T)
+            self.k_quant = OutlierKVQuant(
+                head_dim, n_outlier, ob, rb, seed=seed,
+                quantizer_cls=KVQuantIP, use_hadamard=use_hadamard,
+            )
+            # V: KVQuantMSE — MSE optimal (output is weighted sum of V)
+            self.v_quant = OutlierKVQuant(
+                head_dim, n_outlier, ob, rb, seed=seed + 100,
+                quantizer_cls=KVQuantMSE, use_hadamard=use_hadamard,
+            )
         else:
-            self.k_quant = KVQuantIP(head_dim, num_bits, seed=seed, qjl_seed=seed + 1)
-            self.v_quant = KVQuantIP(
-                head_dim, num_bits, seed=seed + 2, qjl_seed=seed + 3
+            # K: KVQuantIP — preserves inner products for attention scores
+            self.k_quant = KVQuantIP(
+                head_dim, num_bits, seed=seed, qjl_seed=seed + 1,
+                use_hadamard=use_hadamard,
+            )
+            # V: KVQuantMSE — minimises reconstruction MSE for output values
+            self.v_quant = KVQuantMSE(
+                head_dim, num_bits, seed=seed + 2,
+                use_hadamard=use_hadamard,
             )
 
         self._calibrated = False
@@ -114,7 +135,8 @@ class KVCacheQuantizer(nn.Module):
             is_value: If True, uses the V quantizer; otherwise K quantizer.
 
         Returns:
-            Compressed representation (QuantizedIP or OutlierQuantized).
+            K: QuantizedIP or OutlierQuantized (KVQuantIP).
+            V: QuantizedMSE or OutlierQuantized (KVQuantMSE).
         """
         if self.use_outlier and not self._calibrated:
             raise RuntimeError("Call KVCacheQuantizer.calibrate(k, v) first.")

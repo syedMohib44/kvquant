@@ -41,6 +41,49 @@ def _sample_sphere_coord(dim: int, num_samples: int, seed: int = 42) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
+# k-means++ seeding  (Arthur & Vassilvitskii, 2007)
+# ---------------------------------------------------------------------------
+
+
+def _kmeans_plus_plus_init(samples: Tensor, k: int, seed: int = 0) -> Tensor:
+    """
+    k-means++ seeding for 1-D data (Arthur & Vassilvitskii, 2007).
+
+    Chooses k initial centroids from the sample set with probability
+    proportional to squared distance from the nearest already-chosen centroid.
+    Gives an O(log k) approximation guarantee and converges faster than
+    uniform linspace initialisation, especially at low bit-widths (k=2,4,8)
+    where linspace can place centroids in low-density tail regions.
+
+    Args:
+        samples: 1-D tensor of data points.
+        k:       Number of centroids.
+        seed:    RNG seed for reproducibility.
+
+    Returns:
+        Tensor of shape (k,) with sorted initial centroid positions.
+    """
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    n = len(samples)
+
+    # First centroid: choose uniformly at random from samples
+    idx = int(torch.randint(n, (1,), generator=gen).item())
+    centroids = samples[idx : idx + 1].clone()  # (1,)
+
+    for _ in range(k - 1):
+        # D^2 weighting: squared distance to nearest existing centroid
+        dists_sq = (
+            (samples.unsqueeze(1) - centroids.unsqueeze(0)).pow(2).min(dim=1).values
+        )  # (n,)
+        probs = dists_sq / dists_sq.sum().clamp(min=1e-12)
+        idx = int(torch.multinomial(probs, 1, generator=gen).item())
+        centroids = torch.cat([centroids, samples[idx : idx + 1]])
+
+    return centroids.sort().values
+
+
+# ---------------------------------------------------------------------------
 # Lloyd-Max solver against the true distribution
 # ---------------------------------------------------------------------------
 
@@ -55,15 +98,18 @@ def _lloyd_max(
     Solve the 1-D Lloyd-Max problem for the true unit-sphere marginal
     distribution at dimension `dim`.
 
+    Initialises with k-means++ seeding (Arthur & Vassilvitskii, 2007) instead
+    of uniform linspace.  This converges faster and avoids local optima where
+    linspace wastes centroids in low-density tail regions.
+
     Returns centroids of shape (2**num_bits,), sorted ascending, already
     scaled to the true distribution (no further rescaling needed).
     """
     k = 2**num_bits
     samples = _sample_sphere_coord(dim, num_samples).contiguous()
 
-    # Initialise centroids uniformly over the empirical support
-    c_max = float(samples.abs().quantile(0.999))
-    centroids = torch.linspace(-c_max, c_max, k)
+    # k-means++ seeding: concentrates initial centroids in high-density regions
+    centroids = _kmeans_plus_plus_init(samples, k)
 
     for _ in range(num_steps):
         # Assignment via binary search on sorted centroids - O(n log k)
