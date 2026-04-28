@@ -1,5 +1,5 @@
 """
-Entropy coding for KVQuant codebook indices (paper Section 5).
+Entropy coding for KVQuant codebook indices (paper Section 6).
 
 After Lloyd-Max quantization each coordinate is assigned an index in
 {0, ..., 2^b - 1}.  These indices are NOT uniformly distributed - the
@@ -7,7 +7,7 @@ probabilities follow the area under each Voronoi cell of the codebook.
 Huffman coding exploits this non-uniformity to reduce the average
 bit-width toward the Shannon entropy.
 
-At b=4 the entropy is ~3.8 bits/coordinate (paper Table 1), giving ~5%
+At b=4 the entropy is ~3.8 bits/coordinate (paper Table 1), giving ~4%
 compression on top of the raw 4-bit representation.
 
 Classes
@@ -107,7 +107,7 @@ class _Node:
 
 class HuffmanCodec:
     """
-    Huffman codec for KVQuant codebook indices.
+    Huffman codec for TurboQuant codebook indices.
 
     Build once per (num_bits, dim) pair; then use encode() / decode().
 

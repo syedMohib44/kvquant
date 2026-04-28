@@ -9,7 +9,7 @@ Storing R exactly would require as much memory as K itself.  But R is
 low-rank in practice - quantization error is structured, not random.
 We approximate R with a rank-r truncated SVD:
 
-    R ≈ U @ S @ V^T       U (belongs to) R^{T×r}, S (belongs to) R^r, V (belongs to) R^{d×r}
+    R ~= U @ S @ V^T       U (belongs to) R^{T×r}, S (belongs to) R^r, V (belongs to) R^{d×r}
 
 The corrected key matrix is:
 
@@ -22,7 +22,7 @@ This adds an O(T·r·d) correction at query time, which is negligible for
 small r (e.g. r=4 or r=8).
 
 Memory cost of correction:  T·r + r + d·r  vs  T·d  for full residual.
-Break-even rank:  r = T·d / (T + d + 1) ≈ d  for long sequences.
+Break-even rank:  r = T·d / (T + d + 1) ~= d  for long sequences.
 Effective for r << d, i.e. capturing the top few error directions.
 
 LowRankCorrection wraps any KVQuantMSE / KVQuantIP quantizer and

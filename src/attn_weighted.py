@@ -68,9 +68,7 @@ class AttentionWeightedQuantizer(nn.Module):
         self.lo_quantizer = KVQuantMSE(dim, lo_bits, seed=seed + 1)
 
     # ------------------------------------------------------------------
-    def quantize(
-        self, keys: Tensor, query: Tensor
-    ) -> "AttentionWeightedQuantized":
+    def quantize(self, keys: Tensor, query: Tensor) -> "AttentionWeightedQuantized":
         """
         Quantize keys guided by attention weights from query.
 
@@ -85,18 +83,18 @@ class AttentionWeightedQuantizer(nn.Module):
         T = shape[-2]
 
         # Flatten to (N, T, d) and query to (N, 1, d)
-        keys_flat  = keys.reshape(-1, T, self.dim)          # (N, T, d)
-        query_flat = query.reshape(-1, 1, self.dim)          # (N, 1, d)
+        keys_flat = keys.reshape(-1, T, self.dim)  # (N, T, d)
+        query_flat = query.reshape(-1, 1, self.dim)  # (N, 1, d)
         N = keys_flat.shape[0]
 
         # Attention weights: softmax(q @ K^T / sqrt(d))  -> (N, T)
         scores = (query_flat @ keys_flat.transpose(-2, -1)).squeeze(1)  # (N, T)
         scores = scores / math.sqrt(self.dim)
-        weights = F.softmax(scores, dim=-1)                 # (N, T)
+        weights = F.softmax(scores, dim=-1)  # (N, T)
 
         # Split tokens by attention weight - top fraction -> hi_bits
         k_hi = max(1, int(T * self.top_fraction))
-        _, top_idx = weights.topk(k_hi, dim=-1)             # (N, k_hi)
+        _, top_idx = weights.topk(k_hi, dim=-1)  # (N, k_hi)
         top_mask = torch.zeros(N, T, dtype=torch.bool, device=keys.device)
         top_mask.scatter_(1, top_idx, True)
 
@@ -108,7 +106,8 @@ class AttentionWeightedQuantizer(nn.Module):
         lo_q = self.lo_quantizer.quantize(lo_keys)
 
         return AttentionWeightedQuantized(
-            hi_q=hi_q, lo_q=lo_q,
+            hi_q=hi_q,
+            lo_q=lo_q,
             top_mask=top_mask,
             shape=shape,
             dim=self.dim,
@@ -118,7 +117,7 @@ class AttentionWeightedQuantizer(nn.Module):
         """Reconstruct keys from AttentionWeightedQuantized."""
         shape = q.shape
         T = shape[-2]
-        top_mask = q.top_mask          # (N, T)
+        top_mask = q.top_mask  # (N, T)
         N = top_mask.shape[0]
 
         hi_keys = self.hi_quantizer.dequantize(q.hi_q)  # (N, k_hi, d)
@@ -126,7 +125,7 @@ class AttentionWeightedQuantizer(nn.Module):
 
         # Reconstruct in original token order
         out = torch.empty(N, T, self.dim, device=hi_keys.device, dtype=hi_keys.dtype)
-        out[top_mask]  = hi_keys.reshape(-1, self.dim)
+        out[top_mask] = hi_keys.reshape(-1, self.dim)
         out[~top_mask] = lo_keys.reshape(-1, self.dim)
 
         return out.reshape(shape)
@@ -139,8 +138,10 @@ class AttentionWeightedQuantizer(nn.Module):
         return self.top_fraction * self.hi_bits + (1 - self.top_fraction) * self.lo_bits
 
     def extra_repr(self) -> str:
-        return (f"dim={self.dim}, hi_bits={self.hi_bits}, lo_bits={self.lo_bits}, "
-                f"top_fraction={self.top_fraction}, avg_bits={self.avg_bits:.2f}")
+        return (
+            f"dim={self.dim}, hi_bits={self.hi_bits}, lo_bits={self.lo_bits}, "
+            f"top_fraction={self.top_fraction}, avg_bits={self.avg_bits:.2f}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -149,17 +150,19 @@ class AttentionWeightedQuantizer(nn.Module):
 
 from typing import NamedTuple
 
+
 class AttentionWeightedQuantized(NamedTuple):
-    hi_q:     QuantizedMSE   # high-attention group
-    lo_q:     QuantizedMSE   # low-attention group
-    top_mask: Tensor          # (N, T) bool - which tokens are hi-attention
-    shape:    tuple           # original keys shape
-    dim:      int
+    hi_q: QuantizedMSE  # high-attention group
+    lo_q: QuantizedMSE  # low-attention group
+    top_mask: Tensor  # (N, T) bool - which tokens are hi-attention
+    shape: tuple  # original keys shape
+    dim: int
 
 
 # ---------------------------------------------------------------------------
 # Analysis helper
 # ---------------------------------------------------------------------------
+
 
 def weighted_distortion(q: Tensor, K: Tensor, K_hat: Tensor) -> Tensor:
     """
@@ -176,7 +179,7 @@ def weighted_distortion(q: Tensor, K: Tensor, K_hat: Tensor) -> Tensor:
         Scalar mean weighted distortion.
     """
     d = K.shape[-1]
-    scores  = (q.unsqueeze(-2) @ K.transpose(-2, -1)).squeeze(-2) / math.sqrt(d)
-    weights = F.softmax(scores, dim=-1)                         # (..., T)
-    per_tok = ((K - K_hat) ** 2).mean(-1)                       # (..., T)
+    scores = (q.unsqueeze(-2) @ K.transpose(-2, -1)).squeeze(-2) / math.sqrt(d)
+    weights = F.softmax(scores, dim=-1)  # (..., T)
+    per_tok = ((K - K_hat) ** 2).mean(-1)  # (..., T)
     return (weights * per_tok).sum(-1).mean()

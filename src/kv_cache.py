@@ -1,5 +1,5 @@
 """
-KV-cache quantizer built on top of KVQuant.
+KV-cache quantizer built on top of KVQuantIP / OutlierKVQuant.
 
 KVCacheQuantizer wraps either KVQuantIP or OutlierKVQuant and
 provides a simple .compress() / .decompress() interface that matches
@@ -11,8 +11,9 @@ Usage
     quant.calibrate(k_calib, v_calib)   # one-shot calibration
 
     # During generation:
-    k_c = quant.compress(k)             # store compressed
-    k_hat = quant.decompress(k_c)       # recover for attention
+    k_c = quant.compress(k, is_value=False)   # store compressed keys
+    v_c = quant.compress(v, is_value=True)    # store compressed values
+    k_hat = quant.decompress(k_c)             # recover for attention
 
 The compressed representation is stored as Python objects (NamedTuples)
 rather than packed bit-strings - suitable for research / profiling.  A

@@ -8,16 +8,16 @@ tokens that are rarely attended to.
 This module tracks a running importance score per token position and
 dynamically assigns bit-widths from a fixed budget:
 
-    high importance  -> hi_bits  (e.g. 4)
-    mid  importance  -> mid_bits (e.g. 3)
-    low  importance  -> lo_bits  (e.g. 2)
-    very low        -> evict     (drop from cache entirely)
+    high importance  -> hi_bits   (e.g. 4)
+    mid  importance  -> mid_bits  (e.g. 3)
+    low  importance  -> lo_bits   (e.g. 2)
+    very low         -> evict_bits (e.g. 1, minimum compression - not dropped)
 
 The importance score is updated every generation step using an exponential
 moving average of the attention weights received by each cached token.
 
 AdaptiveKVCache manages the full lifecycle:
-  1. push()   - add a new token at full precision temporarily
+  1. push()   - add a new token compressed at hi_bits initially
   2. attend() - provide the attention weights from this step -> update scores
                 and (re)compress tokens whose bit-width should change
   3. get()    - return the full reconstructed cache for the next attention op

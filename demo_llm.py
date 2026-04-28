@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kvquant import KVCacheQuantizer
-from kvquant.correction import _randomized_svd
+from src.correction import _randomized_svd
 
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL = "distilgpt2"
@@ -566,7 +566,7 @@ def main():
 
         # Product Quantization run (optional, --product-quant flag)
         if args.product_quant:
-            from .product_quantizer import ProductKVCache
+            from .src.product_quantizer import ProductKVCache
 
             # PQ config: M=16 subspaces x b=8 bits  →  128 bits/vector = 2 bits/dim.
             # M (subspaces), b (bits each)

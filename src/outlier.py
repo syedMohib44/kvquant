@@ -1,5 +1,5 @@
 """
-Outlier-channel-aware KVQuant (Section 5 of the paper).
+Outlier-channel-aware KV quantization using KVQuantIP (Section 5 of the paper).
 
 Certain channels in attention K/V tensors have disproportionately large
 magnitudes ("outlier channels").  Quantizing them at the same bit-width as
@@ -35,7 +35,7 @@ class OutlierQuantized(NamedTuple):
 
 class OutlierKVQuant(nn.Module):
     """
-    KVQuant with per-channel outlier handling.
+    TurboQuant with per-channel outlier handling.
 
     Calibrate once with a representative batch, then quantize/dequantize.
 

@@ -2,14 +2,16 @@
 Lloyd-Max codebook for KVQuant.
 
 After random rotation, each coordinate of a unit-sphere vector follows:
-    f(t) = [Γ(d/2) / (sqrt(pi) Γ((d-1)/2))] * (1 - t^2)^((d-3)/2)   for t (belongs to) [-1, 1]
+    f(t) = [Gamma(d/2) / (sqrt(pi) Gamma((d-1)/2))] * (1 - t^2)^((d-3)/2)   for t (belongs to) [-1, 1]
 
 This is the true marginal - not Gaussian - and Lloyd-Max centroids should be
 fitted to this distribution for each dimension d.  For large d the distribution
 concentrates near N(0, 1/d), but fitting directly to the true distribution gives
 tighter quantization error, especially at low bit-widths and small d.
 
-Centroids are cached by (num_bits, dim) and computed lazily on first use.
+build_codebook() returns (centroids, boundaries) where boundaries are the
+pre-computed midpoints between consecutive centroids, ready for torch.bucketize.
+Both are cached by (num_bits, dim) and computed lazily on first use.
 """
 
 import math

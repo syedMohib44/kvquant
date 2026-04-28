@@ -1,5 +1,5 @@
 """
-Random orthogonal rotation for KVQuant.
+Random orthogonal rotation for TurboQuant.
 
 Two implementations are provided:
 

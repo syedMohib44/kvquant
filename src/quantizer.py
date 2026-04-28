@@ -1,5 +1,5 @@
 """
-KVQuant quantizers (paper: arxiv 2504.19874).
+TurboQuant quantizers (paper: arxiv 2504.19874).
 
 Two classes are provided:
 
@@ -14,7 +14,7 @@ Two classes are provided:
 
 Normalisation note
 ------------------
-KVQuant is designed for vectors on the unit sphere S^{d-1}.  After a
+TurboQuant is designed for vectors on the unit sphere S^{d-1}.  After a
 random rotation each coordinate has distribution ~ N(0, 1/d).  The
 Lloyd-Max codebook is therefore built for N(0, 1) and the centroids are
 rescaled by 1/sqrtd at quantize time.
