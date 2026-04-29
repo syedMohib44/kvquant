@@ -56,7 +56,7 @@ def codebook_probs(num_bits: int, dim: int) -> Tensor:
     Returns:
         probs: Tensor of shape (2**num_bits,) summing to 1.
     """
-    centroids = build_codebook(num_bits, dim)  # (k,) scaled by 1/sqrt(d)
+    centroids, _ = build_codebook(num_bits, dim)  # (k,) scaled by 1/sqrt(d)
     k = len(centroids)
     std = 1.0 / math.sqrt(dim)
 

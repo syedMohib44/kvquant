@@ -8,11 +8,11 @@ import math
 import pytest
 import torch
 
-from kvquant.codebook import build_codebook, PRECOMPUTED_CENTROIDS, _lloyd_max
-from kvquant.rotation import RandomRotation
-from kvquant.quantizer import KVQuantMSE, KVQuantIP, QuantizedMSE, QuantizedIP
-from kvquant.outlier import OutlierKVQuant
-from kvquant.kv_cache import KVCacheQuantizer
+from src.codebook import build_codebook, PRECOMPUTED_CENTROIDS, _lloyd_max
+from src.rotation import RandomRotation
+from src.quantizer import KVQuantMSE, KVQuantIP, QuantizedMSE, QuantizedIP
+from src.outlier import OutlierKVQuant
+from src.kv_cache import KVCacheQuantizer
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +214,7 @@ class TestKVQuantIP:
         y = y / y.norm(dim=-1, keepdim=True)
         q = KVQuantIP(D, num_bits=b, seed=b * 10, qjl_seed=b * 10 + 1)
         x_tilde = q(unit_vectors)
-        bias = ((unit_vectors * y).sum(-1)(x_tilde * y).sum(-1)).mean().abs().item()
+        bias = ((unit_vectors * y).sum(-1) - (x_tilde * y).sum(-1)).mean().abs().item()
         assert bias < 0.02, f"b={b}: IP bias {bias:.5f} too large"
 
     @pytest.mark.parametrize("b", [1, 2, 3, 4])
@@ -225,7 +225,7 @@ class TestKVQuantIP:
         y = y / y.norm(dim=-1, keepdim=True)
         q = KVQuantIP(D, num_bits=b, seed=b * 20, qjl_seed=b * 20 + 1)
         x_tilde = q(unit_vectors)
-        err = (unit_vectors * y).sum(-1)(x_tilde * y).sum(-1)
+        err = (unit_vectors * y).sum(-1) - (x_tilde * y).sum(-1)
         var = err.var().item()
         upper_var = math.sqrt(3) * math.pi**2 / D / 4**b * 1.2  # 20% tolerance
         assert (
@@ -407,7 +407,7 @@ class TestKVCacheQuantizer:
 # DeltaKVCache Fix 1, 2, 3
 # ---------------------------------------------------------------------------
 
-from kvquant.delta import DeltaKVCache  # noqa: E402
+from src.delta import DeltaKVCache  # noqa: E402
 
 
 class TestDeltaKVCache:

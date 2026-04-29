@@ -198,7 +198,8 @@ def plot_codebook():
 
     for i, b in enumerate([1, 2, 3, 4]):
         ax = axes[i]
-        centroids = build_codebook(b, d).numpy()
+        centroids, _ = build_codebook(b, d)
+        centroids = centroids.numpy()
 
         ax.hist(
             x_sphere,
@@ -906,7 +907,7 @@ def plot_pipeline(kvs, attns, head_dim, n_heads):
 
 
 # ---------------------------------------------------------------------------
-# 10. Distortion Ratio Check  (2.7× claim)
+# 10. Distortion Ratio Check  (2.7x claim)
 # ---------------------------------------------------------------------------
 def plot_ratio_check():
     print("Plotting distortion ratio check...")
@@ -952,7 +953,7 @@ def plot_ratio_check():
         color=COLORS["red"],
         linestyle="--",
         linewidth=2,
-        label=f"Paper upper bound (sqrt3·pi/2 ≈ {bound:.2f})",
+        label=f"Paper upper bound (sqrt3*pi/2 ~= {bound:.2f})",
     )
     ax.axhline(
         1.0,
@@ -981,7 +982,7 @@ def plot_ratio_check():
     ax.set_xticklabels([f"{b}-bit" for b in bits_list])
     ax.set_ylabel("Distortion ratio   actual_MSE / (1/4^b)   [log scale]")
     ax.set_title(
-        "2.7× Bound Verification: Distortion Ratio vs Bit-Width\n(d=128 unit sphere - ratio must stay ≤ sqrt3·pi/2 ≈ 2.72)"
+        "2.7x Bound Verification: Distortion Ratio vs Bit-Width\n(d=128 unit sphere - ratio must stay <= sqrt3*pi/2 ~= 2.72)"
     )
     ax.legend()
     ax.grid(axis="y", which="both")
@@ -1121,18 +1122,18 @@ def plot_perplexity_validation():
     rel = [p / baseline_ppl for p in ppls]
     axes[1].bar(x_pos, rel, color=bar_colors, alpha=0.85)
     axes[1].axhline(
-        1.0, color="black", linestyle="--", linewidth=2, label="Baseline (1.00×)"
+        1.0, color="black", linestyle="--", linewidth=2, label="Baseline (1.00x)"
     )
     axes[1].axhline(
         1.05, color=COLORS["gray"], linestyle=":", linewidth=1.5, label="5% degradation"
     )
     for i, v in enumerate(rel):
-        axes[1].text(i, v + 0.005, f"{v:.2f}×", ha="center", va="bottom", fontsize=9)
+        axes[1].text(i, v + 0.005, f"{v:.2f}x", ha="center", va="bottom", fontsize=9)
     axes[1].set_xticks(x_pos)
     axes[1].set_xticklabels(labels)
     axes[1].set_ylabel("PPL ratio  (quantized / baseline)")
     axes[1].set_title(
-        "Relative PPL Degradation\n(paper: 3.5-bit ≈ neutral, 2.5-bit ≈ marginal)"
+        "Relative PPL Degradation\n(paper: 3.5-bit ~= neutral, 2.5-bit ~= marginal)"
     )
     axes[1].legend()
     axes[1].grid(axis="y")

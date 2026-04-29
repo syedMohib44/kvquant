@@ -8,7 +8,7 @@ TurboQuant (Zandieh et al., 2025) is a compelling approach to KV cache compressi
 
 We introduce five extensions attention-weighted quantization, delta compression, adaptive bit allocation, low-rank error correction, and product quantization each targeting a different structural property of transformer attention that the original method leaves on the table. Along the way, we also corrected several issues in the original implementation: the codebook was fitted to a Gaussian approximation rather than the actual sphere marginal distribution; the QR decomposition could silently produce a reflection instead of a rotation; the nearest-centroid search was doing $O(N \cdot d \cdot k)$ work when a binary search suffices; and the inner-product quantizer was applying a redundant second normalisation pass on vectors already on the unit sphere.
 
-On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47–70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1–2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim the same storage as 2-bit scalar, which collapses matching 3-bit scalar quality. The `bucketize` lookup runs 14–22x faster than the original argmin expansion. Four additional improvements are described: k-means++ codebook initialisation (75% lower init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5% at 0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4% vs same-budget plain), and Hadamard rotation exposed as a configurable parameter ($O(d \log d)$ vs $O(d^2)$).
+On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47-70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1-2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim -- the same storage as 2-bit scalar, which collapses -- matching 3-bit scalar quality. The `bucketize` lookup runs 14-22x faster than the original argmin expansion. Four additional improvements are described: k-means++ codebook initialisation (75% lower init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5% at 0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4% vs same-budget plain), and Hadamard rotation exposed as a configurable parameter ($O(d \log d)$ vs $O(d^2)$).
 
 ---
 
@@ -52,7 +52,7 @@ $$f(t) \;=\; C_d \cdot (1 - t^2)^{(d-3)/2}, \qquad t \in [-1,\, 1]$$
 
 This is a Beta-type distribution that only converges to a Gaussian for large $d$. At small $d$ and low bit-widths the difference is meaningful. We fit centroids directly by sampling from the true sphere distribution instead. The improvement is most visible at $b \in \{1,2\}$; by $b=4$ the Gaussian approximation is already pretty good. Centroids are cached by (num\_bits, dim) after first computation.
 
-**k-means++ initialisation.** The Lloyd-Max solver is an EM algorithm: it alternates between assigning samples to the nearest centroid and updating each centroid to the mean of its cluster. Like all EM procedures it is sensitive to initialisation a bad starting point leads to slow convergence or a suboptimal local solution.
+**k-means++ initialisation.** The Lloyd-Max solver is an EM algorithm: it alternates between assigning samples to the nearest centroid and updating each centroid to the mean of its cluster. Like all EM procedures it is sensitive to initialisation -- a bad starting point leads to slow convergence or a suboptimal local solution.
 
 The original implementation seeds centroids with `torch.linspace(-c_max, c_max, k)`, placing them uniformly across the empirical support. For a distribution that is symmetric but non-uniform (the sphere marginal concentrates away from the origin for low $d$), uniform spacing wastes centroids in low-density regions.
 
@@ -74,6 +74,8 @@ This $D^2$-weighted scheme gives an $O(\log k)$ approximation guarantee over uni
 
 The gains are largest at low bit-widths where $k$ is small and each centroid placement matters most. At $b=4$, $k=16$ centroids are dense enough that linspace converges regardless. After full Lloyd-Max convergence (2000 iterations) both schemes reach near-identical solutions; the practical benefit is fewer iterations to converge and avoidance of rare degenerate local optima at $b \in \{1, 2\}$.
 
+![Figure 7: Left -- raw init MSE (log scale) for linspace vs k-means++ at each bit-width. Right -- percentage MSE reduction from k-means++ seeding.](figures/fig7_kmeans_init.png)
+
 #### 2.2.2 SO(d) Rotation
 
 The QR decomposition gives an orthogonal matrix, but orthogonal includes both rotations ($\det = +1$) and reflections ($\det = -1$). About half the time you'll get a reflection. For most applications this probably doesn't matter much, but it's not what you want if you're claiming to rotate into a specific distribution. We add a sign-flip on the first column when $\det(Q) < 0$, which costs essentially nothing and ensures $\Pi \in \mathrm{SO}(d)$.
@@ -84,7 +86,7 @@ The original approach expands $\mathbf{y}$ into a $(N, d, k)$ tensor and takes t
 
 ```python
 # before
-diff = (y.unsqueeze(-1) centroids.view(1,1,-1)).abs()
+diff = (y.unsqueeze(-1) - centroids.view(1,1,-1)).abs()
 indices = diff.argmin(dim=-1)          # O(N*d*k), large temp tensor
 
 # after
@@ -100,7 +102,7 @@ The butterfly step in the Fast Walsh-Hadamard Transform was allocating two clone
 
 ```python
 a = x[..., :h] + x[..., h:]  # one allocation
-x[..., h:] = x[..., :h] x[..., h:]
+x[..., h:] = x[..., :h] - x[..., h:]
 x[..., :h] = a
 ```
 
@@ -155,9 +157,25 @@ import math
 N = math.prod(q.shape[:-1])
 ```
 
-The difference is negligible for large tensors (the loop runs in $O(\text{ndim})$ iterations, typically 2–3). The change is a clarity improvement as much as a performance one `math.prod` makes the intent immediately obvious.
+The difference is negligible for large tensors (the loop runs in $O(\text{ndim})$ iterations, typically 2-3). The change is a clarity improvement as much as a performance one `math.prod` makes the intent immediately obvious.
 
 #### 2.2.8 Codebook Clone Removal
+
+**Problem.** `build_codebook()` returned `centroids.clone()` and `boundaries.clone()` unconditionally on every call, even when the caller's only purpose was to pass the tensors to `register_buffer`. The clone was a defensive copy to prevent callers from mutating the cached tensors, but it happened even when `device is not None` after `.to()` had already returned a fresh tensor.
+
+**Fix.** Clone only on the CPU path (where the cache must be protected from device moves):
+
+```python
+centroids, boundaries = _CACHE[key]
+if device is not None:
+    # .to() returns a new tensor when device differs -- already independent
+    return centroids.to(device), boundaries.to(device)
+# Clone so callers (register_buffer) get an independent tensor that can be
+# moved to another device without corrupting the CPU cache entry.
+return centroids.clone(), boundaries.clone()
+```
+
+This halves the number of allocations on the GPU path and eliminates one unnecessary CPU copy on the CPU path when device tensors are requested.
 
 #### 2.2.9 K-V Asymmetric Quantization
 
@@ -167,8 +185,8 @@ $$\text{score}_t = \mathbf{q}^\top \hat{\mathbf{k}}_t \qquad \text{output}_t = \
 
 The K cache enters only via inner products with the query. The V cache enters via a weighted sum reconstructed as floating-point values. These roles have different optimal quantization objectives:
 
-- **K** → KVQuantIP: minimises inner-product error $\mathbb{E}[(\langle \mathbf{q}, \mathbf{k} \rangle - \langle \mathbf{q}, \hat{\mathbf{k}} \rangle)^2]$. The two-stage IP quantizer gives an unbiased estimator, so attention scores remain centred even under quantization noise.
-- **V** → KVQuantMSE: minimises reconstruction error $\mathbb{E}[\|\mathbf{v} - \hat{\mathbf{v}}\|^2]$. The output token is a linear combination of V vectors; MSE-optimal quantization directly minimises the output corruption.
+- **K** -> KVQuantIP: minimises inner-product error $\mathbb{E}[(\langle \mathbf{q}, \mathbf{k} \rangle - \langle \mathbf{q}, \hat{\mathbf{k}} \rangle)^2]$. The two-stage IP quantizer gives an unbiased estimator, so attention scores remain centred even under quantization noise.
+- **V** -> KVQuantMSE: minimises reconstruction error $\mathbb{E}[\|\mathbf{v} - \hat{\mathbf{v}}\|^2]$. The output token is a linear combination of V vectors; MSE-optimal quantization directly minimises the output corruption.
 
 **Implementation.** `KVCacheQuantizer` previously used KVQuantIP for both K and V. We separate the backends:
 
@@ -189,23 +207,9 @@ The same asymmetry propagates through `OutlierKVQuant` via a new `quantizer_cls`
 | IP/MSE (asymmetric) at 2.5 bpw | 2.5 | 2.1816 | **0.002086** |
 | IP/IP at 2.0 bpw | 2.0 | 3.1417 | 0.045147 |
 
-At 2.5 bits/dim the asymmetric config reduces V MSE by **61.5%** versus the 3-bit IP/IP baseline using 0.5 fewer bits and by **95.4%** versus the same-budget 2-bit IP/IP baseline. The K IP-error increase reflects the lower per-dimension bit budget; for inner products the IP quantizer remains unbiased regardless.
+At 2.5 bits/dim the asymmetric config reduces V MSE by **61.5%** versus the 3-bit IP/IP baseline -- using 0.5 fewer bits -- and by **95.4%** versus the same-budget 2-bit IP/IP baseline. The K IP-error increase reflects the lower per-dimension bit budget; for inner products the IP quantizer remains unbiased regardless.
 
-**Problem.** `build_codebook()` returned `centroids.clone()` and `boundaries.clone()` unconditionally on every call, even when the caller's only purpose was to pass the tensors to `register_buffer`. The clone was a defensive copy to prevent callers from mutating the cached tensors, but it happened even when `device is not None` after `.to()` had already returned a fresh tensor.
-
-**Fix.** Clone only on the CPU path (where the cache must be protected from device moves):
-
-```python
-centroids, boundaries = _CACHE[key]
-if device is not None:
-    # .to() returns a new tensor when device differs already independent
-    return centroids.to(device), boundaries.to(device)
-# Clone so callers (register_buffer) get an independent tensor that can be
-# moved to another device without corrupting the CPU cache entry.
-return centroids.clone(), boundaries.clone()
-```
-
-This halves the number of allocations on the GPU path and eliminates one unnecessary CPU copy on the CPU path when device tensors are requested.
+![Figure 8: K IP-error (left) and V MSE (right) for symmetric IP/IP vs asymmetric IP/MSE quantization at matched and reduced bit budgets.](figures/fig8_kv_asymmetric.png)
 
 ---
 
@@ -256,7 +260,7 @@ One thing to watch: errors accumulate over long sequences. For most use cases th
 | Fix | Before | After | Trade-off |
 |---|---|---|---|
 | Anchor lookup | `list` O(T) scan per token | `set` O(1) per token | None |
-| `get()` reconstruction | O(T) per call → O(T²) total | O(1) via incremental list in `push()` | Stores T float32 reconstructions permanently alongside compressed deltas |
+| `get()` reconstruction | O(T) per call -> O(T^2) total | O(1) via incremental list in `push()` | Stores T float32 reconstructions permanently alongside compressed deltas |
 | Anchor placement | Fixed interval only | Also adaptive via $\|\delta\|/\|\mathbf{k}\| > \tau$ | Minor algorithm change; $\tau=0$ disables it |
 
 Results on distilgpt2 (3-bit):
@@ -270,11 +274,11 @@ Results on distilgpt2 (3-bit):
 | 4 | 0.25125 | 0.20710 | 1.2x |
 | 5 | 0.17647 | 0.16796 | 1.1x |
 
-Earlier layers benefit more, which makes sense they tend to have smoother, more predictable KV trajectories than the later layers.
+Earlier layers benefit more, which makes sense -- they tend to have smoother, more predictable KV trajectories than the later layers.
 
-**Delta + outlier combination.** Delta compression and outlier-aware quantization are complementary and can be stacked. Outlier channels those with disproportionately high variance also tend to be the channels with the largest delta magnitudes. Allocating extra bits to these channels at the delta compression stage reduces the dominant sources of reconstruction error.
+**Delta + outlier combination.** Delta compression and outlier-aware quantization are complementary and can be stacked. Outlier channels -- those with disproportionately high variance -- also tend to be the channels with the largest delta magnitudes. Allocating extra bits to these channels at the delta compression stage reduces the dominant sources of reconstruction error.
 
-`DeltaKVCache` accepts `use_outlier=True`, which replaces the internal KVQuantIP/KVQuantMSE pair with `OutlierKVQuant` instances calibrated on the delta distribution. The asymmetric rule from §2.2.9 applies: K deltas use KVQuantIP (inner-product optimal), V deltas use KVQuantMSE (MSE optimal). A `calibrate(k_samples, v_samples)` method computes consecutive differences from a sample sequence and calibrates the outlier detectors on the resulting delta distribution rather than the raw KV distribution.
+`DeltaKVCache` accepts `use_outlier=True`, which replaces the internal KVQuantIP/KVQuantMSE pair with `OutlierKVQuant` instances calibrated on the delta distribution. The asymmetric rule from Section 2.2.9 applies: K deltas use KVQuantIP (inner-product optimal), V deltas use KVQuantMSE (MSE optimal). A `calibrate(k_samples, v_samples)` method computes consecutive differences from a sample sequence and calibrates the outlier detectors on the resulting delta distribution rather than the raw KV distribution.
 
 **Empirical result** ($d=64$, $T=50$, 3-bit budget, slow drift $\|\boldsymbol{\delta}_t\| \approx 0.15 \|\mathbf{k}_t\|$):
 
@@ -285,6 +289,8 @@ Earlier layers benefit more, which makes sense they tend to have smoother, more 
 | **2.5-bit delta+outlier (IP/MSE)** | **2.5** | **2.1816** | **0.002086** |
 
 At 2.5 bits/dim the delta+outlier config achieves V MSE **95.4% lower** than same-budget 2-bit plain, and **61.5% lower** than 3-bit plain at half a bit less. K IP-error is comparable to 2-bit plain, consistent with the inner-product quantizer's unbiasedness guarantee.
+
+![Figure 9: K IP-error (left) and V MSE (right) for plain vs delta+outlier quantization. The green bar at 2.5 bpw beats both the 3-bit and same-budget 2-bit baselines on V MSE.](figures/fig9_delta_outlier.png)
 
 ### 3.3 Adaptive Bit Allocation
 
@@ -377,27 +383,27 @@ PQ at 2 bits/dim produces coherent, correct output at the same storage as 2-bit 
           Input KV stream
                  |
                  v
-     Delta compression          ← 1.1–2.2× lower MSE (temporal correlation)
+     Delta compression          <- 1.1-2.2x lower MSE (temporal correlation)
                  |
                  v
-   Attention-weighted            ← 47–70% lower weighted distortion
+   Attention-weighted            <- 47-70% lower weighted distortion
      bit assignment
                  |
-          ┌──────┴──────┐
-          │             │
+          +------+------+
+          |             |
           v             v
-      KVQuantIP      ProductKV       ← alternative backends (choose one)
-  (scalar Lloyd-Max)  (PQ M×b)
+      KVQuantIP      ProductKV       <- alternative backends (choose one)
+  (scalar Lloyd-Max)  (PQ MxB)
   + Low-rank corr.   No correction
   + Huffman coding   needed
-          │             │
-          └──────┬──────┘
+          |             |
+          +------+------+
                  |
                  v
-   Adaptive reallocation         ← dynamic bit-width tracking over generation
+   Adaptive reallocation         <- dynamic bit-width tracking over generation
 ```
 
-The two quantization backends are mutually exclusive per layer. KVQuantIP + low-rank correction is the default path. ProductKVCache (§3.5) is an alternative that trades encode speed for better quality-per-bit at aggressive compression targets ($\leq 2$ bits/dim). Each stage otherwise addresses a different source of inefficiency, so gains from delta, AWQ, and adaptive reallocation stack with either backend.
+The two quantization backends are mutually exclusive per layer. KVQuantIP + low-rank correction is the default path. ProductKVCache (Section 3.5) is an alternative that trades encode speed for better quality-per-bit at aggressive compression targets ($\leq 2$ bits/dim). Each stage otherwise addresses a different source of inefficiency, so gains from delta, AWQ, and adaptive reallocation stack with either backend.
 
 ---
 
@@ -417,30 +423,30 @@ We evaluate perplexity (PPL) under KV cache quantization using the generation sc
 
 ### 5.2 Perplexity vs. Bit-width
 
-**Table 1.** PPL degradation (ΔPPL = PPL_quant − PPL_fp32) at each bit-width. Lower is better.
+**Table 1.** PPL degradation (dPPL = PPL_quant - PPL_fp32) at each bit-width. Lower is better.
 
-| Model | FP32 PPL | 2-bit ΔPPL | 3-bit ΔPPL | 4-bit ΔPPL |
+| Model | FP32 PPL | 2-bit dPPL | 3-bit dPPL | 4-bit dPPL |
 |---|---:|---:|---:|---:|
 | distilgpt2 | 33.51 | +276.64 | +21.44 | +1.71 |
 | gpt2-medium | 13.38 | +173.61 | +6.02 | +1.10 |
 | TinyLlama-1.1B-Chat | 4.78 | +274.06 | +0.87 | +0.25 |
 
-4-bit quantization adds less than 1.75 PPL on all three models. 3-bit is model-dependent: TinyLlama's LlamaAttention architecture tolerates it with only +0.87 ΔPPL, while distilgpt2 shows +21.44. 2-bit is severe on all models without correction.
+4-bit quantization adds less than 1.75 PPL on all three models. 3-bit is model-dependent: TinyLlama's LlamaAttention architecture tolerates it with only +0.87 dPPL, while distilgpt2 shows +21.44. 2-bit is severe on all models without correction.
 
 ---
 
 ### 5.3 Effect of Low-Rank Correction (rank = 4)
 
-**Table 2.** ΔPPL without and with rank-4 low-rank correction applied to the quantized cache.
+**Table 2.** dPPL without and with rank-4 low-rank correction applied to the quantized cache.
 
 | Model | 2-bit | 2-bit+rank-4 | 3-bit | 3-bit+rank-4 | 4-bit | 4-bit+rank-4 |
 |---|---:|---:|---:|---:|---:|---:|
 | distilgpt2 | +276.64 | **+10.89** | +21.44 | **+4.27** | +1.71 | **+0.67** |
 | gpt2-medium | +173.61 | **+5.95** | +6.02 | **+1.55** | +1.10 | **+0.47** |
 
-Rank-4 correction recovers approximately **96% of the 2-bit PPL degradation** on distilgpt2 (276.64 → 10.89) and **97%** on gpt2-medium (173.61 → 5.95). At 3-bit the corrected cache is within 1.6–4.3 PPL of FP32. At 4-bit the gains are smaller (0.5–0.7 PPL) because the 4-bit quantization residual is already small ($D_{\text{mse}} \leq 0.011$); a rank-4 SVD at this noise floor risks fitting numerical artefacts rather than true signal. In practice we apply correction only for bits $< 4$ and skip it at 4-bit to avoid this. (TinyLlama-1.1B-Chat is omitted from Table 2: its 3-bit and 4-bit degradation is already so small that rank-4 correction is below measurement noise at 50 chunks.)
+Rank-4 correction recovers approximately **96% of the 2-bit PPL degradation** on distilgpt2 (276.64 -> 10.89) and **97%** on gpt2-medium (173.61 -> 5.95). At 3-bit the corrected cache is within 1.6-4.3 PPL of FP32. At 4-bit the gains are smaller (0.5-0.7 PPL) because the 4-bit quantization residual is already small ($D_{\text{mse}} \leq 0.011$); a rank-4 SVD at this noise floor risks fitting numerical artefacts rather than true signal. In practice we apply correction only for bits $< 4$ and skip it at 4-bit to avoid this. (TinyLlama-1.1B-Chat is omitted from Table 2: its 3-bit and 4-bit degradation is already so small that rank-4 correction is below measurement noise at 50 chunks.)
 
-**Notable result.** For gpt2-medium, 2-bit + rank-4 (ΔPPL = +5.95) is within 0.07 PPL of plain 3-bit without correction (+6.02). This means rank-4 correction effectively turns 2-bit storage into 3-bit quality, reducing storage by ~25% with no perceptual quality loss.
+**Notable result.** For gpt2-medium, 2-bit + rank-4 (dPPL = +5.95) is within 0.07 PPL of plain 3-bit without correction (+6.02). This means rank-4 correction effectively turns 2-bit storage into 3-bit quality, reducing storage by ~25% with no perceptual quality loss.
 
 ![Figure 5: PPL degradation by bit-width (left) and effect of rank-4 correction (right)](figures/fig5_ppl.png)
 
@@ -486,7 +492,7 @@ None of these require modifying the model or changing the training procedure. Th
 
 ## 9. Implementation Notes
 
-These are runtime optimizations applied after the paper's algorithms were finalized. They do not change any results the quality numbers in Sections 3–3.4 are unchanged but they reduce wall-clock time substantially.
+These are runtime optimizations applied after the paper's algorithms were finalized. They do not change any results the quality numbers in Sections 3-3.4 are unchanged but they reduce wall-clock time substantially.
 
 #### 9.1 Batched `get()` in `AdaptiveKVCache`
 
@@ -629,7 +635,7 @@ The saving is negligible in practice (the $k-1$ additions are trivial), but it r
 
 Root cause: `first_logits = prefill_out.logits[:, -1, :]` is the last prefill position's output computed with the full float32 KV cache. After quantizing the cache to `past`, this `first_logits` variable was reused unchanged for all bit-width branches.
 
-**Fix.** Crop the quantized cache to $T_p 1$ positions, then re-run the last prompt token through the model with that cropped cache to obtain a logit that reflects the quantized state:
+**Fix.** Crop the quantized cache to $T_p - 1$ positions, then re-run the last prompt token through the model with that cropped cache to obtain a logit that reflects the quantized state:
 
 ```python
 def _crop_cache(native_cache, seq_len: int):
@@ -645,7 +651,7 @@ def _crop_cache(native_cache, seq_len: int):
 
 # --- inside the generation loop ---
 past = _quantize_cache(native_cache_orig, kvc, correction_rank=args.correction_rank)
-past_crop = _crop_cache(past, T_p 1)          # crop to T_p-1 positions
+past_crop = _crop_cache(past, T_p - 1)          # crop to T_p-1 positions
 with torch.no_grad():
     q1_out = model(input_ids[:, -1:], past_key_values=past_crop, use_cache=False)
 first_logits_m = q1_out.logits[:, -1, :].clone()  # quantized first-token logit
@@ -667,13 +673,13 @@ The crop-and-rerun costs one extra forward pass (through all layers, but with a 
 
 The first generated token is now `Paris` at all quantized bit-widths, matching the float32 reference. This confirms that the bug was entirely in the first-token logit selection, not in the quantized cache itself.
 
-![Figure 6: Before and after the first-token fix  crop cache to T_p−1 and re-run last prompt token](figures/fig6_firsttoken.png)
+![Figure 6: Before and after the first-token fix  crop cache to T_p-1 and re-run last prompt token](figures/fig6_firsttoken.png)
 
 #### 9.6 Three Optimisations in `DeltaKVCache`
 
 Three performance and correctness issues were identified and fixed in the delta compression implementation after initial deployment.
 
-**Fix 1 O(T²) reconstruction cost.** The original `get()` method rebuilt the full cache from scratch on every call by looping over all $T$ tokens and dequantizing each stored delta. Since `get()` is called at every attention step during generation, the total reconstruction cost was $O(T^2)$. The fix maintains two lists `_k_reconstructed` and `_v_reconstructed` incrementally inside `push()`: after each token is compressed, the current running reconstruction is appended. `get()` then calls `torch.stack()` and returns immediately $O(1)$ reconstruction computation. Trade-off: the reconstructed float32 vectors are stored permanently alongside the compressed deltas, increasing persistent memory by $T \cdot d \cdot 4$ bytes.
+**Fix 1 O(T^2) reconstruction cost.** The original `get()` method rebuilt the full cache from scratch on every call by looping over all $T$ tokens and dequantizing each stored delta. Since `get()` is called at every attention step during generation, the total reconstruction cost was $O(T^2)$. The fix maintains two lists `_k_reconstructed` and `_v_reconstructed` incrementally inside `push()`: after each token is compressed, the current running reconstruction is appended. `get()` then calls `torch.stack()` and returns immediately $O(1)$ reconstruction computation. Trade-off: the reconstructed float32 vectors are stored permanently alongside the compressed deltas, increasing persistent memory by $T \cdot d \cdot 4$ bytes.
 
 **Fix 2 O(T) anchor lookup.** `_anchors` was a `list[int]`; Python's `in` operator on a list is $O(n)$. With $T$ membership checks per `get()` call this was $O(T^2)$ just for anchor lookups. Changing `_anchors` to a `set[int]` (hash set, $O(1)$ lookup) and `.append()` to `.add()` eliminates this with no other trade-off.
 
@@ -707,5 +713,5 @@ All three fixes are covered by 10 new tests in `TestDeltaKVCache`; the full suit
 10. Liu, Z. et al. "ScissorHands: Exploiting the Persistence of Importance Hypothesis for LLM KV Cache Compression at Test Time." NeurIPS (2023).
 11. Halko, N., Martinsson, P.-G. & Tropp, J. "Finding Structure with Randomness: Probabilistic Algorithms for Constructing Approximate Matrix Decompositions." SIAM Review (2011).
 12. Max, J. "Quantizing for minimum distortion." IRE Transactions on Information Theory (1960).
-13. Jégou, H., Douze, M. & Schmid, C. "Product Quantization for Nearest Neighbor Search." IEEE Transactions on Pattern Analysis and Machine Intelligence 33(1):117–128 (2011).
-14. Arthur, D. & Vassilvitskii, S. "k-means++: The Advantages of Careful Seeding." Proceedings of the 18th Annual ACM-SIAM Symposium on Discrete Algorithms (SODA), 1027–1035 (2007).
+13. Jégou, H., Douze, M. & Schmid, C. "Product Quantization for Nearest Neighbor Search." IEEE Transactions on Pattern Analysis and Machine Intelligence 33(1):117-128 (2011).
+14. Arthur, D. & Vassilvitskii, S. "k-means++: The Advantages of Careful Seeding." Proceedings of the 18th Annual ACM-SIAM Symposium on Discrete Algorithms (SODA), 1027-1035 (2007).
