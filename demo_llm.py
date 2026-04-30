@@ -381,9 +381,23 @@ def main():
     parser.add_argument(
         "--product-quant",
         action="store_true",
-        help="Also run Product Quantization (M=16 subspaces x 4 bits = 1 bit/dim "
-        "effective, 4x smaller than 4-bit scalar). Shown as an extra PQ(1b) "
-        "line after the scalar bit-width results.",
+        help="Also run Product Quantization. Shown as an extra PQ line after the "
+        "scalar bit-width results.",
+    )
+    parser.add_argument(
+        "--pq-bits",
+        type=int,
+        default=8,
+        help="Bits per PQ subspace (default: 8 -> K=256 centroids). "
+        "Higher = better quality, larger codebook. "
+        "e.g. 4->K=16 (1b/dim), 8->K=256 (2b/dim), 12->K=4096 (3b/dim).",
+    )
+    parser.add_argument(
+        "--pq-subspaces",
+        type=int,
+        default=16,
+        help="Number of PQ subspaces M (default: 16). "
+        "Must divide head_dim. Fewer subspaces = larger sub_dim = richer codebook.",
     )
     args = parser.parse_args()
 
@@ -592,10 +606,10 @@ def main():
             # num_subspaces=16, bits_per_subspace=4
             # num_subspaces=8, bits_per_subspace=4
 
-            pq_kvc = ProductKVCache(head_dim, num_subspaces=16, bits_per_subspace=8)
+            pq_kvc = ProductKVCache(head_dim, num_subspaces=args.pq_subspaces, bits_per_subspace=args.pq_bits)
             pq_kvc.calibrate(all_k_p, all_v_p)
 
-            past = _quantize_cache(native_cache_orig, pq_kvc, correction_rank=0)
+            past = _quantize_cache(native_cache_orig, pq_kvc, correction_rank=args.correction_rank)
             past_crop = _crop_cache(past, T_p - 1)
             with torch.no_grad():
                 q1_out = model(
