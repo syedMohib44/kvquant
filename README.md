@@ -182,6 +182,11 @@ python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "What is 
 OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is the capital of France?" --max-new-tokens 20
 # Product Quant (PQ) good with accuracy this will use PQ instead of BS 
 python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is Nihilism?" --max-new-tokens 100 --product-quant
+
+# The combination of PQ + low rank correction at the same 2 bits/dim storage is the strongest option PQ captures inter-dimension correlations, correction cleans up the residual error that PQ leaves behind. Use:
+python -m kvquant.demo_llm --model TinyLlama/... --prompt "..." \
+  --product-quant --pq-bits 8 --pq-subspaces 16 --correction-rank 4
+
 #########################
 
 python -m kvquant.demo_extensions   # all 4 extensions on real data

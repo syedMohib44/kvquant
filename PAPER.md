@@ -1,4 +1,4 @@
-# KVQuant: Attention-Aware and Structure-Exploiting Extensions to Near-Optimal Vector Quantization for KV Cache Compression
+# KVQuant: Attention Aware, Structure Exploiting Extensions to KV Cache Compression via Near Optimal Vector Quantization
 
 ---
 
@@ -8,7 +8,7 @@ TurboQuant (Zandieh et al., 2025) is a compelling approach to KV cache compressi
 
 We introduce five extensions attention-weighted quantization, delta compression, adaptive bit allocation, low-rank error correction, and product quantization each targeting a different structural property of transformer attention that the original method leaves on the table. Along the way, we also corrected several issues in the original implementation: the codebook was fitted to a Gaussian approximation rather than the actual sphere marginal distribution; the QR decomposition could silently produce a reflection instead of a rotation; the nearest-centroid search was doing $O(N \cdot d \cdot k)$ work when a binary search suffices; and the inner-product quantizer was applying a redundant second normalisation pass on vectors already on the unit sphere.
 
-On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47-70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1-2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim -- the same storage as 2-bit scalar, which collapses -- matching 3-bit scalar quality. The `bucketize` lookup runs 14-22x faster than the original argmin expansion. Four additional improvements are described: k-means++ codebook initialisation (75% lower init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5% at 0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4% vs same-budget plain), and Hadamard rotation exposed as a configurable parameter ($O(d \log d)$ vs $O(d^2)$).
+On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47-70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1-2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim the same storage as 2-bit scalar, which collapses matching 3-bit scalar quality. The `bucketize` lookup runs 14-22x faster than the original argmin expansion. Four additional improvements are described: k-means++ codebook initialisation (75% lower init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5% at 0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4% vs same-budget plain), and Hadamard rotation exposed as a configurable parameter ($O(d \log d)$ vs $O(d^2)$).
 
 ---
 
@@ -52,7 +52,7 @@ $$f(t) \;=\; C_d \cdot (1 - t^2)^{(d-3)/2}, \qquad t \in [-1,\, 1]$$
 
 This is a Beta-type distribution that only converges to a Gaussian for large $d$. At small $d$ and low bit-widths the difference is meaningful. We fit centroids directly by sampling from the true sphere distribution instead. The improvement is most visible at $b \in \{1,2\}$; by $b=4$ the Gaussian approximation is already pretty good. Centroids are cached by (num\_bits, dim) after first computation.
 
-**k-means++ initialisation.** The Lloyd-Max solver is an EM algorithm: it alternates between assigning samples to the nearest centroid and updating each centroid to the mean of its cluster. Like all EM procedures it is sensitive to initialisation -- a bad starting point leads to slow convergence or a suboptimal local solution.
+**k-means++ initialisation.** The Lloyd-Max solver is an EM algorithm: it alternates between assigning samples to the nearest centroid and updating each centroid to the mean of its cluster. Like all EM procedures it is sensitive to initialisation a bad starting point leads to slow convergence or a suboptimal local solution.
 
 The original implementation seeds centroids with `torch.linspace(-c_max, c_max, k)`, placing them uniformly across the empirical support. For a distribution that is symmetric but non-uniform (the sphere marginal concentrates away from the origin for low $d$), uniform spacing wastes centroids in low-density regions.
 
@@ -65,9 +65,9 @@ This $D^2$-weighted scheme gives an $O(\log k)$ approximation guarantee over uni
 
 **Empirical improvement at initialisation** ($d=64$, 100k samples, before Lloyd-Max iterations):
 
-At 1-bit ($k=2$) k-means++ cuts the initial MSE from 0.097 to 0.024 -- a 75.1% reduction. At 2-bit ($k=4$) the gap is 58.5% (0.006 down to 0.0025). By 3-bit ($k=8$) it narrows to 27.6%, and at 4-bit ($k=16$) both initialisations land at essentially the same MSE (~0.000241 vs 0.000240). The gains are largest where $k$ is small and every centroid placement counts. After full Lloyd-Max convergence both schemes converge to near-identical solutions; the practical benefit is fewer iterations to get there and avoidance of rare degenerate local optima at $b \in \{1, 2\}$.
+At 1-bit ($k=2$) k-means++ cuts the initial MSE from 0.097 to 0.024 a 75.1% reduction. At 2-bit ($k=4$) the gap is 58.5% (0.006 down to 0.0025). By 3-bit ($k=8$) it narrows to 27.6%, and at 4-bit ($k=16$) both initialisations land at essentially the same MSE (~0.000241 vs 0.000240). The gains are largest where $k$ is small and every centroid placement counts. After full Lloyd-Max convergence both schemes converge to near-identical solutions; the practical benefit is fewer iterations to get there and avoidance of rare degenerate local optima at $b \in \{1, 2\}$.
 
-![Figure 7: Left -- raw init MSE (log scale) for linspace vs k-means++ at each bit-width. Right -- percentage MSE reduction from k-means++ seeding.](figures/fig7_kmeans_init.png)
+![Figure 7: Left raw init MSE (log scale) for linspace vs k-means++ at each bit-width. Right percentage MSE reduction from k-means++ seeding.](figures/fig7_kmeans_init.png)
 
 #### 2.2.2 SO(d) Rotation
 
@@ -161,7 +161,7 @@ The difference is negligible for large tensors (the loop runs in $O(\text{ndim})
 ```python
 centroids, boundaries = _CACHE[key]
 if device is not None:
-    # .to() returns a new tensor when device differs -- already independent
+    # .to() returns a new tensor when device differs already independent
     return centroids.to(device), boundaries.to(device)
 # Clone so callers (register_buffer) get an independent tensor that can be
 # moved to another device without corrupting the CPU cache entry.
@@ -194,7 +194,7 @@ The same asymmetry propagates through `OutlierKVQuant` via a new `quantizer_cls`
 
 **Empirical result** (delta cache, $d=64$, $T=50$ drifting sequence, 3-bit budget):
 
-The 3-bit symmetric baseline (IP/IP) gives a K IP-error of 0.2815 and a V MSE of 0.005424. Switching to the asymmetric IP/MSE config at 2.5 bits/dim -- half a bit less per dimension -- drops V MSE to 0.002086, a **61.5% reduction** while spending fewer bits overall. For comparison, plain IP/IP at the same 2-bit budget produces a V MSE of 0.045147, more than 20x worse. The K IP-error rises with the asymmetric config (0.2815 to 2.1816) because the per-dimension budget is lower, but this is expected and consistent with the IP quantizer's unbiasedness guarantee -- the attention scores remain centred regardless.
+The 3-bit symmetric baseline (IP/IP) gives a K IP-error of 0.2815 and a V MSE of 0.005424. Switching to the asymmetric IP/MSE config at 2.5 bits/dim half a bit less per dimension drops V MSE to 0.002086, a **61.5% reduction** while spending fewer bits overall. For comparison, plain IP/IP at the same 2-bit budget produces a V MSE of 0.045147, more than 20x worse. The K IP-error rises with the asymmetric config (0.2815 to 2.1816) because the per-dimension budget is lower, but this is expected and consistent with the IP quantizer's unbiasedness guarantee the attention scores remain centred regardless.
 
 ![Figure 8: K IP-error (left) and V MSE (right) for symmetric IP/IP vs asymmetric IP/MSE quantization at matched and reduced bit budgets.](figures/fig8_kv_asymmetric.png)
 
@@ -220,7 +220,7 @@ Concretely, for a 3-bit average with $b_{\mathrm{hi}}=4$, $b_{\mathrm{lo}}=2$, t
 
 Results on distilgpt2 (3-bit avg):
 
-Across all six layers, AWQ cuts attention-weighted distortion by 47.5% to 70.1% versus uniform quantization at the same average bit-width. Layer 2 sees the largest gain (0.184 down to 0.055, 70.1%), which makes sense -- it tends to have the most peaked attention distributions, so the high-attention tokens benefit most from the extra bits. The average reduction across all layers is 56.5%, and this is the quantity that actually determines how much the model's outputs change.
+Across all six layers, AWQ cuts attention-weighted distortion by 47.5% to 70.1% versus uniform quantization at the same average bit-width. Layer 2 sees the largest gain (0.184 down to 0.055, 70.1%), which makes sense it tends to have the most peaked attention distributions, so the high-attention tokens benefit most from the extra bits. The average reduction across all layers is 56.5%, and this is the quantity that actually determines how much the model's outputs change.
 
 ![Figure 2: Attention-weighted bit assignment and per-layer distortion reduction](figures/fig2_awq.png)
 
@@ -233,19 +233,19 @@ $$\hat{\mathbf{k}}_t \;=\; \hat{\mathbf{k}}_{t-1} + \mathrm{decompress}(\boldsym
 
 One thing to watch: errors accumulate over long sequences. For most use cases this isn't a problem, but two anchor strategies are available. The `anchor_every` parameter re-anchors at fixed intervals (e.g. every 128 tokens). The `anchor_threshold` parameter re-anchors adaptively when $\|\boldsymbol{\delta}_t\| / \|\mathbf{k}_t\| > \tau$ triggering exactly when the sequence changes rapidly and error would accumulate most, without wasting anchors on stable regions.
 
-**Implementation optimisations.** Three improvements were made to the naive implementation. The anchor set was changed from a Python list (O(T) membership test) to a hash set (O(1)), eliminating a quadratic scan. Cache reconstruction was made incremental: instead of rebuilding from all deltas on every `get()` call (O(T^2) total), each `push()` appends the current running reconstruction so `get()` just stacks the list in O(1) -- at the cost of storing T float32 reconstructions alongside the compressed deltas. Finally, anchor placement was extended with an adaptive mode that fires when $\|\delta\|/\|\mathbf{k}\| > \tau$, triggering at actual change-points rather than fixed intervals; $\tau=0$ disables it for full backwards compatibility.
+**Implementation optimisations.** Three improvements were made to the naive implementation. The anchor set was changed from a Python list (O(T) membership test) to a hash set (O(1)), eliminating a quadratic scan. Cache reconstruction was made incremental: instead of rebuilding from all deltas on every `get()` call (O(T^2) total), each `push()` appends the current running reconstruction so `get()` just stacks the list in O(1) at the cost of storing T float32 reconstructions alongside the compressed deltas. Finally, anchor placement was extended with an adaptive mode that fires when $\|\delta\|/\|\mathbf{k}\| > \tau$, triggering at actual change-points rather than fixed intervals; $\tau=0$ disables it for full backwards compatibility.
 
 Results on distilgpt2 (3-bit):
 
-Delta compression reduces MSE across all six layers, with earlier layers benefiting most. Layers 1 and 2 see a 2.2x improvement (MSE roughly halved), while layer 5 -- the deepest -- shows only a 1.1x gain. This gradient makes sense: early layers tend to have smoother, more predictable KV trajectories, so the deltas are smaller relative to the vectors. Later layers develop more complex, rapidly-shifting representations where consecutive tokens diverge more.
+Delta compression reduces MSE across all six layers, with earlier layers benefiting most. Layers 1 and 2 see a 2.2x improvement (MSE roughly halved), while layer 5 the deepest shows only a 1.1x gain. This gradient makes sense: early layers tend to have smoother, more predictable KV trajectories, so the deltas are smaller relative to the vectors. Later layers develop more complex, rapidly-shifting representations where consecutive tokens diverge more.
 
-**Delta + outlier combination.** Delta compression and outlier-aware quantization are complementary and can be stacked. Outlier channels -- those with disproportionately high variance -- also tend to be the channels with the largest delta magnitudes. Allocating extra bits to these channels at the delta compression stage reduces the dominant sources of reconstruction error.
+**Delta + outlier combination.** Delta compression and outlier-aware quantization are complementary and can be stacked. Outlier channels those with disproportionately high variance also tend to be the channels with the largest delta magnitudes. Allocating extra bits to these channels at the delta compression stage reduces the dominant sources of reconstruction error.
 
 `DeltaKVCache` accepts `use_outlier=True`, which replaces the internal KVQuantIP/KVQuantMSE pair with `OutlierKVQuant` instances calibrated on the delta distribution. The asymmetric rule from Section 2.2.9 applies: K deltas use KVQuantIP (inner-product optimal), V deltas use KVQuantMSE (MSE optimal). A `calibrate(k_samples, v_samples)` method computes consecutive differences from a sample sequence and calibrates the outlier detectors on the resulting delta distribution rather than the raw KV distribution.
 
 **Empirical result** ($d=64$, $T=50$, 3-bit budget, slow drift $\|\boldsymbol{\delta}_t\| \approx 0.15 \|\mathbf{k}_t\|$):
 
-At 2.5 bits/dim, the delta+outlier config (IP/MSE) achieves a V MSE of 0.002086 -- **61.5% lower** than the 3-bit plain baseline (0.005424) while using half a bit less, and **95.4% lower** than 2-bit plain at the same budget (0.045147). K IP-error rises to 2.1816 at 2.5 bits, comparable to 2-bit plain, which is expected -- the IP quantizer remains unbiased regardless of bit-width.
+At 2.5 bits/dim, the delta+outlier config (IP/MSE) achieves a V MSE of 0.002086 **61.5% lower** than the 3-bit plain baseline (0.005424) while using half a bit less, and **95.4% lower** than 2-bit plain at the same budget (0.045147). K IP-error rises to 2.1816 at 2.5 bits, comparable to 2-bit plain, which is expected the IP quantizer remains unbiased regardless of bit-width.
 
 ![Figure 9: K IP-error (left) and V MSE (right) for plain vs delta+outlier quantization. The green bar at 2.5 bpw beats both the 3-bit and same-budget 2-bit baselines on V MSE.](figures/fig9_delta_outlier.png)
 
@@ -304,7 +304,7 @@ where $\hat{\mathbf{k}}_t^{(m)}$ is looked up from codebook $\mathcal{C}_m$ usin
 
 **Generation quality results** (TinyLlama-1.1B-Chat, $d=64$, prompt "What is Nihilism?", 100 tokens):
 
-4-bit scalar produces an excellent definition with named philosophers. 3-bit stays on-topic with minor drift. 2-bit scalar collapses entirely -- the output becomes incoherent within about 30 tokens, drifting into unrelated content. PQ at $M=16$, $b=8$ uses the same 128 bits/vector as 2-bit scalar but produces a coherent, correct definition across the full 100 tokens, matching 3-bit scalar quality. The difference comes down to codebook expressiveness: 2-bit scalar has $K=4$ centroids per dimension while PQ has $K=256$ per subspace, capturing the inter-dimension correlations that scalar quantization ignores entirely.
+4-bit scalar produces an excellent definition with named philosophers. 3-bit stays on-topic with minor drift. 2-bit scalar collapses entirely the output becomes incoherent within about 30 tokens, drifting into unrelated content. PQ at $M=16$, $b=8$ uses the same 128 bits/vector as 2-bit scalar but produces a coherent, correct definition across the full 100 tokens, matching 3-bit scalar quality. The difference comes down to codebook expressiveness: 2-bit scalar has $K=4$ centroids per dimension while PQ has $K=256$ per subspace, capturing the inter-dimension correlations that scalar quantization ignores entirely.
 
 **Notable result.** PQ ($M=16$, $b=8$) matches 3-bit scalar generation quality at 2-bit scalar storage a 33% storage reduction with no perceptible quality loss, and a 2$\times$ improvement over same-budget scalar quantization.
 
@@ -314,19 +314,19 @@ where $\hat{\mathbf{k}}_t^{(m)}$ is looked up from codebook $\mathcal{C}_m$ usin
 
 ## 4. Full Pipeline
 
-Each new KV pair passes through four stages before it is stored. The stages are independent -- each targets a different source of inefficiency -- so their gains compound.
+Each new KV pair passes through four stages before it is stored. The stages are independent each targets a different source of inefficiency so their gains compound.
 
-**Stage 1 -- Delta compression.** Rather than compressing each token's key and value vectors in isolation, we compress the *change* from the previous token. Because adjacent KV vectors in a real generation stream are highly correlated, the delta is typically much smaller in magnitude than the absolute vector. The same bit-width therefore achieves lower distortion: 1.1--2.2x lower MSE across distilgpt2 layers (Section 3.2).
+**Stage 1 Delta compression.** Rather than compressing each token's key and value vectors in isolation, we compress the *change* from the previous token. Because adjacent KV vectors in a real generation stream are highly correlated, the delta is typically much smaller in magnitude than the absolute vector. The same bit-width therefore achieves lower distortion: 1.1--2.2x lower MSE across distilgpt2 layers (Section 3.2).
 
-**Stage 2 -- Attention-weighted bit assignment.** Before committing to a quantizer, we rank the tokens by how much attention the current query places on them. The top half get one extra bit; the bottom half give one bit back. The average bit-width is unchanged, but the bits go where the model actually looks. This cuts attention-weighted distortion by 47--70% per layer with no storage overhead (Section 3.1).
+**Stage 2 Attention-weighted bit assignment.** Before committing to a quantizer, we rank the tokens by how much attention the current query places on them. The top half get one extra bit; the bottom half give one bit back. The average bit-width is unchanged, but the bits go where the model actually looks. This cuts attention-weighted distortion by 47--70% per layer with no storage overhead (Section 3.1).
 
-**Stage 3 -- Quantization backend (choose one).** Two backends are available and are mutually exclusive per layer:
+**Stage 3 Quantization backend (choose one).** Two backends are available and are mutually exclusive per layer:
 
-- *KVQuantIP (default)* -- scalar Lloyd-Max quantization with inner-product-optimal K encoding and MSE-optimal V encoding. Low-rank error correction is applied on top: the quantization residual is approximated with a rank-4 SVD and added back, recovering ~11% of the remaining MSE at 7.4% extra storage. Huffman coding of the codebook indices is available as a final lossless step, saving ~4% at 4-bit.
+- *KVQuantIP (default)* scalar Lloyd-Max quantization with inner-product-optimal K encoding and MSE-optimal V encoding. Low-rank error correction is applied on top: the quantization residual is approximated with a rank-4 SVD and added back, recovering ~11% of the remaining MSE at 7.4% extra storage. Huffman coding of the codebook indices is available as a final lossless step, saving ~4% at 4-bit.
 
-- *ProductKVCache (alternative)* -- Product Quantization splits each vector into M subvectors and encodes each with its own k-means codebook. At M=16, b=8 this matches 3-bit scalar quality at 2-bit scalar storage. No low-rank correction is needed at this operating point because PQ already captures inter-dimension correlations that scalar quantization misses.
+- *ProductKVCache (alternative)* Product Quantization splits each vector into M subvectors and encodes each with its own k-means codebook. At M=16, b=8 this matches 3-bit scalar quality at 2-bit scalar storage. No low-rank correction is needed at this operating point because PQ already captures inter-dimension correlations that scalar quantization misses.
 
-**Stage 4 -- Adaptive reallocation.** During generation, each token's importance is tracked via an EMA over the attention weights it receives. As the sequence evolves, tokens cross bit-width thresholds and are recompressed up or down accordingly. This handles the common case where a token that seemed unimportant at compression time becomes critical steps later.
+**Stage 4 Adaptive reallocation.** During generation, each token's importance is tracked via an EMA over the attention weights it receives. As the sequence evolves, tokens cross bit-width thresholds and are recompressed up or down accordingly. This handles the common case where a token that seemed unimportant at compression time becomes critical steps later.
 
 ---
 
@@ -348,7 +348,7 @@ We evaluate perplexity (PPL) under KV cache quantization using the generation sc
 
 PPL degradation (dPPL = PPL_quant - PPL_fp32) at each bit-width:
 
-At 4-bit, all three models hold up well -- distilgpt2 adds only +1.71 PPL over its FP32 baseline of 33.51, gpt2-medium adds +1.10 over 13.38, and TinyLlama adds just +0.25 over 4.78. 3-bit is more model-dependent: TinyLlama's LlamaAttention architecture tolerates it gracefully (+0.87 dPPL) while distilgpt2 shows a steeper drop (+21.44). At 2-bit the degradation is severe across all models (+276, +173, +274 respectively) without correction -- 2-bit scalar essentially breaks generation.
+At 4-bit, all three models hold up well distilgpt2 adds only +1.71 PPL over its FP32 baseline of 33.51, gpt2-medium adds +1.10 over 13.38, and TinyLlama adds just +0.25 over 4.78. 3-bit is more model-dependent: TinyLlama's LlamaAttention architecture tolerates it gracefully (+0.87 dPPL) while distilgpt2 shows a steeper drop (+21.44). At 2-bit the degradation is severe across all models (+276, +173, +274 respectively) without correction 2-bit scalar essentially breaks generation.
 
 ---
 
@@ -356,7 +356,7 @@ At 4-bit, all three models hold up well -- distilgpt2 adds only +1.71 PPL over i
 
 With rank-4 correction applied:
 
-On distilgpt2, rank-4 correction brings 2-bit dPPL from +276.64 down to +10.89 -- recovering **96% of the degradation**. On gpt2-medium the recovery is **97%** (173.61 down to 5.95). At 3-bit, the corrected cache lands within 1.6--4.3 PPL of FP32 on both models. At 4-bit the gains are smaller (0.5--0.7 PPL) because the 4-bit residual is already small enough ($D_{\text{mse}} \leq 0.011$) that a rank-4 SVD risks fitting numerical noise rather than real signal -- so in practice we apply correction only when bits $< 4$. TinyLlama is omitted here: its 3-bit and 4-bit degradation is already below measurement noise at 50 chunks, so correction is not meaningful to report.
+On distilgpt2, rank-4 correction brings 2-bit dPPL from +276.64 down to +10.89 recovering **96% of the degradation**. On gpt2-medium the recovery is **97%** (173.61 down to 5.95). At 3-bit, the corrected cache lands within 1.6--4.3 PPL of FP32 on both models. At 4-bit the gains are smaller (0.5--0.7 PPL) because the 4-bit residual is already small enough ($D_{\text{mse}} \leq 0.011$) that a rank-4 SVD risks fitting numerical noise rather than real signal so in practice we apply correction only when bits $< 4$. TinyLlama is omitted here: its 3-bit and 4-bit degradation is already below measurement noise at 50 chunks, so correction is not meaningful to report.
 
 **Notable result.** For gpt2-medium, 2-bit + rank-4 (dPPL = +5.95) is within 0.07 PPL of plain 3-bit without correction (+6.02). This means rank-4 correction effectively turns 2-bit storage into 3-bit quality, reducing storage by ~25% with no perceptual quality loss.
 
@@ -378,7 +378,7 @@ On distilgpt2, rank-4 correction brings 2-bit dPPL from +276.64 down to +10.89 -
 
 ## 7. Discussion and Limitations
 
-**Composability.** The five extensions are designed to be stacked, but not all combinations are equally useful. Delta compression and attention-weighted bit assignment are complementary -- delta targets temporal correlation in absolute vectors, AWQ targets token importance. Low-rank correction is orthogonal to both. PQ, however, is a full replacement for the scalar KVQuantIP path and cannot be trivially combined with it at the same layer; it is best treated as an alternative quantization backend.
+**Composability.** The five extensions are designed to be stacked, but not all combinations are equally useful. Delta compression and attention-weighted bit assignment are complementary delta targets temporal correlation in absolute vectors, AWQ targets token importance. Low-rank correction is orthogonal to both. PQ, however, is a full replacement for the scalar KVQuantIP path and cannot be trivially combined with it at the same layer; it is best treated as an alternative quantization backend.
 
 **GQA amplification.** Models with Grouped Query Attention (GQA) share KV heads across multiple query heads. With a grouping factor $g = \text{num\_heads} / \text{kv\_heads}$, the effective per-attention-head distortion is:
 $$D_{\text{eff}} \approx g \cdot D_{\text{mse}}.$$
@@ -394,7 +394,7 @@ For Qwen2.5-1.5B ($g=6$, $d=128$) even 4-bit quantization (theoretical $D \leq 0
 
 ## 8. Conclusion
 
-The core insight behind KVQuant -- rotate into an approximately isotropic distribution, then apply optimal 1-D quantization -- is sound and gives strong theoretical guarantees. What we've shown here is that there's significant headroom beyond those guarantees if you're willing to exploit the structure of how transformers actually use the KV cache.
+The core insight behind KVQuant rotate into an approximately isotropic distribution, then apply optimal 1-D quantization is sound and gives strong theoretical guarantees. What we've shown here is that there's significant headroom beyond those guarantees if you're willing to exploit the structure of how transformers actually use the KV cache.
 
 Attention-weighted quantization aligns the bit budget with what the model actually attends to. Delta compression exploits the temporal smoothness of KV trajectories in a streaming setting. Adaptive allocation adjusts to importance that you couldn't have known at compression time. Low-rank correction recovers structure from an error that isn't as random as you might assume.
 
@@ -568,7 +568,7 @@ The crop-and-rerun costs one extra forward pass (through all layers, but with a 
 **Effect.** Before the fix, `demo_llm.py` with a 3-bit Qwen2.5-1.5B-Instruct (1.5 B parameters, GQA with $g=6$, $d=128$) on `"France Capital City :"` produced:
 
 ```
-3-bit: France Capital City : [Chinese characters -- "Faguo Bali, Paris, is the capital of France..."]
+3-bit: France Capital City : [Chinese characters "Faguo Bali, Paris, is the capital of France..."]
 ```
 
 (mixing Chinese and English mid-sentence, corrupted from token 1 misalignment). After:
@@ -593,7 +593,7 @@ Three performance and correctness issues were identified and fixed in the delta 
 
 **Empirical result** ($T=30$, 3-bit, sudden drift at $t=15$):
 
-With no anchor beyond the initial one, MSE accumulates to 0.116. A fixed `anchor_every=32` uses a second anchor but places it at position 32 -- after the drift at position 15 -- so it barely helps (MSE 0.116, essentially the same). Adaptive anchoring with `anchor_threshold=0.4` uses the same two anchors but fires the second one at position 15 exactly where the drift happens, reducing MSE to 0.00126 -- a **98.9% reduction** at zero extra anchor cost.
+With no anchor beyond the initial one, MSE accumulates to 0.116. A fixed `anchor_every=32` uses a second anchor but places it at position 32 after the drift at position 15 so it barely helps (MSE 0.116, essentially the same). Adaptive anchoring with `anchor_threshold=0.4` uses the same two anchors but fires the second one at position 15 exactly where the drift happens, reducing MSE to 0.00126 a **98.9% reduction** at zero extra anchor cost.
 
 All three fixes are covered by 10 new tests in `TestDeltaKVCache`; the full suite of 88 tests passes.
 
