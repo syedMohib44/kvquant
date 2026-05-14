@@ -2,7 +2,7 @@
 
 **Attention-aware KV cache quantization for LLM inference.**
 
-KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) with four novel extensions and several implementation improvements. It achieves near-optimal KV cache compression by combining information-theoretically grounded vector quantization with transformer-specific structure exploitation.
+KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) with five novel extensions and several implementation improvements. It achieves near-optimal KV cache compression by combining information-theoretically grounded vector quantization with transformer-specific structure exploitation.
 
 ---
 
@@ -10,11 +10,11 @@ KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 
 
 | Metric | Value |
 |---|---|
-| Attention-weighted distortion reduction | **47–70%** per layer (same bit-width) |
-| Delta compression MSE improvement | **1.1–2.2×** on correlated streams |
+| Attention-weighted distortion reduction | **47--70%** per layer (same bit-width) |
+| Delta compression MSE improvement | **1.1--2.2x** on correlated streams |
 | Low-rank correction MSE reduction | **~11%** at rank-4, ~19% at rank-8 |
-| Codebook lookup speedup vs argmin | **14–22×** (bucketize) |
-| Test suite | **78/78 passing** |
+| Codebook lookup speedup vs argmin | **14--22x** (bucketize) |
+| Test suite | **88/88 passing** |
 
 ---
 
@@ -22,7 +22,7 @@ KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 
 
 ### 1. MSE Distortion vs Bit-Width
 
-KVQuant achieves per-element MSE well within the theoretical upper bound `(sqrt3 pi/2) · 4^{-b}` across all bit-widths. Both QR and Hadamard rotations stay below the bound.
+KVQuant achieves per-element MSE well within the theoretical upper bound `(sqrt3 pi/2) . 4^{-b}` across all bit-widths. Both QR and Hadamard rotations stay below the bound.
 
 ![MSE Bounds](plots/1_mse_bounds.png)
 
@@ -54,7 +54,7 @@ Rather than allocating bits uniformly, AWQ assigns more bits to tokens that rece
 
 ### 5. Delta Compression (Extension 2)
 
-Consecutive KV vectors are highly correlated. Compressing token-to-token deltas `δ_t = k_t - k(cap)_{t-1}` instead of absolute vectors gives **1.1–2.2× lower MSE**, especially in early layers with smoother trajectories.
+Consecutive KV vectors are highly correlated. Compressing token-to-token deltas `delta_t = k_t - k(cap)_{t-1}` instead of absolute vectors gives **1.1--2.2x lower MSE**, especially in early layers with smoother trajectories.
 
 ![Delta Compression](plots/5_delta_compression.png)
 
@@ -137,7 +137,7 @@ pip install -e ".[dev]"
 
 This installs all dependencies (`torch`, `transformers`, `numpy`, `matplotlib`) and `pytest`, and makes the `kvquant` package importable from anywhere as long as the `kvquant` conda environment is active.
 
-**Requirements:** Python ≥ 3.10, PyTorch ≥ 2.1, Transformers ≥ 4.40
+**Requirements:** Python >= 3.10, PyTorch >= 2.1, Transformers >= 4.40
 
 ### 4. Configure VS Code (optional)
 
@@ -189,7 +189,7 @@ python -m kvquant.demo_llm --model TinyLlama/... --prompt "..." \
 
 #########################
 
-python -m kvquant.demo_extensions   # all 4 extensions on real data
+python -m kvquant.demo_extensions   # all 5 extensions on real data
 python -m kvquant.visualize         # regenerate all plots -> plots/
 ```
 
@@ -228,7 +228,7 @@ k_corrected = lrc.forward(keys)
 ## Running tests
 
 ```bash
-python -m pytest test_kvquant.py -v   # 78 tests, all pass
+python -m pytest test_kvquant.py -v   # 88 tests, all pass
 # or simply:
 pytest
 ```
@@ -240,10 +240,10 @@ pytest
 | | Reference | KVQUANT |
 |---|---|---|
 | Codebook distribution | Gaussian approximation | **True sphere marginal** |
-| Rotation | May produce reflections (det = −1) | **SO(d) enforced** (det = +1) |
-| Nearest-centroid lookup | `argmin` - O(N·d·k) | **`bucketize`** - O(N·d·log k), 14–22× faster |
+| Rotation | May produce reflections (det = -1) | **SO(d) enforced** (det = +1) |
+| Nearest-centroid lookup | `argmin` - O(N.d.k) | **`bucketize`** - O(N.d.log k), 14--22x faster |
 | FWHT | 2 clones per butterfly level | **In-place**, 1 allocation per level |
-| Extensions | None | **4 novel extensions** |
+| Extensions | None | **5 novel extensions** |
 | Entropy coding | Not present | **Huffman coding** on indices |
 | High-level API | None | **`KVCacheQuantizer`** for (B,H,T,d) tensors |
 
@@ -253,16 +253,16 @@ pytest
 
 ```
 kvquant/
-├-- quantizer.py       # KVQuantMSE, KVQuantIP
-├-- rotation.py        # RandomRotation (QR), HadamardRotation (WHT)
-├-- codebook.py        # Lloyd-Max on true sphere distribution
-├-- entropy.py         # Huffman coding on indices
-├-- outlier.py         # Per-channel bit allocation for outliers
-├-- kv_cache.py        # KVCacheQuantizer - high-level (B,H,T,d) API
-├-- attn_weighted.py   # Extension 1: attention-weighted quantization
-├-- delta.py           # Extension 2: delta / temporal compression
-├-- adaptive.py        # Extension 3: EMA-based adaptive bit allocation
-└-- correction.py      # Extension 4: low-rank error correction
+|-- quantizer.py       # KVQuantMSE, KVQuantIP
+|-- rotation.py        # RandomRotation (QR), HadamardRotation (WHT)
+|-- codebook.py        # Lloyd-Max on true sphere distribution
+|-- entropy.py         # Huffman coding on indices
+|-- outlier.py         # Per-channel bit allocation for outliers
+|-- kv_cache.py        # KVCacheQuantizer - high-level (B,H,T,d) API
+|-- attn_weighted.py   # Extension 1: attention-weighted quantization
+|-- delta.py           # Extension 2: delta / temporal compression
+|-- adaptive.py        # Extension 3: EMA-based adaptive bit allocation
++-- correction.py      # Extension 4: low-rank error correction
 ```
 
 ## Example Output
@@ -275,9 +275,9 @@ python -m kvquant.demo_llm --prompt "Hi how are you?"
 
   Unquant: Hi how are you? I'm a big fan of the game and I'm really excited to see how it will be released. I'm really excited to see how it will be released. I'm really excited to see how
 
-  2-bit  : Hi how are you? I’s a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is
+  2-bit  : Hi how are you? I's a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is
 
-  3-bit  : Hi how are you? I’m a little bit shy, but I’m a little bit shy, but I’m a little bit shy, but I’m a little bit shy, but
+  3-bit  : Hi how are you? I'm a little bit shy, but I'm a little bit shy, but I'm a little bit shy, but I'm a little bit shy, but
   
   4-bit  : Hi how are you? I'm a big fan of the game and I'm really excited to see what you do. I'm really excited to see what you do. I'm a big fan of the game and I'm
 ----------------------------------------------------------------

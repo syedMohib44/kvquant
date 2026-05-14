@@ -205,10 +205,10 @@ The 3-bit symmetric baseline (IP/IP) gives a K IP-error of 0.2815 and a V MSE of
 ### 3.1 Attention-Weighted Quantization
 
 KVQuant minimizes:
-$$\mathcal{L}_{\mathrm{uniform}} \;=\; \mathbb{E}\!\left[\,\|\mathbf{k}_i \hat{\mathbf{k}}_i\|^2\,\right].$$
+$$\mathcal{L}_{\mathrm{uniform}} \;=\; \mathbb{E}\!\left[\,\|\mathbf{k}_i - \hat{\mathbf{k}}_i\|^2\,\right].$$
 
 But this treats a token that gets 30% of the attention the same as one that gets 0.01%. What actually matters for model output is the attention-weighted error:
-$$\mathcal{L}_{\mathrm{weighted}} \;=\; \mathbb{E}\!\left[\,a_i \cdot \|\mathbf{k}_i \hat{\mathbf{k}}_i\|^2\,\right],$$
+$$\mathcal{L}_{\mathrm{weighted}} \;=\; \mathbb{E}\!\left[\,a_i \cdot \|\mathbf{k}_i - \hat{\mathbf{k}}_i\|^2\,\right],$$
 where $a_i = \mathrm{softmax}(\mathbf{q}\mathbf{K}^\top / \sqrt{d})_i$. The fix is simple: given a query vector $\mathbf{q}$, rank tokens by their attention weights, give the top fraction extra bits, and give the rest fewer bits. The average bit-width stays the same you're just redistributing it.
 
 Concretely, for a 3-bit average with $b_{\mathrm{hi}}=4$, $b_{\mathrm{lo}}=2$, top 50%:
@@ -226,9 +226,9 @@ Across all six layers, AWQ cuts attention-weighted distortion by 47.5% to 70.1% 
 
 ### 3.2 Delta Compression
 
-During autoregressive generation, the KV vectors for adjacent tokens are correlated often strongly. The delta $\|\mathbf{k}_t \mathbf{k}_{t-1}\|$ is typically much smaller than $\|\mathbf{k}_t\|$. Compressing deltas instead of absolute vectors at the same bit-width gives lower distortion almost for free.
+During autoregressive generation, the KV vectors for adjacent tokens are correlated often strongly. The delta $\|\mathbf{k}_t - \mathbf{k}_{t-1}\|$ is typically much smaller than $\|\mathbf{k}_t\|$. Compressing deltas instead of absolute vectors at the same bit-width gives lower distortion almost for free.
 
-The scheme is straightforward: store $\mathbf{k}_0$ at full float32 precision as an anchor, then for each subsequent token compress $\boldsymbol{\delta}_t = \mathbf{k}_t \hat{\mathbf{k}}_{t-1}$ with KVQuantIP. Reconstruction accumulates:
+The scheme is straightforward: store $\mathbf{k}_0$ at full float32 precision as an anchor, then for each subsequent token compress $\boldsymbol{\delta}_t = \mathbf{k}_t - \hat{\mathbf{k}}_{t-1}$ with KVQuantIP. Reconstruction accumulates:
 $$\hat{\mathbf{k}}_t \;=\; \hat{\mathbf{k}}_{t-1} + \mathrm{decompress}(\boldsymbol{\delta}_t).$$
 
 One thing to watch: errors accumulate over long sequences. For most use cases this isn't a problem, but two anchor strategies are available. The `anchor_every` parameter re-anchors at fixed intervals (e.g. every 128 tokens). The `anchor_threshold` parameter re-anchors adaptively when $\|\boldsymbol{\delta}_t\| / \|\mathbf{k}_t\| > \tau$ triggering exactly when the sequence changes rapidly and error would accumulate most, without wasting anchors on stable regions.
@@ -261,11 +261,11 @@ As an illustrative example: at short sequence lengths (12 tokens, distilgpt2 lay
 
 ### 3.4 Low-Rank Error Correction
 
-Quantization error $\mathbf{R} = \mathbf{K} \hat{\mathbf{K}}$ isn't random noise it has structure. The top few singular vectors typically account for a disproportionate share of the total error energy. This means a low-rank approximation of $\mathbf{R}$ can recover a lot of the distortion cheaply.
+Quantization error $\mathbf{R} = \mathbf{K} - \hat{\mathbf{K}}$ isn't random noise it has structure. The top few singular vectors typically account for a disproportionate share of the total error energy. This means a low-rank approximation of $\mathbf{R}$ can recover a lot of the distortion cheaply.
 
 Given $\hat{\mathbf{K}}$ from any KVQuant variant, the correction is:
 
-1. Compute $\mathbf{R} = \mathbf{K} \hat{\mathbf{K}}$
+1. Compute $\mathbf{R} = \mathbf{K} - \hat{\mathbf{K}}$
 2. Truncated SVD: $\mathbf{R} \approx \mathbf{U}_r \boldsymbol{\Sigma}_r \mathbf{V}_r^\top$
 3. Store $\mathbf{U}_s = \mathbf{U}_r \boldsymbol{\Sigma}_r$ and $\mathbf{V}_r$
 4. Corrected reconstruction: $\hat{\mathbf{K}} + \mathbf{U}_s \mathbf{V}_r^\top$
@@ -286,7 +286,7 @@ At 2-bit, rank-4 correction drops MSE from 0.252 to 0.220 (a 13% reduction) and 
 
 Scalar Lloyd-Max quantization treats each post-rotation coordinate independently. This ignores residual correlations between adjacent dimensions that survive the Hadamard transform. Product Quantization (PQ; Jégou et al., 2011) exploits these correlations by partitioning the $d$-dimensional vector into $M$ subvectors of size $d^* = d / M$ and learning a separate $k$-means codebook per subspace:
 
-$$\hat{\mathbf{k}} \;=\; \bigl[\,\hat{\mathbf{k}}^{(1)}\;\|\;\hat{\mathbf{k}}^{(2)}\;\|\;\cdots\;\|\;\hat{\mathbf{k}}^{(M)}\,\bigr], \qquad \hat{\mathbf{k}}^{(m)} = \arg\min_{\mathbf{c} \in \mathcal{C}_m} \|\mathbf{k}^{(m)} \mathbf{c}\|_2^2$$
+$$\hat{\mathbf{k}} \;=\; \bigl[\,\hat{\mathbf{k}}^{(1)}\;\|\;\hat{\mathbf{k}}^{(2)}\;\|\;\cdots\;\|\;\hat{\mathbf{k}}^{(M)}\,\bigr], \qquad \hat{\mathbf{k}}^{(m)} = \arg\min_{\mathbf{c} \in \mathcal{C}_m} \|\mathbf{k}^{(m)} - \mathbf{c}\|_2^2$$
 
 where $\mathcal{C}_m \subset \mathbb{R}^{d^*}$ is the $K$-entry codebook for subspace $m$, trained by $k$-means on calibration vectors.
 
@@ -294,7 +294,7 @@ where $\mathcal{C}_m \subset \mathbb{R}^{d^*}$ is the $K$-entry codebook for sub
 $$\text{bits per vector} = M \cdot b \quad \Longleftrightarrow \quad \frac{M \cdot b}{d} \;\text{ bits per dimension}.$$
 For $d=64$, $M=16$, $b=8$: $16 \times 8 = 128$ bits/vector $= 2$ bits/dim identical to 2-bit scalar but with $K=256$ centroids per subspace vs $K=4$ for scalar.
 
-**Initialisation.** Codebooks are seeded with $k$-means++ (Arthur \& Vassilvitskii, 2007), which selects initial centroids with probability proportional to $\|\mathbf{x} \mathbf{c}_{\text{nearest}}\|_2^2$. This gives an $O(\log K)$ approximation guarantee over random initialisation and converges in fewer iterations.
+**Initialisation.** Codebooks are seeded with $k$-means++ (Arthur \& Vassilvitskii, 2007), which selects initial centroids with probability proportional to $\|\mathbf{x} - \mathbf{c}_{\text{nearest}}\|_2^2$. This gives an $O(\log K)$ approximation guarantee over random initialisation and converges in fewer iterations.
 
 **Integration with KVQuant.** The Hadamard rotation is applied before the subspace split so that information is spread uniformly across subspaces. Each subvector then has approximately isotropic variance, making all $M$ codebooks equally important. Codebooks are calibrated on the actual prefill KV vectors, so the centroid distribution matches the true per-model, per-layer KV distribution rather than the theoretical sphere marginal.
 
