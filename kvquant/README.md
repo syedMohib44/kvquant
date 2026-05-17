@@ -24,7 +24,7 @@ KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 
 
 KVQuant achieves per-element MSE well within the theoretical upper bound `(sqrt3 pi/2) . 4^{-b}` across all bit-widths. Both QR and Hadamard rotations stay below the bound.
 
-![MSE Bounds](https://github.com/syedMohib44/kvquant/blob/main/plots/1_mse_bounds?raw=true)
+![MSE Bounds](plots/1_mse_bounds.png)
 
 ---
 
@@ -32,7 +32,7 @@ KVQuant achieves per-element MSE well within the theoretical upper bound `(sqrt3
 
 Unlike the original KVQuant which uses a Gaussian approximation, we fit Lloyd-Max centroids directly to the **true unit-sphere marginal distribution** `f(t) alpha (1 - t^2)^{(d-3)/2}`. This gives tighter quantization, especially at low bit-widths and small `d`.
 
-![Codebook Centroids](https://github.com/syedMohib44/kvquant/blob/main/plots/2_codebook_centroids?raw=true)
+![Codebook Centroids](plots/2_codebook_centroids.png)
 
 ---
 
@@ -40,7 +40,7 @@ Unlike the original KVQuant which uses a Gaussian approximation, we fit Lloyd-Ma
 
 Random rotation (QR or Hadamard) transforms raw KV coordinates - which have arbitrary non-Gaussian distributions - into approximately N(0, 1/d), enabling optimal per-coordinate Lloyd-Max quantization.
 
-![Rotation Effect](https://github.com/syedMohib44/kvquant/blob/main/plots/3_rotation_effect?raw=true)
+![Rotation Effect](plots/3_rotation_effect.png)
 
 ---
 
@@ -48,7 +48,7 @@ Random rotation (QR or Hadamard) transforms raw KV coordinates - which have arbi
 
 Rather than allocating bits uniformly, AWQ assigns more bits to tokens that receive high attention from queries. At the same average bit-width, this reduces **attention-weighted distortion by 56.5% on average** across all distilgpt2 layers.
 
-![Attention-Weighted Quantization](https://github.com/syedMohib44/kvquant/blob/main/plots/4_attention_weighted?raw=true)
+![Attention-Weighted Quantization](plots/4_attention_weighted.png)
 
 ---
 
@@ -56,7 +56,7 @@ Rather than allocating bits uniformly, AWQ assigns more bits to tokens that rece
 
 Consecutive KV vectors are highly correlated. Compressing token-to-token deltas `delta_t = k_t - k(cap)_{t-1}` instead of absolute vectors gives **1.1--2.2x lower MSE**, especially in early layers with smoother trajectories.
 
-![Delta Compression](https://github.com/syedMohib44/kvquant/blob/main/plots/5_delta_compression?raw=true)
+![Delta Compression](plots/5_delta_compression.png)
 
 ---
 
@@ -64,7 +64,7 @@ Consecutive KV vectors are highly correlated. Compressing token-to-token deltas 
 
 Token importance evolves during generation. An EMA-based importance tracker dynamically reassigns bit-widths as attention scores accumulate, giving more bits to tokens that prove important over time.
 
-![Adaptive Allocation](https://github.com/syedMohib44/kvquant/blob/main/plots/6_adaptive_allocation?raw=true)
+![Adaptive Allocation](plots/6_adaptive_allocation.png)
 
 ---
 
@@ -72,7 +72,7 @@ Token importance evolves during generation. An EMA-based importance tracker dyna
 
 Quantization error `R = K - k(cap)` is structured - its top singular vectors capture most of the error energy. A rank-r SVD correction reduces MSE by **~11% at rank-4** using only 6.3% extra storage.
 
-![Low-Rank Correction](https://github.com/syedMohib44/kvquant/blob/main/plots/7_low_rank_correction?raw=true)
+![Low-Rank Correction](plots/7_low_rank_correction.png)
 
 ---
 
@@ -80,7 +80,7 @@ Quantization error `R = K - k(cap)` is structured - its top singular vectors cap
 
 Codebook indices are non-uniformly distributed after rotation. Huffman coding reduces storage toward the Shannon entropy - at 4-bit, d=128: ~5% savings.
 
-![Entropy Coding](https://github.com/syedMohib44/kvquant/blob/main/plots/8_entropy_coding?raw=true)
+![Entropy Coding](plots/8_entropy_coding.png)
 
 ---
 
@@ -88,7 +88,7 @@ Codebook indices are non-uniformly distributed after rotation. Huffman coding re
 
 End-to-end comparison of baseline KVQuant vs the combined KVQUANT pipeline across all layers and bit-widths.
 
-![Pipeline Comparison](https://github.com/syedMohib44/kvquant/blob/main/plots/9_pipeline_comparison?raw=true)
+![Pipeline Comparison](plots/9_pipeline_comparison.png)
 
 ---
 
@@ -96,7 +96,7 @@ End-to-end comparison of baseline KVQuant vs the combined KVQUANT pipeline acros
 
 Storage cost vs reconstruction quality across configurations.
 
-![Compression Ratio](https://github.com/syedMohib44/kvquant/blob/main/plots/10_ratio_check?raw=true)
+![Compression Ratio](plots/10_ratio_check.png)
 
 ---
 
@@ -104,7 +104,7 @@ Storage cost vs reconstruction quality across configurations.
 
 End-to-end perplexity on distilgpt2 confirms that quantization quality improvements preserve language modelling performance.
 
-![Perplexity Validation](https://github.com/syedMohib44/kvquant/blob/main/plots/11_perplexity_validation?raw=true)
+![Perplexity Validation](plots/11_perplexity_validation.png)
 
 ---
 
@@ -190,7 +190,7 @@ python -m kvquant.demo_llm --model TinyLlama/... --prompt "..." \
 #########################
 
 python -m kvquant.demo_extensions   # all 5 extensions on real data
-python -m kvquant.visualize         # regenerate all plots -> https://github.com/syedMohib44/kvquant/blob/main/plots/
+python -m kvquant.visualize         # regenerate all plots -> plots/
 ```
 
 ---
@@ -288,8 +288,9 @@ python -m kvquant.demo_llm --prompt "Hi how are you?"
 
 ```bibtex
 @misc{kvquantpp2025,
-  title   = {KVQuant: Attention Aware, Structure Exploiting Extensions to KV Cache Compression via Near Optimal Vector Quantization},
+  title   = {KVQUANT: Attention-Aware and Structure-Exploiting Extensions
+             to Near-Optimal Vector Quantization for KV Cache Compression},
   year    = {2025},
-  note    = {Extensions of TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate (Zandieh et al., arXiv:2504.19874)}
+  note    = {Extensions of KVQuant (Zandieh et al., arXiv:2504.19874)}
 }
 ```
