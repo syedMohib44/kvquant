@@ -1,3 +1,5 @@
+**[Read the Paper (PDF)](https://osf.io/9wskz/files/xzb7d)** | **[View on GitHub](https://github.com/syedMohib44/kvquant)**
+
 # KVQUANT
 
 **Attention-aware KV cache quantization for LLM inference.**
