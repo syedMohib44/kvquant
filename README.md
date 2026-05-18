@@ -1,4 +1,4 @@
-**[Read the Paper (PDF)](https://osf.io/9wskz/files/xzb7d)** | **[View on GitHub](https://github.com/syedMohib44/kvquant)**
+**[Read the Paper (PDF)](https://osf.io/9wskz/files/xzb7d)** | **[DOI: 10.17605/OSF.IO/9WSKZ](https://doi.org/10.17605/OSF.IO/9WSKZ)** | **[View on GitHub](https://github.com/syedMohib44/kvquant)**
 
 # KVQUANT
 
@@ -291,7 +291,10 @@ python -m kvquant.demo_llm --prompt "Hi how are you?"
 ```bibtex
 @misc{kvquantpp2025,
   title   = {KVQuant: Attention Aware, Structure Exploiting Extensions to KV Cache Compression via Near Optimal Vector Quantization},
+  author  = {Uddin, Syed Muheeb},
   year    = {2025},
+  doi     = {10.17605/OSF.IO/9WSKZ},
+  url     = {https://doi.org/10.17605/OSF.IO/9WSKZ},
   note    = {Extensions of TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate (Zandieh et al., arXiv:2504.19874)}
 }
 ```
