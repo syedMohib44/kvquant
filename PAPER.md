@@ -1,4 +1,4 @@
-# KVQuant: Attention Aware, Structure Exploiting Extensions to KV Cache Compression via Near Optimal Vector Quantization
+# TurboQuant++: Attention-Aware and Structure-Exploiting Extensions to Near-Optimal KV Cache Vector Quantization
 
 ---
 
