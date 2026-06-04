@@ -22,6 +22,7 @@ production system would add entropy coding on top.
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -68,15 +69,31 @@ class KVCacheQuantizer(nn.Module):
         regular_bits: int | None = None,
         use_hadamard: bool = False,
         seed: int = 0,
+        gqa_factor: int = 1,
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
         self.num_bits = num_bits
         self.use_outlier = use_outlier
+        self.gqa_factor = gqa_factor
+
+        # GQA amplification: each KV head is shared by g = n_heads/n_kv_heads query
+        # heads, so the effective attention-weighted distortion is g × D_mse.
+        # To keep quality constant: g × 4^{-b_eff} = 4^{-b_req}
+        # → b_eff = b_req + log4(g) = b_req + log(g)/log(4).
+        # For g=1 (MHA) +0; g=4 +1; g=6/7 (Qwen2.5) +2; g=32 (Llama-3) +3.
+        # Capped at 8 (Lloyd-Max codebook now supports 1–8 bits; 8-bit = 256 centroids).
+        # We apply gqa_extra to BOTH effective_bits AND any caller-supplied
+        # outlier/regular bits so the compensation is never bypassed.
+        _MAX_BITS = 8
+        gqa_extra = math.ceil(math.log(max(gqa_factor, 1), 4)) if gqa_factor > 1 else 0
+        effective_bits = min(num_bits + gqa_extra, _MAX_BITS)
 
         if use_outlier:
-            ob = outlier_bits if outlier_bits is not None else min(num_bits + 1, 4)
-            rb = regular_bits if regular_bits is not None else max(num_bits - 1, 1)
+            ob_base = outlier_bits if outlier_bits is not None else num_bits + 1
+            rb_base = regular_bits if regular_bits is not None else num_bits - 1
+            ob = min(ob_base + gqa_extra, _MAX_BITS)
+            rb = min(max(rb_base + gqa_extra, 1), _MAX_BITS)
             # K: KVQuantIP  inner-product optimal (attention scores use Q @ K^T)
             self.k_quant = OutlierKVQuant(
                 head_dim, n_outlier, ob, rb, seed=seed,
@@ -90,12 +107,12 @@ class KVCacheQuantizer(nn.Module):
         else:
             # K: KVQuantIP preserves inner products for attention scores
             self.k_quant = KVQuantIP(
-                head_dim, num_bits, seed=seed, qjl_seed=seed + 1,
+                head_dim, effective_bits, seed=seed, qjl_seed=seed + 1,
                 use_hadamard=use_hadamard,
             )
             # V: KVQuantMSE minimises reconstruction MSE for output values
             self.v_quant = KVQuantMSE(
-                head_dim, num_bits, seed=seed + 2,
+                head_dim, effective_bits, seed=seed + 2,
                 use_hadamard=use_hadamard,
             )
 
@@ -178,7 +195,8 @@ class KVCacheQuantizer(nn.Module):
         return float(self.num_bits)
 
     def extra_repr(self) -> str:
+        gqa = f", gqa_factor={self.gqa_factor}" if self.gqa_factor > 1 else ""
         return (
             f"head_dim={self.head_dim}, num_bits={self.num_bits}, "
-            f"use_outlier={self.use_outlier}, avg_bits={self.avg_bits:.2f}"
+            f"use_outlier={self.use_outlier}, avg_bits={self.avg_bits:.2f}{gqa}"
         )

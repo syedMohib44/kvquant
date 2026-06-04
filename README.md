@@ -189,6 +189,11 @@ python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "
 python -m kvquant.demo_llm --model TinyLlama/... --prompt "..." \
   --product-quant --pq-bits 8 --pq-subspaces 16 --correction-rank 4
 
+
+python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --prompt "What is the capital of France?" --max-new-tokens 20 --correction-rank 4
+
+
+python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --prompt "What is the capital of France?" --max-new-tokens 40 --correction-rank 8
 #########################
 
 python -m kvquant.demo_extensions   # all 5 extensions on real data

@@ -215,15 +215,21 @@ def _crop_cache(native_cache, seq_len: int):
     return cache
 
 
-def _quantize_cache(native_cache, kvc, correction_rank: int = 0):
+def _quantize_cache(native_cache, kvc_or_list, correction_rank: int = 0):
     """
     Return a COPY of native_cache with K, V quantized in transformer-attention
     layers.  Linear/state-space state is left untouched so hybrid models (Qwen3.5,
     Mamba, …) continue to work correctly.
+
+    kvc_or_list: a single KVCacheQuantizer (applied to all layers) OR a list of
+    KVCacheQuantizers (one per transformer attention layer, in order).  Per-layer
+    quantizers give better quality because each layer has its own outlier-channel
+    profile and bit allocation.
     """
     cache_q = copy.deepcopy(native_cache)
+    _is_list = isinstance(kvc_or_list, list)
 
-    def _quant_pair(k, v):
+    def _quant_pair(k, v, kvc):
         """Quantize a (k, v) pair, optionally apply low-rank correction, cast back."""
         dtype = k.dtype
         k_hat, v_hat = kvc.decompress_kv(*kvc.compress_kv(k.float(), v.float()))
@@ -234,27 +240,36 @@ def _quantize_cache(native_cache, kvc, correction_rank: int = 0):
 
     # New-style DynamicCache
     if hasattr(cache_q, "layers"):
+        kv_idx = 0
         for layer in cache_q.layers:
             k = getattr(layer, "keys", None)
             v = getattr(layer, "values", None)
             if isinstance(k, torch.Tensor):
-                layer.keys, layer.values = _quant_pair(k, v)
+                kvc = kvc_or_list[kv_idx] if _is_list else kvc_or_list
+                layer.keys, layer.values = _quant_pair(k, v, kvc)
+                kv_idx += 1
         return cache_q
 
     # Old-style DynamicCache / HybridCache
     if hasattr(cache_q, "key_cache"):
+        kv_idx = 0
         for i in range(len(cache_q.key_cache)):
             k, v = cache_q.key_cache[i], cache_q.value_cache[i]
             if isinstance(k, torch.Tensor):
-                cache_q.key_cache[i], cache_q.value_cache[i] = _quant_pair(k, v)
+                kvc = kvc_or_list[kv_idx] if _is_list else kvc_or_list
+                cache_q.key_cache[i], cache_q.value_cache[i] = _quant_pair(k, v, kvc)
+                kv_idx += 1
         return cache_q
 
     # Legacy tuple-of-tuples (immutable - rebuild)
     if isinstance(native_cache, (tuple, list)):
         result = []
+        kv_idx = 0
         for k, v in native_cache:
             if isinstance(k, torch.Tensor):
-                result.append(_quant_pair(k, v))
+                kvc = kvc_or_list[kv_idx] if _is_list else kvc_or_list
+                result.append(_quant_pair(k, v, kvc))
+                kv_idx += 1
             else:
                 result.append((k, v))
         return tuple(result)
@@ -404,6 +419,7 @@ def main():
     model, tok = load_model(args.model)
     n_layers, n_heads, n_kv_heads, head_dim = get_model_dims(model)
     n_outlier = max(4, head_dim // 4)
+    gqa_factor = n_heads // n_kv_heads  # 1 for MHA; >1 for GQA (Qwen, Llama-3, …)
     hybrid = _is_hybrid_model(model)
 
     print(
@@ -519,15 +535,24 @@ def main():
 
         # Quantized generation - one pass per bit-width
         for bits in BITS_LIST:
-            kvc = KVCacheQuantizer(
-                head_dim=head_dim,
-                num_bits=bits,
-                use_outlier=True,
-                n_outlier=n_outlier,
-                outlier_bits=min(bits + 1, 4),
-                regular_bits=max(bits - 1, 1),
-            )
-            kvc.calibrate(all_k_p, all_v_p)
+            # Per-layer quantizers: calibrate each layer independently so that
+            # outlier channels are detected from that layer's own statistics.
+            # Layers can have very different KV distributions (early vs late layers),
+            # so a single shared quantizer misidentifies outliers for most layers.
+            kvc_layers = []
+            for lk, lv in cal_kvs:
+                kvc_l = KVCacheQuantizer(
+                    head_dim=head_dim,
+                    num_bits=bits,
+                    use_outlier=True,
+                    n_outlier=n_outlier,
+                    outlier_bits=min(bits + 1, 8),
+                    regular_bits=max(bits - 1, 1),
+                    gqa_factor=gqa_factor,
+                )
+                kvc_l.calibrate(lk, lv)
+                kvc_layers.append(kvc_l)
+            kvc = kvc_layers[0]  # for avg_bits label only
 
             # _quantize_cache deep-copies native_cache and quantizes K,V in-place.
             # For hybrid models the Mamba/linear-attn state is preserved in the copy,
@@ -537,9 +562,9 @@ def main():
             # residual is already small (0.011 MSE bound), so a rank-4 SVD picks
             # up numerical noise rather than signal and can hurt quality. At 2-bit
             # and 3-bit the residual is large and structured, so correction helps.
-            effective_rank = args.correction_rank if bits < 4 else 0
+            effective_rank = args.correction_rank if (bits < 4 or gqa_factor > 1) else 0
             past = _quantize_cache(
-                native_cache_orig, kvc, correction_rank=effective_rank
+                native_cache_orig, kvc_layers, correction_rank=effective_rank
             )
 
             # Greedy decode: get the first-token logit from the QUANTIZED cache
@@ -574,8 +599,14 @@ def main():
                     break
 
             gen_ids = torch.cat(generated, dim=1)
+            eff_bits = kvc.avg_bits
+            label = (
+                f"{bits}-bit"
+                if gqa_factor == 1
+                else f"{bits}-bit→{eff_bits:.0f}b (g={gqa_factor})"
+            )
             print(
-                f"  {bits}-bit  : {_clean(tok.decode(gen_ids[0], skip_special_tokens=True))}"
+                f"  {label}  : {_clean(tok.decode(gen_ids[0], skip_special_tokens=True))}"
             )
 
         # Product Quantization run (optional, --product-quant flag)
@@ -606,10 +637,16 @@ def main():
             # num_subspaces=16, bits_per_subspace=4
             # num_subspaces=8, bits_per_subspace=4
 
-            pq_kvc = ProductKVCache(head_dim, num_subspaces=args.pq_subspaces, bits_per_subspace=args.pq_bits)
+            pq_kvc = ProductKVCache(
+                head_dim,
+                num_subspaces=args.pq_subspaces,
+                bits_per_subspace=args.pq_bits,
+            )
             pq_kvc.calibrate(all_k_p, all_v_p)
 
-            past = _quantize_cache(native_cache_orig, pq_kvc, correction_rank=args.correction_rank)
+            past = _quantize_cache(
+                native_cache_orig, pq_kvc, correction_rank=args.correction_rank
+            )
             past_crop = _crop_cache(past, T_p - 1)
             with torch.no_grad():
                 q1_out = model(
@@ -680,8 +717,9 @@ def main():
             num_bits=bits,
             use_outlier=True,
             n_outlier=n_outlier,
-            outlier_bits=min(bits + 1, 4),
+            outlier_bits=min(bits + 1, 8),
             regular_bits=max(bits - 1, 1),
+            gqa_factor=gqa_factor,
         )
         kvc.calibrate(all_k, all_v)
 
@@ -714,8 +752,9 @@ def main():
             num_bits=bits,
             use_outlier=True,
             n_outlier=n_outlier,
-            outlier_bits=min(bits + 1, 4),
+            outlier_bits=min(bits + 1, 8),
             regular_bits=max(bits - 1, 1),
+            gqa_factor=gqa_factor,
         )
         kvc.calibrate(all_k, all_v)
         quant_kvs = _make_cache_dynamic(kvs, kvc)
@@ -737,6 +776,7 @@ def main():
         n_outlier=n_outlier,
         outlier_bits=4,
         regular_bits=3,
+        gqa_factor=gqa_factor,
     )
     kvc.calibrate(all_k, all_v)
     quant_kvs = _make_cache_dynamic(kvs, kvc)

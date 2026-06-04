@@ -196,6 +196,79 @@ eliminates the large intermediate tensor. In practice: $14\times$ faster at
 2-bit, $22\times$ faster at 4-bit (tested at $N=4096$, $d=128$). The same
 fix applies inside the Lloyd-Max solver's assignment step.
 
+\subsubsection{GQA Compensation and Per-Layer Calibration}
+
+\paragraph{GQA amplification.}
+Models with Grouped Query Attention (GQA) share each KV head across
+$g = n_{\text{heads}} / n_{\text{kv-heads}}$ query heads. Because the same
+quantized KV vector is used in $g$ independent attention computations, the
+effective per-head distortion is amplified:
+\begin{equation}
+  D_{\mathrm{eff}} \;\approx\; g \cdot D_{\mathrm{mse}}.
+  \label{eq:gqa_amp}
+\end{equation}
+For Qwen2.5-1.5B ($g=6$, $d=128$) even 4-bit quantization
+($D_{\mathrm{mse}} \leq 0.011$ from Eq.~\ref{eq:mse_bound}) gives
+$D_{\mathrm{eff}} \approx 0.066$, which is large enough to corrupt
+generation.
+
+\paragraph{Compensation formula.}
+We solve for the effective bit-width $b_{\mathrm{eff}}$ such that the
+amplified distortion of the GQA model matches the target of a standard
+$b$-bit MHA model:
+\begin{equation}
+  g \cdot \frac{\sqrt{3}\,\pi}{2} \cdot 4^{-b_{\mathrm{eff}}}
+  \;=\; \frac{\sqrt{3}\,\pi}{2} \cdot 4^{-b}
+  \quad\Rightarrow\quad
+  b_{\mathrm{eff}} \;=\; b + \log_4 g \;=\; b + \frac{\log g}{\log 4}.
+\end{equation}
+Since bit-widths must be integers we round up:
+$b_{\mathrm{eff}} = b + \lceil \log_4 g \rceil$.
+Concretely: $g=4$ adds $+1$ bit; $g=6$ or $g=7$ adds $+2$ bits;
+$g=32$ adds $+3$ bits. Effective bits are capped at 8 (the maximum supported
+by the Lloyd-Max solver with 256 centroids). The same adjustment is applied
+to the outlier and regular channel bit-widths in \texttt{OutlierKVQuant} so
+that GQA compensation cannot be bypassed by caller-supplied explicit
+bit-widths.
+
+\begin{lstlisting}[language=Python]
+# KVCacheQuantizer.__init__  (kv_cache.py)
+gqa_extra = math.ceil(math.log(max(gqa_factor, 1), 4)) \
+            if gqa_factor > 1 else 0
+effective_bits = min(num_bits + gqa_extra, 8)
+
+# GQA extra applied to outlier/regular bits as well
+ob = min(ob_base + gqa_extra, 8)
+rb = min(max(rb_base + gqa_extra, 1), 8)
+\end{lstlisting}
+
+\paragraph{Per-layer calibration.}
+\texttt{OutlierKVQuant} identifies outlier channels as those with the
+highest variance in the calibration data. Different transformer layers have
+completely different KV distributions---layer~0 may concentrate variance in
+dimensions $\{12, 47, 93\}$ while layer~15 concentrates it in
+$\{5, 61, 120\}$. Using a single quantizer calibrated on data pooled from
+all layers averages out these patterns and causes systematic misidentification
+of outlier channels in every individual layer.
+
+The correct approach is one \texttt{KVCacheQuantizer} per transformer layer,
+each calibrated independently on its own layer's KV data:
+
+\begin{lstlisting}[language=Python]
+kvc_layers = []
+for lk, lv in cal_kvs:   # cal_kvs[i] = (k_layer_i, v_layer_i)
+    kvc_l = KVCacheQuantizer(head_dim=head_dim, num_bits=bits,
+                             use_outlier=True, gqa_factor=gqa_factor)
+    kvc_l.calibrate(lk, lv)  # calibrate on this layer's data only
+    kvc_layers.append(kvc_l)
+\end{lstlisting}
+
+This is consistent with the paper's framework: the Lloyd-Max quantization
+theory is unchanged, and only the channel-identification step is made
+layer-specific. For MHA models with similar KV distributions across layers
+a single shared quantizer remains acceptable. For GQA models with deep
+per-layer specialisation, per-layer calibration is essential.
+
 \subsubsection{In-Place FWHT}
 
 The butterfly step in the Fast Walsh-Hadamard Transform was allocating two
@@ -535,8 +608,17 @@ might assume.
 
 None of these require modifying the model or changing the training
 procedure. They are all implemented as composable PyTorch modules in
-\texttt{kvquant/}, and they can be adopted in any combination. The full
-test suite of 88 unit tests passes cleanly.
+\texttt{kvquant/}, and they can be adopted in any combination.
+
+We also addressed two implementation issues specific to non-MHA architectures.
+GQA models amplify effective distortion by a factor of $g$ (the number of
+query heads per KV head); compensating with $\lceil \log_4 g \rceil$ extra
+bits per coordinate, capped at 8, restores generation quality on models such
+as Qwen2.5-1.5B ($g=6$) and Qwen2.5-7B ($g=7$). Per-layer calibration of
+the outlier detector, rather than pooling KV data across all transformer
+layers, correctly identifies the layer-specific channels that carry anomalous
+variance. Both fixes are active when \texttt{gqa\_factor} $> 1$ is passed to
+\texttt{KVCacheQuantizer}. The full test suite of 88 unit tests passes cleanly.
 
 % -----------------------------------------------------------------------
 \clearpage

@@ -380,9 +380,36 @@ On distilgpt2, rank-4 correction brings 2-bit dPPL from +276.64 down to +10.89 r
 
 **Composability.** The five extensions are designed to be stacked, but not all combinations are equally useful. Delta compression and attention-weighted bit assignment are complementary delta targets temporal correlation in absolute vectors, AWQ targets token importance. Low-rank correction is orthogonal to both. PQ, however, is a full replacement for the scalar KVQuantIP path and cannot be trivially combined with it at the same layer; it is best treated as an alternative quantization backend.
 
-**GQA amplification.** Models with Grouped Query Attention (GQA) share KV heads across multiple query heads. With a grouping factor $g = \text{num\_heads} / \text{kv\_heads}$, the effective per-attention-head distortion is:
+**GQA amplification and compensation.** Models with Grouped Query Attention (GQA) share KV heads across multiple query heads. With a grouping factor $g = \text{num\_heads} / \text{kv\_heads}$, the effective per-attention-head distortion is:
 $$D_{\text{eff}} \approx g \cdot D_{\text{mse}}.$$
-For Qwen2.5-1.5B ($g=6$, $d=128$) even 4-bit quantization (theoretical $D \leq 0.011$) gives $D_{\text{eff}} \approx 0.066$, which is large enough to corrupt generation. TinyLlama ($g=8$, $d=64$) survives because the smaller absolute head dimension yields smaller per-element error. This is a fundamental limitation of scalar quantization for high-GQA models: the minimum safe bit-width is approximately $b \geq \frac{1}{2} \log_4 \!\left(\frac{\sqrt{3}\,\pi\,g}{2\,D_{\max}}\right)$.
+For Qwen2.5-1.5B ($g=6$, $d=128$) even 4-bit quantization (theoretical $D \leq 0.011$) gives $D_{\text{eff}} \approx 0.066$, which is large enough to corrupt generation. TinyLlama ($g=8$, $d=64$) survives because the smaller absolute head dimension yields smaller per-element error.
+
+To compensate, we solve for the effective bit-width $b_{\text{eff}}$ such that the amplified distortion matches the target $D_{\text{target}}$ of a standard $b$-bit MHA model:
+$$g \cdot \frac{\sqrt{3}\,\pi}{2} \cdot 4^{-b_{\text{eff}}} \;=\; \frac{\sqrt{3}\,\pi}{2} \cdot 4^{-b}$$
+$$\Rightarrow \quad b_{\text{eff}} \;=\; b + \log_4(g) \;=\; b + \frac{\log g}{\log 4}.$$
+Since bit-widths must be integers, we round up: $b_{\text{eff}} = b + \lceil \log_4 g \rceil$. For $g=4$ this adds $+1$ bit; for $g=6$ or $g=7$ it adds $+2$ bits; for $g=32$ it adds $+3$ bits. Effective bits are capped at 8, which is the maximum supported by the Lloyd-Max solver (256 centroids). The same adjustment is applied to the outlier and regular channel bit-widths in `OutlierKVQuant` to ensure GQA compensation is not bypassed by caller-supplied explicit bit-widths.
+
+This is a fundamental limitation of scalar quantization for high-GQA models: the minimum safe bit-width is approximately $b \geq \frac{1}{2} \log_4 \!\left(\frac{\sqrt{3}\,\pi\,g}{2\,D_{\max}}\right)$. The GQA compensation is implemented in `KVCacheQuantizer` via a `gqa_factor` parameter:
+
+```python
+gqa_extra = math.ceil(math.log(max(gqa_factor, 1), 4)) if gqa_factor > 1 else 0
+effective_bits = min(num_bits + gqa_extra, 8)
+```
+
+**Per-layer calibration.** The original implementation used a single `KVCacheQuantizer` instance calibrated on KV data pooled from all transformer layers. This is incorrect for `OutlierKVQuant`: outlier channels are defined as those with the highest variance in the calibration data, and different transformer layers have completely different KV distributions. Layer 0 might have outlier variance concentrated in dimensions 12, 47, and 93; layer 15 might have it in dimensions 5, 61, and 120. Pooling calibration data across layers averages out these layer-specific patterns, causing the outlier detector to misidentify channels for every individual layer.
+
+The correct approach is one `KVCacheQuantizer` per transformer layer, each calibrated independently on its own layer's KV data. The per-layer calibration loop in `demo_llm.py` is:
+
+```python
+kvc_layers = []
+for lk, lv in cal_kvs:          # cal_kvs[i] = (k_layer_i, v_layer_i)
+    kvc_l = KVCacheQuantizer(head_dim=head_dim, num_bits=bits,
+                             use_outlier=True, gqa_factor=gqa_factor, ...)
+    kvc_l.calibrate(lk, lv)     # calibrate on this layer's data only
+    kvc_layers.append(kvc_l)
+```
+
+This aligns with the paper's framework: outlier channel detection should use each layer's own KV statistics. The underlying Lloyd-Max quantization theory is unchanged --- only the channel identification step is now layer-specific. For MHA models with uniform KV distributions across layers, a single shared quantizer remains acceptable, but for GQA models with deep per-layer specialisation, per-layer calibration is essential for correct outlier identification.
 
 **PQ encode speed.** The current PQ implementation encodes new tokens with $M$ sequential `cdist` calls in Python. For $M=16$, $K=256$, this is roughly 16x slower per append than scalar `bucketize`. At short contexts the overhead is acceptable; at very long contexts (thousands of tokens appended during generation) it becomes the bottleneck. A batched CUDA kernel that performs all $M$ nearest-centroid lookups in one pass would close most of this gap.
 
@@ -398,7 +425,9 @@ The core insight behind KVQuant rotate into an approximately isotropic distribut
 
 Attention-weighted quantization aligns the bit budget with what the model actually attends to. Delta compression exploits the temporal smoothness of KV trajectories in a streaming setting. Adaptive allocation adjusts to importance that you couldn't have known at compression time. Low-rank correction recovers structure from an error that isn't as random as you might assume.
 
-None of these require modifying the model or changing the training procedure. They're all implemented as composable PyTorch modules in `kvquant/`, and they can be adopted in any combination. Four further improvements strengthen the implementation: k-means++ seeding reduces Lloyd-Max initialisation MSE by up to 75% at low bit-widths; K-V asymmetric quantization cuts V reconstruction error by 61.5% at a lower bit budget; combining delta compression with outlier-aware quantization reduces V MSE by 95.4% versus same-budget scalar; and Hadamard rotation is now a configurable parameter throughout the stack. The full test suite (88 tests) passes cleanly.
+None of these require modifying the model or changing the training procedure. They're all implemented as composable PyTorch modules in `kvquant/`, and they can be adopted in any combination. Four further improvements strengthen the implementation: k-means++ seeding reduces Lloyd-Max initialisation MSE by up to 75% at low bit-widths; K-V asymmetric quantization cuts V reconstruction error by 61.5% at a lower bit budget; combining delta compression with outlier-aware quantization reduces V MSE by 95.4% versus same-budget scalar; and Hadamard rotation is now a configurable parameter throughout the stack.
+
+Two additional fixes address non-MHA architectures. GQA models amplify effective distortion by $g$ (query heads per KV head); compensating with $\lceil \log_4 g \rceil$ extra bits per coordinate, capped at 8, restores generation quality on Qwen2.5-1.5B ($g=6$) and Qwen2.5-7B ($g=7$). Per-layer calibration of the outlier detector, rather than pooling KV data across all transformer layers, correctly identifies the layer-specific channels that carry anomalous variance. The full test suite (88 tests) passes cleanly.
 
 ---
 

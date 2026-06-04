@@ -101,7 +101,7 @@ class KVQuantMSE(nn.Module):
         use_hadamard: bool | None = None,
     ) -> None:
         super().__init__()
-        assert 1 <= num_bits <= 4, "num_bits must be 1–4"
+        assert 1 <= num_bits <= 8, "num_bits must be 1–8"
         self.dim = dim
         self.num_bits = num_bits
 
@@ -256,7 +256,7 @@ class KVQuantIP(nn.Module):
         use_hadamard: bool | None = None,
     ) -> None:
         super().__init__()
-        assert 1 <= num_bits <= 4, "num_bits must be 1–4"
+        assert 1 <= num_bits <= 8, "num_bits must be 1–8"
         self.dim = dim
         self.num_bits = num_bits
         self.mse_bits = max(0, num_bits - 1)

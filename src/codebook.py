@@ -166,7 +166,7 @@ def build_codebook(
         boundaries: Tensor of shape (2**num_bits - 1,)  - midpoints between
                     consecutive centroids, ready for ``torch.bucketize``.
     """
-    assert 1 <= num_bits <= 4, "Only 1–4 bits/coordinate are supported."
+    assert 1 <= num_bits <= 8, "Only 1–8 bits/coordinate are supported."
     key = (num_bits, dim)
     if key not in _CACHE:
         c = _lloyd_max(num_bits, dim)
