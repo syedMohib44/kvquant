@@ -1,4 +1,4 @@
-# TurboQuant++: Attention-Aware and Structure-Exploiting Extensions to Near-Optimal KV Cache Vector Quantization
+# KVQuant++: Attention-Aware and Structure-Exploiting Extensions to Near-Optimal KV Cache Vector Quantization
 
 ---
 

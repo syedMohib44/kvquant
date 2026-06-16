@@ -291,6 +291,69 @@ python -m kvquant.demo_llm --prompt "Hi how are you?"
 
 ---
 
+## Publishing to PyPI
+
+### Build the package
+
+Run from the **parent** directory of `kvquant/` (i.e., one level up):
+
+```bash
+cd ..
+python -m build kvquant
+```
+
+This produces two files in `kvquant/dist/`:
+- `kvquant_plus_plus-x.x.x-py3-none-any.whl`
+- `kvquant_plus_plus-x.x.x.tar.gz`
+
+### Upload to PyPI
+
+```bash
+twine upload kvquant/dist/kvquant_plus_plus-x.x.x*
+```
+
+Credentials are read from `~/.pypirc`:
+
+```ini
+[pypi]
+username = __token__
+password = pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Or via environment variables:
+
+```bash
+set TWINE_USERNAME=__token__
+set TWINE_PASSWORD=pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+twine upload kvquant/dist/*
+```
+
+### Version bumps
+
+Update `version` in `pyproject.toml` before each release. PyPI does not allow overwriting an existing version.
+
+```toml
+[project]
+version = "0.1.2"
+```
+
+Then rebuild and upload:
+
+```bash
+python -m build kvquant
+twine upload kvquant/dist/kvquant_plus_plus-0.1.2*
+```
+
+### Install from PyPI
+
+```bash
+pip install kvquant-plus-plus
+```
+
+PyPI page: https://pypi.org/project/kvquant-plus-plus/
+
+---
+
 ## Citation
 
 ```bibtex

@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kvquant"
-version = "0.1.0"
-description = "Attention-aware KV cache quantization for LLM inference (KVQuant extensions)"
+name = "kvquant-plus-plus"
+version = "0.1.1"
+description = "Attention-aware KV cache quantization for LLM inference (KVQuant++ extensions)"
 readme = "PAPER.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -21,8 +21,11 @@ dev = [
     "pytest>=7.4.0",
 ]
 
-[tool.setuptools.packages]
-find = {where = [".."], include = ["kvquant"]}
+[tool.setuptools]
+packages = ["kvquant"]
+
+[tool.setuptools.package-dir]
+"kvquant" = "src"
 
 [tool.pytest.ini_options]
 testpaths = ["."]
