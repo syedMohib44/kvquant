@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .quantizer import KVQuantMSE, QuantizedMSE
+from .csrc import softmax_triton
 
 
 class AttentionWeightedQuantizer(nn.Module):
@@ -90,7 +91,7 @@ class AttentionWeightedQuantizer(nn.Module):
         # Attention weights: softmax(q @ K^T / sqrt(d))  -> (N, T)
         scores = (query_flat @ keys_flat.transpose(-2, -1)).squeeze(1)  # (N, T)
         scores = scores / math.sqrt(self.dim)
-        weights = F.softmax(scores, dim=-1)  # (N, T)
+        weights = softmax_triton(scores, dim=-1)  # (N, T)
 
         # Split tokens by attention weight - top fraction -> hi_bits
         k_hi = max(1, int(T * self.top_fraction))

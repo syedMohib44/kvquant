@@ -49,6 +49,30 @@ from .rotation import RandomRotation, HadamardRotation
 
 
 # ---------------------------------------------------------------------------
+# Compiled QJL projection  (fuses matmul + comparison into one CUDA kernel)
+# ---------------------------------------------------------------------------
+
+def _qjl_project(r_unit: Tensor, S: Tensor):
+    """sign(r_unit @ S.T) — fused by torch.compile on CUDA."""
+    return r_unit @ S.T > 0
+
+
+_qjl_project_compiled = None
+
+
+def _qjl_project_dispatch(r_unit: Tensor, S: Tensor):
+    global _qjl_project_compiled
+    if r_unit.is_cuda:
+        if _qjl_project_compiled is None:
+            try:
+                _qjl_project_compiled = torch.compile(_qjl_project)
+            except Exception:
+                _qjl_project_compiled = _qjl_project
+        return _qjl_project_compiled(r_unit, S)
+    return _qjl_project(r_unit, S)
+
+
+# ---------------------------------------------------------------------------
 # Return types
 # ---------------------------------------------------------------------------
 
@@ -309,9 +333,8 @@ class KVQuantIP(nn.Module):
         r_unit = x_unit - x_hat_unit  # (N, d)
         r_norm = r_unit.norm(dim=-1, keepdim=True)  # (N, 1)
 
-        # sign(S @ r_unit), S is (d, d) - computed as r_unit @ S.T
-        qjl_proj = r_unit @ self.S.T  # (N, d)
-        qjl_bits = qjl_proj > 0  # (N, d) bool
+        # sign(S @ r_unit) — fused matmul+compare via torch.compile on CUDA
+        qjl_bits = _qjl_project_dispatch(r_unit, self.S)  # (N, d) bool
 
         return QuantizedIP(
             indices=indices.reshape(*shape[:-1], self.dim),

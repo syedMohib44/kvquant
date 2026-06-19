@@ -25,6 +25,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .rotation import HadamardRotation
+from .csrc import pq_encode_triton
 
 
 # ---------------------------------------------------------------------------
@@ -205,22 +206,15 @@ class ProductQuantizer(nn.Module):
 
         shape = x.shape
         flat = x.reshape(-1, self.dim).float()  # (N, dim)
-        N = flat.shape[0]
 
         norms = flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         y = self.rotation(flat / norms)  # (N, dim)
-        y_split = y.reshape(N, self.M, self.sub_dim)  # (N, M, sub_dim)
 
-        codes = torch.zeros(N, self.M, dtype=torch.long, device=x.device)
         books = self.codebooks.to(x.device)  # (M, K, sub_dim)
 
-        for m in range(self.M):
-            # Pairwise distances between N sub-vectors and K centroids
-            dists = torch.cdist(
-                y_split[:, m, :].contiguous(),  # (N, sub_dim)
-                books[m],  # (K, sub_dim)
-            )  # (N, K)
-            codes[:, m] = dists.argmin(dim=-1)  # (N,)
+        # Triton kernel fuses all M subspace lookups into one GPU launch;
+        # falls back to sequential cdist on CPU or when Triton is unavailable.
+        codes = pq_encode_triton(y, books)  # (N, M) int64
 
         return QuantizedPQ(codes=codes, norms=norms, shape=shape)
 
