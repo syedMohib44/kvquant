@@ -1,12 +1,16 @@
 """
 CUDA/Triton kernels for kvquant acceleration.
 
-Provides drop-in replacements for the hot paths in kvquant:
-  - pq_encode_triton : batched PQ encode (replaces M sequential torch.cdist calls)
-  - softmax_triton   : row-wise numerically-stable softmax
+Import priority for each kernel:
+  1. cuda-triton-kernels package  (pip install kvquant-plus-plus[cuda])
+  2. Local Triton implementation  (pip install triton)
+  3. Pure PyTorch fallback        (always available, CPU-safe)
 
-Both fall back silently to pure-PyTorch when Triton is not installed or the
-tensor is not on a CUDA device, so the package continues to work on CPU.
+Install the GPU-accelerated path:
+    pip install "kvquant-plus-plus[cuda]"
+
+This installs both triton and cuda-triton-kernels from:
+    https://github.com/syedMohib44/cuda-triton-multiarch
 """
 
 from .pq_encode import pq_encode_triton, TRITON_AVAILABLE

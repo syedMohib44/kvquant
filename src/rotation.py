@@ -162,15 +162,27 @@ _fwht_compiled: "None | callable" = None
 def _fwht(x: Tensor) -> Tensor:
     """
     FWHT dispatcher: uses a torch.compile-d version on CUDA (2-3x faster),
-    falls back to the pure-Python loop on CPU.
+    falls back to the pure-Python loop on CPU or when compile is unavailable.
+
+    Backend priority:
+      1. inductor  — requires Triton (Linux/WSL); fuses into a single kernel
+      2. cudagraphs — no Triton needed; replays the CUDA graph, eliminates
+                      Python loop overhead on subsequent calls
+      3. plain     — pure-Python butterfly loop (CPU or fallback)
     """
     global _fwht_compiled
     if x.is_cuda:
         if _fwht_compiled is None:
-            try:
-                _fwht_compiled = torch.compile(_fwht_impl)
-            except Exception:
-                # torch.compile unavailable (PyTorch < 2.0) — use plain impl
+            for backend in ("inductor", "cudagraphs"):
+                try:
+                    candidate = torch.compile(_fwht_impl, backend=backend)
+                    # Smoke-test with a small tensor to catch TritonMissing early
+                    _ = candidate(torch.zeros(2, 2, device=x.device))
+                    _fwht_compiled = candidate
+                    break
+                except Exception:
+                    continue
+            if _fwht_compiled is None:
                 _fwht_compiled = _fwht_impl
         return _fwht_compiled(x)
     return _fwht_impl(x)

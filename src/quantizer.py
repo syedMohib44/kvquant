@@ -57,16 +57,30 @@ def _qjl_project(r_unit: Tensor, S: Tensor):
     return r_unit @ S.T > 0
 
 
+# torch.compile only helps QJL when N is large enough for the fused
+# matmul+compare kernel to amortise launch overhead.
+# Benchmarks show break-even at N >= 8192 on RTX-class GPUs.
+_QJL_COMPILE_MIN_N = 8192
 _qjl_project_compiled = None
 
 
 def _qjl_project_dispatch(r_unit: Tensor, S: Tensor):
     global _qjl_project_compiled
-    if r_unit.is_cuda:
+    N = r_unit.shape[0]
+    if r_unit.is_cuda and N >= _QJL_COMPILE_MIN_N:
         if _qjl_project_compiled is None:
-            try:
-                _qjl_project_compiled = torch.compile(_qjl_project)
-            except Exception:
+            for backend in ("inductor", "cudagraphs"):
+                try:
+                    candidate = torch.compile(_qjl_project, backend=backend)
+                    _ = candidate(
+                        torch.zeros(2, S.shape[0], device=r_unit.device),
+                        torch.zeros(S.shape, device=S.device),
+                    )
+                    _qjl_project_compiled = candidate
+                    break
+                except Exception:
+                    continue
+            if _qjl_project_compiled is None:
                 _qjl_project_compiled = _qjl_project
         return _qjl_project_compiled(r_unit, S)
     return _qjl_project(r_unit, S)

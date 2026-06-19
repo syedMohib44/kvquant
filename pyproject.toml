@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvquant-plus-plus"
-version = "0.1.1"
+version = "0.1.2"
 description = "Attention-aware KV cache quantization for LLM inference (KVQuant++ extensions)"
 readme = "PAPER.md"
 requires-python = ">=3.10"
@@ -21,14 +21,18 @@ dev = [
     "pytest>=7.4.0",
 ]
 cuda = [
-    "triton>=2.1.0",
+    "triton>=2.1.0; sys_platform != 'win32'",
+    "triton-windows>=3.1.0; sys_platform == 'win32'",
+    # cuda-triton-kernels will be added here once published to PyPI
+    # pip install "git+https://github.com/syedMohib44/cuda-triton-multiarch#egg=cuda-triton-kernels"
 ]
 
 [tool.setuptools]
-packages = ["kvquant"]
+packages = ["kvquant", "kvquant.csrc"]
 
 [tool.setuptools.package-dir]
 "kvquant" = "src"
+"kvquant.csrc" = "src/csrc"
 
 [tool.pytest.ini_options]
 testpaths = ["."]

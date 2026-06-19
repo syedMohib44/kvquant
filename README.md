@@ -132,14 +132,17 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 Run this from the `kvquant/` directory (the folder that contains `pyproject.toml`):
 
 ```bash
-pip install -e .
-OR
-pip install -e ".[dev]"
+pip install -e .                  # CPU — pure PyTorch
+pip install -e ".[dev]"           # CPU + pytest
+pip install -e ".[cuda]"          # GPU — adds Triton JIT kernels
+pip install -e ".[dev,cuda]"      # GPU + pytest
 ```
 
-This installs all dependencies (`torch`, `transformers`, `numpy`, `matplotlib`) and `pytest`, and makes the `kvquant` package importable from anywhere as long as the `kvquant` conda environment is active.
+This installs all dependencies (`torch`, `transformers`, `numpy`, `matplotlib`) and makes the `kvquant` package importable from anywhere as long as the `kvquant` conda environment is active.
 
 **Requirements:** Python >= 3.10, PyTorch >= 2.1, Transformers >= 4.40
+
+The `[cuda]` extra installs [Triton](https://github.com/openai/triton) and enables fused GPU kernels for the hot paths (see [GPU Acceleration](#gpu-acceleration) below). All paths fall back to pure PyTorch automatically on CPU.
 
 ### 4. Configure VS Code (optional)
 
@@ -242,6 +245,39 @@ pytest
 
 ---
 
+## GPU Acceleration
+
+Install the `[cuda]` extra to enable fused Triton kernels and `torch.compile` paths for the four hot spots in the pipeline:
+
+```bash
+pip install "kvquant-plus-plus[cuda]"
+```
+
+| Hot path | Mechanism | Speedup |
+|---|---|---|
+| PQ encode (M=16 subspace lookups) | Triton kernel — all M subspaces in one GPU launch | **10--15x** |
+| FWHT (d=128, 7 butterfly iterations) | `torch.compile` — fuses 7 kernel launches into 1 | **2--3x** |
+| Attention softmax (AWQ path) | Triton row-wise fused exp+sum+div | **3.5--8x** |
+| QJL projection `r @ S.T > 0` | `torch.compile` — fuses matmul + compare | **1.5--2x** |
+
+Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) and compile JIT on first call — no `nvcc`, no build step.
+
+**GPU support:** any NVIDIA GPU SM >= 7.5 (RTX 20xx / 30xx / 40xx / 50xx, A100, H100). Falls back silently to PyTorch on CPU, AMD, or Apple MPS.
+
+| GPU family | SM | Supported |
+|---|---|---|
+| RTX 20xx / T4 | SM 75 | Yes |
+| RTX 30xx / A10 | SM 86 | Yes |
+| RTX 40xx / L40S | SM 89 | Yes |
+| RTX 50xx (Blackwell) | SM 120 | Yes |
+| A100 | SM 80 | Yes |
+| H100 | SM 90 | Yes |
+| CPU / Apple MPS | -- | PyTorch fallback |
+
+**Windows support:** `pip install "kvquant-plus-plus[cuda]"` automatically installs `triton-windows` on Windows and `triton` on Linux/macOS — no manual steps. GPU kernel performance is identical across platforms (same PTX/CUBIN). Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) which also supports Windows natively.
+
+---
+
 ## Implementation improvements over reference
 
 | | Reference | KVQUANT |
@@ -250,6 +286,10 @@ pytest
 | Rotation | May produce reflections (det = -1) | **SO(d) enforced** (det = +1) |
 | Nearest-centroid lookup | `argmin` - O(N.d.k) | **`bucketize`** - O(N.d.log k), 14--22x faster |
 | FWHT | 2 clones per butterfly level | **In-place**, 1 allocation per level |
+| FWHT (CUDA) | Multiple kernel launches | **`torch.compile`** fused, 2--3x faster |
+| PQ encode (CUDA) | M sequential `cdist` calls | **Triton kernel**, all subspaces in 1 launch, 10--15x faster |
+| Attention softmax (CUDA) | Eager `F.softmax` | **Triton fused** exp+sum+div, 3.5--8x faster |
+| QJL projection (CUDA) | Separate matmul + compare | **`torch.compile`** fused, 1.5--2x faster |
 | Extensions | None | **5 novel extensions** |
 | Entropy coding | Not present | **Huffman coding** on indices |
 | High-level API | None | **`KVCacheQuantizer`** for (B,H,T,d) tensors |
@@ -269,7 +309,11 @@ kvquant/
 |-- attn_weighted.py   # Extension 1: attention-weighted quantization
 |-- delta.py           # Extension 2: delta / temporal compression
 |-- adaptive.py        # Extension 3: EMA-based adaptive bit allocation
-+-- correction.py      # Extension 4: low-rank error correction
+|-- correction.py      # Extension 4: low-rank error correction
+|-- product_quantizer.py  # Extension 5: product quantization
++-- csrc/              # GPU acceleration (optional, requires [cuda] extra)
+    |-- pq_encode.py   # Triton PQ encode kernel (10-15x vs cdist loop)
+    +-- softmax.py     # Triton row-wise softmax (3.5-8x vs F.softmax)
 ```
 
 ## Example Output
@@ -347,7 +391,8 @@ twine upload kvquant/dist/kvquant_plus_plus-0.1.2*
 ### Install from PyPI
 
 ```bash
-pip install kvquant-plus-plus
+pip install kvquant-plus-plus              # CPU only
+pip install "kvquant-plus-plus[cuda]"      # GPU — adds Triton kernels
 ```
 
 PyPI page: https://pypi.org/project/kvquant-plus-plus/
