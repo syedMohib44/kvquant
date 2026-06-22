@@ -259,8 +259,47 @@ pip install "kvquant-plus-plus[cuda]"
 | FWHT (d=128, 7 butterfly iterations) | `torch.compile` — fuses 7 kernel launches into 1 | **2--3x** |
 | Attention softmax (AWQ path) | Triton row-wise fused exp+sum+div | **3.5--8x** |
 | QJL projection `r @ S.T > 0` | `torch.compile` — fuses matmul + compare | **1.5--2x** |
+| Flash attention (post-decompression) | WMMA / CuTe CUDA → Triton → PyTorch SDPA cascade | **up to native FA-2 speed** |
 
 Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) and compile JIT on first call — no `nvcc`, no build step.
+
+### Flash attention backend
+
+`pip install "kvquant-plus-plus[cuda]"` also installs `cuda-triton-kernels`, which provides `attention_bhsd` — a multi-head flash attention function for `(B, H, T, d)` tensors (KVQuant's native layout):
+
+```python
+from kvquant.csrc.attention import attention_bhsd, attention_backend
+
+# q, k, v: (batch, heads, seqlen, head_dim)
+out = attention_bhsd(q, k, v, is_causal=False)
+
+print(attention_backend())
+# → "flash_attn_cuda (WMMA)"           fastest — requires CUDA build step (see below)
+# → "flash_attn_cutlass (CuTe)"        fast — requires CUDA build step (see below)
+# → "flash_attention_triton (Triton)"  JIT — available with [cuda] install, no build
+# → "scaled_dot_product_attention (PyTorch)"  always available fallback
+```
+
+The Triton backend is active out of the box after `pip install "kvquant-plus-plus[cuda]"`. The WMMA and CuTe CUDA backends give additional speedups but require building C++ extensions from source (see below).
+
+### Optional: build CUDA flash attention extensions
+
+For maximum flash attention performance, build the CUDA extensions from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch). These require `nvcc` (CUDA Toolkit 12.x/13.x) and, on Windows, Visual Studio Build Tools 2019+.
+
+```bash
+git clone https://github.com/syedMohib44/cuda-triton-multiarch.git
+cd cuda-triton-multiarch
+
+# Linux / WSL2
+make build-fac            # WMMA FlashAttention (SM75/80/86/89/120)
+make build-fac-cutlass    # CuTe/CUTLASS FlashAttention (SM80+)
+
+# Windows (Native)
+powershell -ExecutionPolicy Bypass -File Makefile.windows.ps1 build-fac
+powershell -ExecutionPolicy Bypass -File Makefile.windows.ps1 build-fac-cutlass
+```
+
+After building, `attention_bhsd` automatically picks up the compiled extensions — no code changes needed. Check the active backend with `attention_backend()`.
 
 **GPU support:** any NVIDIA GPU SM >= 7.5 (RTX 20xx / 30xx / 40xx / 50xx, A100, H100). Falls back silently to PyTorch on CPU, AMD, or Apple MPS.
 
@@ -313,7 +352,8 @@ kvquant/
 |-- product_quantizer.py  # Extension 5: product quantization
 +-- csrc/              # GPU acceleration (optional, requires [cuda] extra)
     |-- pq_encode.py   # Triton PQ encode kernel (10-15x vs cdist loop)
-    +-- softmax.py     # Triton row-wise softmax (3.5-8x vs F.softmax)
+    |-- softmax.py     # Triton row-wise softmax (3.5-8x vs F.softmax)
+    +-- attention.py   # Flash attention bridge — WMMA/CuTe/Triton/SDPA cascade
 ```
 
 ## Example Output

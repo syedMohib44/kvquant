@@ -15,5 +15,6 @@ This installs both triton and cuda-triton-kernels from:
 
 from .pq_encode import pq_encode_triton, TRITON_AVAILABLE
 from .softmax import softmax_triton
+from .attention import attention_bhsd, attention_backend
 
-__all__ = ["pq_encode_triton", "softmax_triton", "TRITON_AVAILABLE"]
+__all__ = ["pq_encode_triton", "softmax_triton", "TRITON_AVAILABLE", "attention_bhsd", "attention_backend"]

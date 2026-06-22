@@ -23,8 +23,7 @@ dev = [
 cuda = [
     "triton>=2.1.0; sys_platform != 'win32'",
     "triton-windows>=3.1.0; sys_platform == 'win32'",
-    # cuda-triton-kernels will be added here once published to PyPI
-    # pip install "git+https://github.com/syedMohib44/cuda-triton-multiarch#egg=cuda-triton-kernels"
+    "cuda-triton-kernels @ git+https://github.com/syedMohib44/cuda-triton-multiarch.git",
 ]
 
 [tool.setuptools]
