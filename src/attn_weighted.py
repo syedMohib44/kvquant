@@ -43,11 +43,16 @@ class AttentionWeightedQuantizer(nn.Module):
     default, giving a 50/50 split. Adjust `top_fraction` to change the ratio.
 
     Args:
-        dim:          Head dimension d.
-        hi_bits:      Bits for high-attention tokens (default 4).
-        lo_bits:      Bits for low-attention tokens (default 2).
-        top_fraction: Fraction of tokens treated as high-attention (default 0.5).
-        seed:         RNG seed for the rotation matrices.
+        dim:            Head dimension d.
+        hi_bits:        Bits for high-attention tokens (default 4).
+        lo_bits:        Bits for low-attention tokens (default 2).
+        top_fraction:   Fraction of tokens treated as high-attention (default 0.5).
+        n_sink_tokens:  Number of leading tokens always placed in the hi group,
+                        regardless of their attention weight.  Sink tokens at
+                        positions 0..n_sink_tokens-1 attract disproportionate
+                        attention mass across layers and need precise
+                        representation (default 4).  Set to 0 to disable.
+        seed:           RNG seed for the rotation matrices.
     """
 
     def __init__(
@@ -56,6 +61,7 @@ class AttentionWeightedQuantizer(nn.Module):
         hi_bits: int = 4,
         lo_bits: int = 2,
         top_fraction: float = 0.5,
+        n_sink_tokens: int = 4,
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -64,6 +70,7 @@ class AttentionWeightedQuantizer(nn.Module):
         self.hi_bits = hi_bits
         self.lo_bits = lo_bits
         self.top_fraction = top_fraction
+        self.n_sink_tokens = n_sink_tokens
 
         self.hi_quantizer = KVQuantMSE(dim, hi_bits, seed=seed)
         self.lo_quantizer = KVQuantMSE(dim, lo_bits, seed=seed + 1)
@@ -93,11 +100,24 @@ class AttentionWeightedQuantizer(nn.Module):
         scores = scores / math.sqrt(self.dim)
         weights = softmax_triton(scores, dim=-1)  # (N, T)
 
-        # Split tokens by attention weight - top fraction -> hi_bits
-        k_hi = max(1, int(T * self.top_fraction))
-        _, top_idx = weights.topk(k_hi, dim=-1)  # (N, k_hi)
+        # Build top_mask: sink tokens are always hi, remaining budget goes to
+        # the top-attention tokens among non-sink positions.
+        n_sink = min(self.n_sink_tokens, T)
+        k_hi_total = max(n_sink, int(T * self.top_fraction))
+        k_hi_budget = k_hi_total - n_sink  # slots left after reserving sinks
+
         top_mask = torch.zeros(N, T, dtype=torch.bool, device=keys.device)
-        top_mask.scatter_(1, top_idx, True)
+        # Pin sink positions
+        if n_sink > 0:
+            top_mask[:, :n_sink] = True
+        # Fill remaining budget from non-sink positions by attention weight
+        if k_hi_budget > 0 and T > n_sink:
+            non_sink_weights = weights.clone()
+            non_sink_weights[:, :n_sink] = -float("inf")  # exclude sinks from topk
+            _, top_idx = non_sink_weights.topk(k_hi_budget, dim=-1)
+            top_mask.scatter_(1, top_idx, True)
+
+        k_hi = top_mask[0].sum().item()  # same for all N (deterministic)
 
         # Quantize each group
         hi_keys = keys_flat[top_mask].reshape(N, k_hi, self.dim)
@@ -141,7 +161,8 @@ class AttentionWeightedQuantizer(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"dim={self.dim}, hi_bits={self.hi_bits}, lo_bits={self.lo_bits}, "
-            f"top_fraction={self.top_fraction}, avg_bits={self.avg_bits:.2f}"
+            f"top_fraction={self.top_fraction}, n_sink={self.n_sink_tokens}, "
+            f"avg_bits={self.avg_bits:.2f}"
         )
 
 

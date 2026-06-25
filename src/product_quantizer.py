@@ -173,6 +173,8 @@ class ProductQuantizer(nn.Module):
                Should be a representative sample  the actual prefill KV
                vectors work well.
         """
+        if x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            x = x.to(torch.float32)
         flat = x.reshape(-1, self.dim).float()
 
         # Unit-normalise then rotate (same preprocessing as quantize)
@@ -205,6 +207,8 @@ class ProductQuantizer(nn.Module):
             raise RuntimeError("Call calibrate() before quantize().")
 
         shape = x.shape
+        if x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            x = x.to(torch.float32)
         flat = x.reshape(-1, self.dim).float()  # (N, dim)
 
         norms = flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)

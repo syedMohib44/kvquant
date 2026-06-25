@@ -65,6 +65,11 @@ class AdaptiveKVCache(nn.Module):
                           in the new tier for this many consecutive attend() calls
                           (default 2).  Prevents expensive recompression from
                           transient attention fluctuations.
+        n_sink_tokens:    Number of leading tokens always kept at hi_bits.
+                          Positions 0..n_sink_tokens-1 accumulate disproportionate
+                          attention mass (sink-token phenomenon) and must not be
+                          aggressively quantized regardless of their EMA score.
+                          Set to 0 to disable (default 4).
         seed:             RNG seed.
     """
 
@@ -80,6 +85,7 @@ class AdaptiveKVCache(nn.Module):
         evict_threshold: float = 0.001,
         ema_decay: float = 0.9,
         hysteresis_steps: int = 2,
+        n_sink_tokens: int = 4,
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -93,6 +99,7 @@ class AdaptiveKVCache(nn.Module):
         self.evict_threshold = evict_threshold
         self.ema_decay = ema_decay
         self.hysteresis_steps = hysteresis_steps
+        self.n_sink_tokens = n_sink_tokens
 
         # One quantizer per bit-width tier
         self._quantizers = nn.ModuleDict(
@@ -109,7 +116,11 @@ class AdaptiveKVCache(nn.Module):
     # ------------------------------------------------------------------
     def push(self, k: Tensor, v: Tensor) -> None:
         """
-        Add a new token to the cache at hi_bits initially.
+        Add a new token to the cache.
+
+        Tokens at positions 0..n_sink_tokens-1 are always stored at hi_bits and
+        will never be downgraded.  All other tokens start at hi_bits and may be
+        downgraded by attend() based on their importance score.
 
         Args:
             k: (..., head_dim)
@@ -154,6 +165,31 @@ class AdaptiveKVCache(nn.Module):
         new_k, new_v = [], []
         for t in range(T):
             ek = self._k_entries[t]
+
+            # Sink tokens: positions 0..n_sink_tokens-1 always stay at hi_bits.
+            # They accumulate attention mass regardless of the current query and
+            # must not be downgraded by the EMA-importance logic.
+            if t < self.n_sink_tokens:
+                new_k.append(
+                    _CacheEntry(
+                        q=ek.q,
+                        bits=self.hi_bits,
+                        score=ek.score,          # leave score untouched
+                        pending_bits=self.hi_bits,
+                        pending_steps=0,
+                    )
+                )
+                new_v.append(
+                    _CacheEntry(
+                        q=self._v_entries[t].q,
+                        bits=self.hi_bits,
+                        score=self._v_entries[t].score,
+                        pending_bits=self.hi_bits,
+                        pending_steps=0,
+                    )
+                )
+                continue
+
             new_score = self.ema_decay * ek.score + (1 - self.ema_decay) * w[t]
             want_bits = self._score_to_bits(new_score)
 
@@ -313,6 +349,6 @@ class AdaptiveKVCache(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"head_dim={self.head_dim}, tiers=({self.hi_bits},{self.mid_bits},"
-            f"{self.lo_bits},{self.evict_bits}), length={self.length}, "
-            f"avg_bits={self.avg_bits():.2f}"
+            f"{self.lo_bits},{self.evict_bits}), n_sink={self.n_sink_tokens}, "
+            f"length={self.length}, avg_bits={self.avg_bits():.2f}"
         )

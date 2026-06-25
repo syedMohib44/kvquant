@@ -174,6 +174,9 @@ class KVQuantMSE(nn.Module):
             QuantizedMSE with indices of shape (..., d).
         """
         shape = x.shape
+        # FP8 tensors cannot be directly cast on all torch versions; upcast first.
+        if x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            x = x.to(torch.float32)
         x_flat = x.reshape(-1, self.dim).to(self.centroids.dtype)
 
         # Save norms, project onto unit sphere
@@ -326,6 +329,8 @@ class KVQuantIP(nn.Module):
             QuantizedIP.
         """
         shape = x.shape
+        if x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            x = x.to(torch.float32)
         x_flat = x.reshape(-1, self.dim).to(self.S.dtype)
         N = x_flat.shape[0]
 
