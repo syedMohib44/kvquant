@@ -179,7 +179,6 @@ def _int8_quantize_cache(past_key_values, kvs):
     import copy
 
     cache_q = copy.deepcopy(past_key_values)
-    kv_idx = 0
 
     def _q8(t: torch.Tensor) -> torch.Tensor:
         """Per-vector (last dim) uint8 round-trip (stored as float, no dtype cast)."""
@@ -199,17 +198,15 @@ def _int8_quantize_cache(past_key_values, kvs):
             if isinstance(k, torch.Tensor):
                 layer.keys   = _q8(k)
                 layer.values = _q8(layer.values)
-                kv_idx += 1
     elif hasattr(cache_q, "key_cache"):
         for i in range(len(cache_q.key_cache)):
             k = cache_q.key_cache[i]
             if isinstance(k, torch.Tensor):
                 cache_q.key_cache[i]   = _q8(k)
                 cache_q.value_cache[i] = _q8(cache_q.value_cache[i])
-                kv_idx += 1
-    elif isinstance(past_key_values, (tuple, list)):
+    elif isinstance(cache_q, (tuple, list)):
         result = []
-        for k, v in past_key_values:
+        for k, v in cache_q:
             if isinstance(k, torch.Tensor):
                 result.append((_q8(k), _q8(v)))
             else:
@@ -382,7 +379,6 @@ def generate(
     input_ids = _format_prompt(tok, prompt, raw, system=system)
     past, avg_bits, T_p, ids = _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank)
 
-    device = _model_device(mdl)
     suppress_ids = _get_suppress_ids(tok)
 
     # First token from the compressed cache.
@@ -513,8 +509,9 @@ def stream(
         if next_tok.item() == tok.eos_token_id:
             break
 
-    # Yield any remaining text after the last token, skipping incomplete sequences
+    # Yield any remaining text after the last token, skipping incomplete sequences.
+    # Use the same raw decode as the loop (no _clean_text) so whitespace is consistent.
     final_text = tok.decode(torch.cat(generated, dim=1)[0], skip_special_tokens=True)
-    final_fragment = _clean_text(final_text)[prev_len:].replace("\ufffd", "")
+    final_fragment = final_text[prev_len:].replace("\ufffd", "")
     if final_fragment:
         yield final_fragment
