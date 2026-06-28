@@ -132,17 +132,16 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 Run this from the `kvquant/` directory (the folder that contains `pyproject.toml`):
 
 ```bash
-pip install -e .                  # CPU — pure PyTorch
-pip install -e ".[dev]"           # CPU + pytest
-pip install -e ".[cuda]"          # GPU — adds Triton JIT kernels
-pip install -e ".[dev,cuda]"      # GPU + pytest
+pip install -e .           # includes GPU kernels (Triton JIT) + PyTorch fallbacks
+pip install -e ".[dev]"    # + pytest
+pip install -e ".[cuda]"   # + explicit Triton version pin (optional)
 ```
 
-This installs all dependencies (`torch`, `transformers`, `numpy`, `matplotlib`) and makes the `kvquant` package importable from anywhere as long as the `kvquant` conda environment is active.
+This installs all dependencies (`torch`, `transformers`, `numpy`, `matplotlib`, `cuda-triton-kernels`) and makes the `kvquant` package importable from anywhere as long as the environment is active.
 
 **Requirements:** Python >= 3.10, PyTorch >= 2.1, Transformers >= 4.40
 
-The `[cuda]` extra installs [Triton](https://github.com/openai/triton) and enables fused GPU kernels for the hot paths (see [GPU Acceleration](#gpu-acceleration) below). All paths fall back to pure PyTorch automatically on CPU.
+GPU kernels (Triton JIT softmax, flash attention, matmul) are included in the base install — no `[cuda]` extra needed. All paths fall back to pure PyTorch automatically on CPU, AMD, or Apple MPS. For maximum flash attention performance, build the optional WMMA/CUTLASS CUDA extensions from source (see [GPU Acceleration](#gpu-acceleration) below).
 
 ### 4. Configure VS Code (optional)
 
@@ -208,29 +207,73 @@ python -m kvquant.visualize         # regenerate all plots -> https://github.com
 ## Quick start
 
 ```python
+import torch
 from kvquant import KVCacheQuantizer
 
-# Standard 2-bit KV cache quantization
-quant = KVCacheQuantizer(head_dim=64, num_bits=2)
-quant.calibrate(keys)
-k_compressed = quant.compress(keys)
-k_reconstructed = quant.decompress(k_compressed)
+# shapes: (batch, heads, seq_len, head_dim)
+B, H, T, D = 1, 8, 128, 64
+keys   = torch.randn(B, H, T, D)
+values = torch.randn(B, H, T, D)
 
-# Attention-weighted quantization
+# ── KVCacheQuantizer ────────────────────────────────────────────────────────
+# calibrate() takes BOTH keys and values; call it once with a representative sample
+quant = KVCacheQuantizer(head_dim=D, num_bits=3)
+quant.calibrate(keys, values)                          # identifies outlier channels
+
+k_compressed   = quant.compress(keys,   is_value=False)   # inner-product-optimal
+v_compressed   = quant.compress(values, is_value=True)    # MSE-optimal
+
+k_reconstructed = quant.decompress(k_compressed, is_value=False)
+v_reconstructed = quant.decompress(v_compressed, is_value=True)
+
+# convenience pair API
+k_c, v_c = quant.compress_kv(keys, values)
+k_hat, v_hat = quant.decompress_kv(k_c, v_c)
+
+# ── AttentionWeightedQuantizer ──────────────────────────────────────────────
+# quantize(keys, query): second arg is the QUERY vector, not pre-computed weights.
+# High-attention tokens get hi_bits, low-attention tokens get lo_bits.
+# Sink tokens (positions 0-3) are always kept at hi_bits regardless of score.
 from kvquant import AttentionWeightedQuantizer
-awq = AttentionWeightedQuantizer(head_dim=64, hi_bits=4, lo_bits=2, top_fraction=0.5)
-q_weighted = awq.quantize(keys, attn_weights=attn_scores)
 
-# Delta compression for streaming
+query = torch.randn(B, H, D)   # current query - (batch, heads, head_dim)
+awq   = AttentionWeightedQuantizer(dim=D, hi_bits=4, lo_bits=2, top_fraction=0.5)
+q_weighted = awq.quantize(keys.reshape(B * H, T, D), query.reshape(B * H, D))
+k_corrected_aw = awq.dequantize(q_weighted)
+
+# ── DeltaKVCache ────────────────────────────────────────────────────────────
+# push() takes one K and one V vector per step; get() returns the full cache
 from kvquant import DeltaKVCache
-delta = DeltaKVCache(head_dim=64, num_bits=3)
-for token_key in stream:
-    compressed = delta.push(token_key)
 
-# Low-rank error correction
-from kvquant import LowRankCorrection
-lrc = LowRankCorrection(head_dim=64, num_bits=2, rank=4)
-k_corrected = lrc.forward(keys)
+delta = DeltaKVCache(head_dim=D, num_bits=3)
+for t in range(T):
+    delta.push(keys[:, :, t, :], values[:, :, t, :])   # k, v both required
+
+K_hat, V_hat = delta.get()   # (T, ..., head_dim) reconstructed
+
+# ── LowRankCorrection ───────────────────────────────────────────────────────
+# Wraps an existing quantizer; forward() quantizes + corrects in one call
+from kvquant import LowRankCorrection, KVQuantMSE
+
+base_quantizer = KVQuantMSE(dim=D, num_bits=2)
+lrc = LowRankCorrection(quantizer=base_quantizer, rank=4)
+
+keys_2d     = keys.reshape(-1, D)   # (N, head_dim)
+k_corrected = lrc.forward(keys_2d)  # quantize → low-rank residual correction → reconstruct
+
+# ── AdaptiveKVCache (EMA importance + sink token protection) ────────────────
+from kvquant import AdaptiveKVCache
+
+cache = AdaptiveKVCache(head_dim=D, hi_bits=4, mid_bits=3, lo_bits=2, n_sink_tokens=4)
+for t in range(T):
+    cache.push(keys[:, :, t, :], values[:, :, t, :])
+
+# after each forward pass, provide softmax attention weights -> updates bit tiers
+attn_weights = torch.softmax(torch.randn(B, H, T), dim=-1)
+cache.attend(attn_weights)
+
+K_adaptive, V_adaptive = cache.get()
+print(cache.bit_allocation())   # {4: N_hi, 3: N_mid, 2: N_lo, 1: N_evict}
 ```
 
 ---
@@ -247,7 +290,13 @@ pytest
 
 ## GPU Acceleration
 
-Install the `[cuda]` extra to enable fused Triton kernels and `torch.compile` paths for the four hot spots in the pipeline:
+GPU kernels are included in the base install — no extra flag needed:
+
+```bash
+pip install kvquant-plus-plus
+```
+
+For an explicit Triton version pin:
 
 ```bash
 pip install "kvquant-plus-plus[cuda]"
@@ -431,8 +480,8 @@ twine upload kvquant/dist/kvquant_plus_plus-0.1.2*
 ### Install from PyPI
 
 ```bash
-pip install kvquant-plus-plus              # CPU only
-pip install "kvquant-plus-plus[cuda]"      # GPU — adds Triton kernels
+pip install kvquant-plus-plus              # GPU kernels included (Triton JIT)
+pip install "kvquant-plus-plus[cuda]"      # same + explicit Triton version pin
 ```
 
 PyPI page: https://pypi.org/project/kvquant-plus-plus/

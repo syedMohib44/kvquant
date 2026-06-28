@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvquant-plus-plus"
-version = "0.1.2"
+version = "0.1.4"
 description = "Attention-aware KV cache quantization for LLM inference (KVQuant++ extensions)"
 readme = "PAPER.md"
 requires-python = ">=3.10"
@@ -14,6 +14,10 @@ dependencies = [
     "transformers>=4.40.0",
     "numpy>=1.24.0",
     "matplotlib>=3.7.0",
+    # GPU kernels — Triton JIT softmax, flash attention, matmul, multi-GPU dispatcher.
+    # Pre-built WMMA/CUTLASS CUDA extensions are included in the wheel when installed
+    # from PyPI (built via GitHub Actions CI for all supported GPUs SM75-SM120).
+    "cuda-triton-multiarch>=0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -21,9 +25,10 @@ dev = [
     "pytest>=7.4.0",
 ]
 cuda = [
+    # cuda-triton-multiarch is already in base deps (Triton installed transitively).
+    # This extra explicitly pins Triton for users who want a version-locked install.
     "triton>=2.1.0; sys_platform != 'win32'",
     "triton-windows>=3.1.0; sys_platform == 'win32'",
-    "cuda-triton-kernels @ git+https://github.com/syedMohib44/cuda-triton-multiarch.git",
 ]
 
 [tool.setuptools]
