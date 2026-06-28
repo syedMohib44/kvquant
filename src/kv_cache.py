@@ -22,6 +22,7 @@ production system would add entropy coding on top.
 
 from __future__ import annotations
 
+import copy
 import math
 import torch
 import torch.nn as nn
@@ -34,6 +35,177 @@ from .outlier import OutlierKVQuant, OutlierQuantized
 
 # Accept any quantized representation (K uses IP, V uses MSE)
 CompressedKV = QuantizedIP | QuantizedMSE | OutlierQuantized
+
+
+# ---------------------------------------------------------------------------
+# Model-cache utilities
+# These live here because they operate on KVCacheQuantizer objects and on the
+# native cache format returned by HuggingFace models.  Keeping them in one
+# place prevents the same logic from being duplicated across generate.py,
+# demo scripts, and user code.
+# ---------------------------------------------------------------------------
+
+
+def kvs_from_cache(past_key_values) -> list[tuple[Tensor, Tensor]]:
+    """
+    Extract a flat list of (k, v) tensors from any HuggingFace cache format.
+
+    Handles:
+      - new DynamicCache  (transformers >= 4.50): .layers[i].keys / .values
+      - old DynamicCache  (transformers 4.38-4.49): .key_cache[i] / .value_cache[i]
+      - tuple-of-tuples   (transformers < 4.38): ((k0,v0), (k1,v1), …)
+
+    Skips None entries (linear-attn / sliding-window / Mamba layers in hybrid
+    models).  Returns only transformer-attention layers that have real KV tensors.
+
+    Args:
+        past_key_values: The cache object returned by model(..., use_cache=True).
+
+    Returns:
+        List of (k, v) tensor pairs, one per transformer attention layer.
+    """
+    if hasattr(past_key_values, "layers"):
+        return [
+            (layer.keys, layer.values)
+            for layer in past_key_values.layers
+            if isinstance(getattr(layer, "keys", None), Tensor)
+        ]
+    if hasattr(past_key_values, "key_cache"):
+        return [
+            (past_key_values.key_cache[i], past_key_values.value_cache[i])
+            for i in range(len(past_key_values.key_cache))
+            if past_key_values.key_cache[i] is not None
+        ]
+    if isinstance(past_key_values, (tuple, list)):
+        return [(k, v) for k, v in past_key_values if isinstance(k, Tensor)]
+    return []
+
+
+def quantize_model_cache(
+    past_key_values,
+    kvc_or_list: "KVCacheQuantizer | list[KVCacheQuantizer]",
+    correction_rank: int = 0,
+):
+    """
+    Return a deep copy of ``past_key_values`` with every transformer-attention
+    K/V pair compressed then decompressed via ``kvc_or_list``.
+
+    Non-KV state (Mamba hidden state, linear-attention state) is left untouched
+    so hybrid models (Qwen3.5, Jamba, …) continue to work correctly.
+
+    Args:
+        past_key_values:  Cache from model(..., use_cache=True).
+        kvc_or_list:      A single KVCacheQuantizer applied to all layers, or a
+                          list of per-layer KVCacheQuantizers (one per attention
+                          layer in order).  Per-layer gives better quality because
+                          each layer has its own outlier-channel profile.
+        correction_rank:  If > 0, apply a rank-r SVD correction to the residual
+                          (K - K_hat) before storing.  Reduces quantization error
+                          at the cost of storing r*(T+d) extra floats per layer.
+                          0 = disabled.
+
+    Returns:
+        A deep-copied cache with quantized K/V tensors.
+    """
+    cache_q = copy.deepcopy(past_key_values)
+    _is_list = isinstance(kvc_or_list, list)
+
+    def _compress_pair(k: Tensor, v: Tensor, kvc: "KVCacheQuantizer"):
+        dt = k.dtype
+        k_hat, v_hat = kvc.decompress_kv(*kvc.compress_kv(k.float(), v.float()))
+        if correction_rank > 0:
+            k_hat = _low_rank_correct(k.float(), k_hat, correction_rank)
+            v_hat = _low_rank_correct(v.float(), v_hat, correction_rank)
+        return k_hat.to(dt), v_hat.to(dt)
+
+    if hasattr(cache_q, "layers"):
+        idx = 0
+        for layer in cache_q.layers:
+            k = getattr(layer, "keys", None)
+            if isinstance(k, Tensor):
+                kvc = kvc_or_list[idx] if _is_list else kvc_or_list
+                layer.keys, layer.values = _compress_pair(k, layer.values, kvc)
+                idx += 1
+        return cache_q
+
+    if hasattr(cache_q, "key_cache"):
+        idx = 0
+        for i in range(len(cache_q.key_cache)):
+            k = cache_q.key_cache[i]
+            if isinstance(k, Tensor):
+                kvc = kvc_or_list[idx] if _is_list else kvc_or_list
+                cache_q.key_cache[i], cache_q.value_cache[i] = _compress_pair(
+                    k, cache_q.value_cache[i], kvc
+                )
+                idx += 1
+        return cache_q
+
+    if isinstance(past_key_values, (tuple, list)):
+        result, idx = [], 0
+        for k, v in past_key_values:
+            if isinstance(k, Tensor):
+                kvc = kvc_or_list[idx] if _is_list else kvc_or_list
+                result.append(_compress_pair(k, v, kvc))
+                idx += 1
+            else:
+                result.append((k, v))
+        return tuple(result)
+
+    return cache_q
+
+
+def crop_model_cache(past_key_values, seq_len: int):
+    """
+    Return a deep copy of ``past_key_values`` with K/V tensors truncated to
+    ``seq_len`` positions along the sequence dimension.
+
+    Used to obtain a T-1 cache for getting accurate first-token logits from the
+    compressed cache (see generate.py).  Non-KV state is preserved unchanged.
+
+    Args:
+        past_key_values: Cache from model(..., use_cache=True).
+        seq_len:         Number of token positions to keep.
+
+    Returns:
+        Deep-copied cache truncated to seq_len.
+    """
+    cache = copy.deepcopy(past_key_values)
+    if hasattr(cache, "layers"):
+        for layer in cache.layers:
+            k = getattr(layer, "keys", None)
+            if isinstance(k, Tensor) and k.shape[-2] > seq_len:
+                layer.keys = k[..., :seq_len, :]
+                layer.values = layer.values[..., :seq_len, :]
+    elif hasattr(cache, "key_cache"):
+        for i in range(len(cache.key_cache)):
+            k = cache.key_cache[i]
+            if isinstance(k, Tensor) and k.shape[-2] > seq_len:
+                cache.key_cache[i] = k[..., :seq_len, :]
+                cache.value_cache[i] = cache.value_cache[i][..., :seq_len, :]
+    return cache
+
+
+def _low_rank_correct(x: Tensor, x_hat: Tensor, rank: int) -> Tensor:
+    """Add a rank-r SVD correction of the residual (x - x_hat) to x_hat."""
+    orig = x_hat.shape
+    N = x_hat.reshape(-1, orig[-2], orig[-1]).shape[0]
+    R = (x - x_hat).reshape(N, orig[-2], orig[-1])
+    T_len = R.shape[1]
+    r = min(rank, T_len - 1, orig[-1] - 1)
+    if r < 1:
+        return x_hat
+    if T_len >= 64:
+        try:
+            from .correction import _randomized_svd
+            U, S, Vh = _randomized_svd(R, rank=r)
+        except Exception:
+            U, S, Vh = torch.linalg.svd(R, full_matrices=False)
+            U, S, Vh = U[..., :r], S[..., :r], Vh[..., :r, :]
+    else:
+        U, S, Vh = torch.linalg.svd(R, full_matrices=False)
+        U, S, Vh = U[..., :r], S[..., :r], Vh[..., :r, :]
+    correction = (U * S.unsqueeze(-2)) @ Vh
+    return (x_hat + correction.reshape(orig))
 
 
 class KVCacheQuantizer(nn.Module):

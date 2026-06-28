@@ -36,14 +36,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from kvquant import KVCacheQuantizer
-from kvquant.demo_llm import (
-    load_model,
-    get_model_dims,
-    _kvs_from_cache,
-    _quantize_cache,
-    sep,
-)
+from kvquant import KVCacheQuantizer, kvs_from_cache, quantize_model_cache
+from kvquant.demo_llm import load_model, get_model_dims, sep
 
 BITS_LIST = [2, 3, 4]
 
@@ -257,7 +251,7 @@ def compute_ppl(
 
         # Optionally quantize the cache
         if kvc is not None:
-            cache = _quantize_cache(cache, kvc, correction_rank=correction_rank)
+            cache = quantize_model_cache(cache, kvc, correction_rank=correction_rank)
 
         # Score target tokens against the (possibly quantized) cache.
         # prefill.logits[:, -1, :] predicts tgt[:, 0]  (first generated token).
@@ -348,7 +342,7 @@ def main():
     cal_ids = torch.cat([c for c, _ in cal_chunks], dim=0)
     with torch.no_grad():
         cal_out = model(cal_ids, use_cache=True)
-    cal_kvs = _kvs_from_cache(cal_out.past_key_values)
+    cal_kvs = kvs_from_cache(cal_out.past_key_values)
     T_cal = cal_ids.shape[1]
     all_k = torch.cat([kv[0].reshape(-1, T_cal, head_dim) for kv in cal_kvs])
     all_v = torch.cat([kv[1].reshape(-1, T_cal, head_dim) for kv in cal_kvs])

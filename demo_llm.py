@@ -25,14 +25,11 @@ so that both pure-transformer and hybrid architectures work transparently.
 """
 
 import argparse
-import copy
 import re
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from kvquant import KVCacheQuantizer
-from src.correction import _randomized_svd
+from kvquant import KVCacheQuantizer, kvs_from_cache, quantize_model_cache, crop_model_cache
 
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL = "distilgpt2"
@@ -104,177 +101,6 @@ def _is_hybrid_model(model):
     return False
 
 
-def _kvs_from_cache(native_cache):
-    """
-    Extract list of (k, v) tensors from whatever cache type the model returned.
-    Handles three formats:
-      • new DynamicCache  (transformers >= 4.50): .layers[i].keys / .values
-      • old DynamicCache  (transformers 4.38-4.49): .key_cache[i] / .value_cache[i]
-      • tuple-of-tuples   (transformers < 4.38): ((k0,v0), (k1,v1), …)
-    Skips None / missing entries (linear-attn / sliding-window layers).
-    """
-    # New-style DynamicCache: layers list with DynamicLayer objects
-    if hasattr(native_cache, "layers"):
-        result = []
-        for layer in native_cache.layers:
-            k = getattr(layer, "keys", None)
-            v = getattr(layer, "values", None)
-            if isinstance(k, torch.Tensor):
-                result.append((k, v))
-        return result
-
-    # Old-style DynamicCache / HybridCache
-    if hasattr(native_cache, "key_cache"):
-        return [
-            (native_cache.key_cache[i], native_cache.value_cache[i])
-            for i in range(len(native_cache.key_cache))
-            if native_cache.key_cache[i] is not None
-        ]
-
-    # Legacy tuple-of-tuples
-    if isinstance(native_cache, (tuple, list)):
-        return [(k, v) for k, v in native_cache if isinstance(k, torch.Tensor)]
-
-    return []
-
-
-def _apply_lowrank_correction(
-    x: torch.Tensor, x_hat: torch.Tensor, rank: int
-) -> torch.Tensor:
-    """Add rank-r SVD correction to x_hat using residual (x - x_hat).
-
-    The quantized cache x_hat has error R = x - x_hat. That error is not
-    random - it tends to be low-rank (a few directions account for most of
-    the energy). We approximate R with a rank-r SVD and add it back, recovering
-    most of the lost precision at a fraction of the storage cost.
-    """
-    # Save original shape (B, H, T, d) to restore at the end.
-    # The model expects this exact shape - we can't return anything different.
-    orig_shape = x_hat.shape
-
-    # SVD requires exactly 3 dims: (batch, rows, cols).
-    # The KV cache is 4D: (B, H, T, d) - B=batch, H=heads, T=tokens, d=head_dim.
-    # Flatten B and H into a single batch dimension N = B*H so SVD sees (N, T, d).
-    # reshape() is a free view - no data is copied.
-    N = x_hat.reshape(-1, orig_shape[-2], orig_shape[-1]).shape[0]
-
-    # Compute the residual error: how far is the quantized cache from the real cache.
-    # Use float32 to avoid precision loss during subtraction (x_hat may be float16).
-    R = (x.float() - x_hat.float()).reshape(N, orig_shape[-2], orig_shape[-1])
-    T = R.shape[1]  # number of tokens in the cache
-
-    # Clamp rank so it never exceeds what SVD can produce: min(T, d) - 1.
-    # Without this, SVD would crash on very short sequences (e.g. T=2, rank=4).
-    r = min(rank, T - 1, orig_shape[-1] - 1)
-    if r < 1:
-        # Sequence too short to apply any correction - return as-is.
-        return x_hat
-
-    # Choose SVD method based on sequence length:
-    #   T >= 64 -> randomized SVD: faster (2.5x at T=256+), slight approximation
-    #   T <  64 -> exact SVD then manually truncate to top-r components
-    if T >= 64:
-        U, S, Vh = _randomized_svd(R, rank=r)
-    else:
-        U, S, Vh = torch.linalg.svd(R, full_matrices=False)
-        # SVD returns all singular components; keep only the top-r.
-        # These hold the most energy (singular values are sorted largest->smallest).
-        U, S, Vh = U[..., :r], S[..., :r], Vh[..., :r, :]
-
-    # Reconstruct the rank-r approximation of the residual error.
-    # Equivalent to U @ diag(S) @ Vh but avoids allocating a diagonal matrix.
-    # S.unsqueeze(-2) broadcasts S from (N, r) to (N, 1, r) so it scales each
-    # row of U: (N, T, r) * (N, 1, r) = (N, T, r), then @ Vh (N, r, d) = (N, T, d).
-    correction = (U * S.unsqueeze(-2)) @ Vh  # (N, T, d)
-
-    # Add correction to quantized cache, reshape back to (B, H, T, d),
-    # and cast back to the original dtype (e.g. float16).
-    return (x_hat.float() + correction.reshape(orig_shape)).to(x_hat.dtype)
-
-
-def _crop_cache(native_cache, seq_len: int):
-    """
-    Return a deep copy of native_cache with KV tensors truncated to seq_len
-    positions along the sequence dimension.  Non-KV state (Mamba, linear-attn)
-    is preserved unchanged.  Used to obtain the T_p-1 cache needed to compute
-    an accurate quantized logit for the first generated token.
-    """
-    cache = copy.deepcopy(native_cache)
-    if hasattr(cache, "layers"):  # new-style DynamicCache
-        for layer in cache.layers:
-            k = getattr(layer, "keys", None)
-            if isinstance(k, torch.Tensor) and k.shape[-2] > seq_len:
-                layer.keys = k[..., :seq_len, :]
-                layer.values = layer.values[..., :seq_len, :]
-    elif hasattr(cache, "key_cache"):  # old-style DynamicCache / HybridCache
-        for i in range(len(cache.key_cache)):
-            k = cache.key_cache[i]
-            if isinstance(k, torch.Tensor) and k.shape[-2] > seq_len:
-                cache.key_cache[i] = k[..., :seq_len, :]
-                cache.value_cache[i] = cache.value_cache[i][..., :seq_len, :]
-    return cache
-
-
-def _quantize_cache(native_cache, kvc_or_list, correction_rank: int = 0):
-    """
-    Return a COPY of native_cache with K, V quantized in transformer-attention
-    layers.  Linear/state-space state is left untouched so hybrid models (Qwen3.5,
-    Mamba, …) continue to work correctly.
-
-    kvc_or_list: a single KVCacheQuantizer (applied to all layers) OR a list of
-    KVCacheQuantizers (one per transformer attention layer, in order).  Per-layer
-    quantizers give better quality because each layer has its own outlier-channel
-    profile and bit allocation.
-    """
-    cache_q = copy.deepcopy(native_cache)
-    _is_list = isinstance(kvc_or_list, list)
-
-    def _quant_pair(k, v, kvc):
-        """Quantize a (k, v) pair, optionally apply low-rank correction, cast back."""
-        dtype = k.dtype
-        k_hat, v_hat = kvc.decompress_kv(*kvc.compress_kv(k.float(), v.float()))
-        if correction_rank > 0:
-            k_hat = _apply_lowrank_correction(k, k_hat, correction_rank)
-            v_hat = _apply_lowrank_correction(v, v_hat, correction_rank)
-        return k_hat.to(dtype), v_hat.to(dtype)
-
-    # New-style DynamicCache
-    if hasattr(cache_q, "layers"):
-        kv_idx = 0
-        for layer in cache_q.layers:
-            k = getattr(layer, "keys", None)
-            v = getattr(layer, "values", None)
-            if isinstance(k, torch.Tensor):
-                kvc = kvc_or_list[kv_idx] if _is_list else kvc_or_list
-                layer.keys, layer.values = _quant_pair(k, v, kvc)
-                kv_idx += 1
-        return cache_q
-
-    # Old-style DynamicCache / HybridCache
-    if hasattr(cache_q, "key_cache"):
-        kv_idx = 0
-        for i in range(len(cache_q.key_cache)):
-            k, v = cache_q.key_cache[i], cache_q.value_cache[i]
-            if isinstance(k, torch.Tensor):
-                kvc = kvc_or_list[kv_idx] if _is_list else kvc_or_list
-                cache_q.key_cache[i], cache_q.value_cache[i] = _quant_pair(k, v, kvc)
-                kv_idx += 1
-        return cache_q
-
-    # Legacy tuple-of-tuples (immutable - rebuild)
-    if isinstance(native_cache, (tuple, list)):
-        result = []
-        kv_idx = 0
-        for k, v in native_cache:
-            if isinstance(k, torch.Tensor):
-                kvc = kvc_or_list[kv_idx] if _is_list else kvc_or_list
-                result.append(_quant_pair(k, v, kvc))
-                kv_idx += 1
-            else:
-                result.append((k, v))
-        return tuple(result)
-
-    return cache_q  # unknown type - return deep copy as-is
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +130,7 @@ def capture_kv(model, input_ids):
     with torch.no_grad():
         out = model(input_ids, output_attentions=False, use_cache=True)
     pkv = out.past_key_values
-    kvs = _kvs_from_cache(pkv)
+    kvs = kvs_from_cache(pkv)
     return kvs, pkv
 
 
@@ -475,32 +301,13 @@ def main():
         input_ids = enc["input_ids"]
         T_p = input_ids.shape[1]
 
-        # Single prefill pass - gets native cache (DynamicCache or HybridCache)
-        # and logits at the last prompt position.
+        # Prefill: run the model on the full prompt once.
+        # The resulting KV tensors are both the calibration data and the cache to
+        # compress — they capture this context's exact outlier-channel distribution.
         with torch.no_grad():
             prefill_out = model(input_ids, use_cache=True)
         native_cache_orig = prefill_out.past_key_values
-
-        # Calibration pool - use TEXTS corpus for better outlier-channel estimation.
-        # The prompt alone is too short (< 20 tokens) to reliably identify outliers.
-        cal_enc = tok(
-            TEXTS,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=64,
-            add_special_tokens=True,
-        )
-        with torch.no_grad():
-            cal_out = model(cal_enc["input_ids"], use_cache=True)
-        cal_kvs = _kvs_from_cache(cal_out.past_key_values)
-        cal_T = cal_enc["input_ids"].shape[1]
-        all_k_p = torch.cat(
-            [kv[0].reshape(-1, cal_T, head_dim) for kv in cal_kvs], dim=0
-        )
-        all_v_p = torch.cat(
-            [kv[1].reshape(-1, cal_T, head_dim) for kv in cal_kvs], dim=0
-        )
+        cal_kvs = kvs_from_cache(native_cache_orig)
 
         # Newline suppression (varies by tokenizer)
         newline_ids = tok.encode("\n", add_special_tokens=False)
@@ -554,7 +361,7 @@ def main():
                 kvc_layers.append(kvc_l)
             kvc = kvc_layers[0]  # for avg_bits label only
 
-            # _quantize_cache deep-copies native_cache and quantizes K,V in-place.
+            # quantize_model_cache deep-copies native_cache and quantizes K,V in-place.
             # For hybrid models the Mamba/linear-attn state is preserved in the copy,
             # so the subsequent forward passes work without error.
             #
@@ -563,7 +370,7 @@ def main():
             # up numerical noise rather than signal and can hurt quality. At 2-bit
             # and 3-bit the residual is large and structured, so correction helps.
             effective_rank = args.correction_rank if (bits < 4 or gqa_factor > 1) else 0
-            past = _quantize_cache(
+            past = quantize_model_cache(
                 native_cache_orig, kvc_layers, correction_rank=effective_rank
             )
 
@@ -571,7 +378,7 @@ def main():
             # by cropping to T_p-1 positions and running the last prompt token
             # through. Using the unquantized prefill logit here would make all
             # bit-widths produce the same first token - hiding the real degradation.
-            past_crop = _crop_cache(past, T_p - 1)
+            past_crop = crop_model_cache(past, T_p - 1)
             with torch.no_grad():
                 q1_out = model(
                     input_ids[:, -1:], past_key_values=past_crop, use_cache=False
@@ -642,12 +449,16 @@ def main():
                 num_subspaces=args.pq_subspaces,
                 bits_per_subspace=args.pq_bits,
             )
-            pq_kvc.calibrate(all_k_p, all_v_p)
+            # Calibrate PQ codebooks on the actual prefill KV vectors (cal_kvs),
+            # stacking all layers into one pool for a richer training set.
+            all_k_cal = torch.cat([kv[0].reshape(-1, head_dim) for kv in cal_kvs])
+            all_v_cal = torch.cat([kv[1].reshape(-1, head_dim) for kv in cal_kvs])
+            pq_kvc.calibrate(all_k_cal, all_v_cal)
 
-            past = _quantize_cache(
+            past = quantize_model_cache(
                 native_cache_orig, pq_kvc, correction_rank=args.correction_rank
             )
-            past_crop = _crop_cache(past, T_p - 1)
+            past_crop = crop_model_cache(past, T_p - 1)
             with torch.no_grad():
                 q1_out = model(
                     input_ids[:, -1:], past_key_values=past_crop, use_cache=False

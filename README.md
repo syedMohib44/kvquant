@@ -163,117 +163,430 @@ If Pylance still shows `Import "kvquant" could not be resolved`, add this to you
 
 ## Running demos
 
-Run demos as **modules** from inside the `kvquant` directory with the `kvquant` env active:
+Run from the repo root with the `kvquant` conda env active:
 
 ```bash
-python -m kvquant.demo              # basic quantization examples
-python -m kvquant.demo_llm          # real distilgpt2 KV cache 
+# Basic quantization examples (no model download needed)
+python -m kvquant.demo
 
-#### Prompt testing ####
-python -m kvquant.demo_llm --prompt "Hi how are you?" --max-new-tokens 60 # Pure transformer (default)
-python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is AI?" # Hybrid model (Qwen3.5) - auto-detected, uses native cache
-python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "Once upon a time" # Recommended alternative models
-python -m kvquant.demo_llm --model microsoft/phi-2 --prompt "Explain transformers" # Recommended alternative models
-# Base model - auto Q/A format
-python -m kvquant.demo_llm --model distilgpt2 --prompt "What is the capital of France?" --max-new-tokens 20
-# Instruction model - chat template
-python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "What is the capital of France?" --max-new-tokens 20
-# Hybrid thinking model - chat template + enable_thinking=False
-python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is the capital of France?" --max-new-tokens 20
-# Rank 4 will get us 11% MSE reduction at only 7.4% extra storage
-python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "What is the capital of France?" --max-new-tokens 20 --correction-rank 4
-# Test for Mac M1
-OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is the capital of France?" --max-new-tokens 20
-# Product Quant (PQ) good with accuracy this will use PQ instead of BS 
-python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "What is Nihilism?" --max-new-tokens 100 --product-quant
+# All 5 novel extensions on real data
+python -m kvquant.demo_extensions
 
-# The combination of PQ + low rank correction at the same 2 bits/dim storage is the strongest option PQ captures inter-dimension correlations, correction cleans up the residual error that PQ leaves behind. Use:
-python -m kvquant.demo_llm --model TinyLlama/... --prompt "..." \
+# Regenerate all plots
+python -m kvquant.visualize
+
+# Perplexity benchmark (distilgpt2 vs 2/3/4-bit KV cache)
+python -m kvquant.eval_ppl
+python -m kvquant.eval_ppl --model gpt2-medium --correction-rank 4
+```
+
+### demo_llm — interactive generation at different bit-widths
+
+Runs the same prompt through unquantized, 2-bit, 3-bit, and 4-bit KV caches side by side so you can see the quality difference directly.
+
+```bash
+# Default benchmark (distilgpt2, no download)
+python -m kvquant.demo_llm
+
+# Base model — auto Q/A prompt format
+python -m kvquant.demo_llm \
+  --model distilgpt2 \
+  --prompt "What is the capital of France?" \
+  --max-new-tokens 30
+
+# Instruct model — uses the model's built-in chat template
+python -m kvquant.demo_llm \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --prompt "Explain machine learning in simple terms" \
+  --max-new-tokens 80
+
+# TinyLlama — fast, recommended for quick tests
+python -m kvquant.demo_llm \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --prompt "What is nihilism?" \
+  --max-new-tokens 100
+
+# Hybrid model (Qwen3.5) — auto-detected, uses native cache
+python -m kvquant.demo_llm \
+  --model Qwen/Qwen3.5-0.8B \
+  --prompt "What is AI?" \
+  --max-new-tokens 60
+
+# Sentence completion — skip chat template with --raw
+python -m kvquant.demo_llm \
+  --model distilgpt2 \
+  --prompt "The Eiffel Tower is located in" \
+  --raw --max-new-tokens 20
+
+# Low-rank correction — +11% quality at 3-bit
+python -m kvquant.demo_llm \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --prompt "Describe the water cycle" \
+  --correction-rank 4
+
+# Product Quantization — 2 bits/dim via learned codebooks (73x faster encode)
+python -m kvquant.demo_llm \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --prompt "What is nihilism?" \
+  --max-new-tokens 100 \
+  --product-quant
+
+# PQ + low-rank correction — strongest combination at 2 bits/dim
+# PQ captures inter-dimension correlations; correction cleans up the residual
+python -m kvquant.demo_llm \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --prompt "Explain the Turing test" \
   --product-quant --pq-bits 8 --pq-subspaces 16 --correction-rank 4
 
+# Large model (requires enough VRAM or use device_map in Python API)
+python -m kvquant.demo_llm \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --prompt "Explain quantum entanglement" \
+  --max-new-tokens 80 --correction-rank 4
 
-python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --prompt "What is the capital of France?" --max-new-tokens 20 --correction-rank 4
-
-
-python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --prompt "What is the capital of France?" --max-new-tokens 40 --correction-rank 8
-#########################
-
-python -m kvquant.demo_extensions   # all 5 extensions on real data
-python -m kvquant.visualize         # regenerate all plots -> https://github.com/syedMohib44/kvquant/blob/main/plots/
+# Mac / Apple MPS (suppress tokenizer parallelism warning)
+OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m kvquant.demo_llm \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --prompt "What is the capital of France?" \
+  --max-new-tokens 20
 ```
 
 ---
 
 ## Quick start
 
+### Install from PyPI
+
+```bash
+pip install kvquant-plus-plus
+```
+
+---
+
+### generate() — full response
+
+Pass a prompt string, get back text. The model is downloaded on first call and cached in memory for subsequent calls.
+
 ```python
-import torch
+from kvquant import generate
+
+out = generate("What is machine learning?")
+print(out.text)
+print(f"{out.compression_ratio:.1f}x smaller than float16")
+
+# With a system prompt
+out = generate(
+    "What is machine learning?",
+    system="You are a helpful assistant. Be concise.",
+)
+print(out.text)
+```
+
+`GenerateResult` fields: `.text`, `.bits`, `.avg_bits_per_dim`, `.compression_ratio`, `.model`, `.prompt`
+
+---
+
+### stream() — print tokens as they arrive
+
+```python
+from kvquant import stream
+
+for token in stream("Explain transformers in simple terms"):
+    print(token, end="", flush=True)
+print()
+```
+
+---
+
+### System prompt — role, persona, or instructions
+
+Pass any combination of system and user prompt. Both are quantized together in a single prefill pass — no extra compute cost.
+
+```python
+from kvquant import generate, stream
+
+# System prompt only sets the model's role; user prompt is the question
+out = generate(
+    "What is quantum entanglement?",
+    system="You are a physics professor. Answer at undergraduate level.",
+    bits=3,
+)
+print(out.text)
+
+# User prompt only (system omitted — same as before)
+out = generate("What is quantum entanglement?", bits=3)
+print(out.text)
+
+# Long document analysis — system sets the task, user supplies the document
+contract = open("contract.txt").read()
+out = generate(
+    contract + "\n\nList all payment terms.",
+    system="You are a legal analyst. Extract facts only, be concise.",
+    bits=3,
+    max_new_tokens=300,
+)
+print(out.text)
+
+# Streaming with a system prompt
+for token in stream(
+    "Explain gradient descent.",
+    system="You are a machine learning tutor. Use simple analogies.",
+    bits=3,
+):
+    print(token, end="", flush=True)
+print()
+```
+
+---
+
+### Bit-width options (2 / 3 / 4)
+
+```python
+from kvquant import generate
+
+# 2-bit: most compressed (~8x smaller than float16), some quality loss
+out = generate("Summarise the French Revolution", bits=2)
+print(f"{out.compression_ratio:.1f}x  — {out.text}")
+
+# 3-bit: recommended default (~5x smaller, minimal quality loss)
+out = generate("Summarise the French Revolution", bits=3)
+print(f"{out.compression_ratio:.1f}x  — {out.text}")
+
+# 4-bit: best quality (~4x smaller, near-lossless)
+out = generate("Summarise the French Revolution", bits=4)
+print(f"{out.compression_ratio:.1f}x  — {out.text}")
+```
+
+---
+
+### Sampling — creative / varied output
+
+```python
+from kvquant import generate
+
+# Greedy (deterministic, default)
+out = generate("Once upon a time", bits=3, temperature=0.0)
+
+# Sampling with temperature
+out = generate("Once upon a time", bits=3, temperature=0.8)
+
+# Nucleus (top-p) sampling
+out = generate("Once upon a time", bits=3, temperature=0.8, top_p=0.95)
+
+print(out.text)
+```
+
+---
+
+### Different models
+
+Works with any HuggingFace causal LM — instruct, base, and hybrid architectures (Qwen, Llama, Phi, Mistral, Falcon, Gemma …).
+
+```python
+from kvquant import generate
+
+# Small instruct model (default, downloads ~1 GB)
+out = generate("What is quantum entanglement?",
+               model="Qwen/Qwen2.5-1.5B-Instruct", bits=3)
+
+# TinyLlama — fast, great for testing
+out = generate("What is the capital of France?",
+               model="TinyLlama/TinyLlama-1.1B-Chat-v1.0", bits=3)
+
+# Larger instruct model
+out = generate("Explain the Turing test",
+               model="Qwen/Qwen2.5-7B-Instruct", bits=3)
+
+# Base (non-instruct) model — use raw=True for sentence completion
+out = generate("The Eiffel Tower is located in",
+               model="distilgpt2", bits=3, raw=True)
+
+print(out.text)
+```
+
+---
+
+### Multi-GPU — large models
+
+```python
+from kvquant import generate
+
+# device_map="auto" spreads the model across all available GPUs
+out = generate(
+    "Explain quantum computing in detail",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    bits=3,
+    device_map="auto",
+)
+print(out.text)
+print(f"{out.compression_ratio:.1f}x vs float16")
+```
+
+---
+
+### Low-rank error correction (+11% quality)
+
+At 2-bit and 3-bit, a rank-4 SVD correction of the quantization residual recovers ~11% of the MSE at only 6–7% extra storage. Recommended for low bit-widths.
+
+```python
+from kvquant import generate
+
+out = generate(
+    "Explain the history of the Roman Empire",
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    bits=3,
+    correction_rank=4,    # 0 = disabled (default), 4 = recommended
+    max_new_tokens=300,
+)
+print(out.text)
+```
+
+---
+
+### Repetition control
+
+```python
+from kvquant import generate
+
+# Default repetition_penalty=1.3 already handles most cases
+# Increase to 1.5-2.0 if you see looping at 2-bit
+out = generate("Tell me about AI", bits=2, repetition_penalty=1.5)
+print(out.text)
+```
+
+---
+
+> **What are keys and values?**  When a language model processes text it stores intermediate
+> representations called the KV cache — one key and value vector per token per layer.
+> These tensors grow with context length and consume most of GPU memory during inference.
+> kvquant compresses them from 16 bits to 2–4 bits with minimal quality loss.
+
+---
+
+## Low-level API
+
+For integrating directly into a training loop, custom transformer, or research pipeline. All classes accept KV tensors as-is — `(T, head_dim)`, `(B, H, T, head_dim)`, or anything in between.
+
+---
+
+### KVCacheQuantizer — compress / decompress a KV cache
+
+```python
 from kvquant import KVCacheQuantizer
 
-# shapes: (batch, heads, seq_len, head_dim)
-B, H, T, D = 1, 8, 128, 64
-keys   = torch.randn(B, H, T, D)
-values = torch.randn(B, H, T, D)
+# keys, values: KV tensors from your transformer, shape (..., head_dim)
+head_dim = keys.shape[-1]
 
-# ── KVCacheQuantizer ────────────────────────────────────────────────────────
-# calibrate() takes BOTH keys and values; call it once with a representative sample
-quant = KVCacheQuantizer(head_dim=D, num_bits=3)
-quant.calibrate(keys, values)                          # identifies outlier channels
+quant = KVCacheQuantizer(head_dim=head_dim, num_bits=3)
 
-k_compressed   = quant.compress(keys,   is_value=False)   # inner-product-optimal
-v_compressed   = quant.compress(values, is_value=True)    # MSE-optimal
+# One-shot calibration — use the actual prefill KVs from your context
+quant.calibrate(keys, values)
 
-k_reconstructed = quant.decompress(k_compressed, is_value=False)
-v_reconstructed = quant.decompress(v_compressed, is_value=True)
-
-# convenience pair API
-k_c, v_c = quant.compress_kv(keys, values)
+# Compress (K uses inner-product-optimal, V uses MSE-optimal quantization)
+k_c, v_c     = quant.compress_kv(keys, values)
 k_hat, v_hat = quant.decompress_kv(k_c, v_c)
 
-# ── AttentionWeightedQuantizer ──────────────────────────────────────────────
-# quantize(keys, query): second arg is the QUERY vector, not pre-computed weights.
-# High-attention tokens get hi_bits, low-attention tokens get lo_bits.
-# Sink tokens (positions 0-3) are always kept at hi_bits regardless of score.
+print(f"avg bits/dim: {quant.avg_bits:.2f}")
+```
+
+---
+
+### AttentionWeightedQuantizer — more bits for tokens the model attends to
+
+Sink tokens (positions 0–3) are always pinned to `hi_bits` regardless of their attention score.
+
+```python
 from kvquant import AttentionWeightedQuantizer
 
-query = torch.randn(B, H, D)   # current query - (batch, heads, head_dim)
-awq   = AttentionWeightedQuantizer(dim=D, hi_bits=4, lo_bits=2, top_fraction=0.5)
-q_weighted = awq.quantize(keys.reshape(B * H, T, D), query.reshape(B * H, D))
-k_corrected_aw = awq.dequantize(q_weighted)
+awq = AttentionWeightedQuantizer(dim=head_dim, hi_bits=4, lo_bits=2, top_fraction=0.5)
 
-# ── DeltaKVCache ────────────────────────────────────────────────────────────
-# push() takes one K and one V vector per step; get() returns the full cache
+# keys: (..., T, head_dim)   query: (..., head_dim)
+compressed = awq.quantize(keys, query)
+k_hat      = awq.dequantize(compressed)
+
+print(f"avg bits: {awq.avg_bits:.2f}")   # 3.0 at top_fraction=0.5
+```
+
+---
+
+### DeltaKVCache — streaming / autoregressive generation
+
+Compresses token-to-token deltas instead of absolute vectors. Works because consecutive KV vectors are highly correlated (1.1–2.2x lower MSE than absolute compression at the same bit-width).
+
+```python
 from kvquant import DeltaKVCache
 
-delta = DeltaKVCache(head_dim=D, num_bits=3)
-for t in range(T):
-    delta.push(keys[:, :, t, :], values[:, :, t, :])   # k, v both required
+cache = DeltaKVCache(head_dim=head_dim, num_bits=3)
 
-K_hat, V_hat = delta.get()   # (T, ..., head_dim) reconstructed
+# During generation — call once per new token
+for k_new, v_new in token_stream:     # k_new, v_new: (..., head_dim)
+    cache.push(k_new, v_new)
 
-# ── LowRankCorrection ───────────────────────────────────────────────────────
-# Wraps an existing quantizer; forward() quantizes + corrects in one call
-from kvquant import LowRankCorrection, KVQuantMSE
+K_hat, V_hat = cache.get()            # full reconstructed cache, O(1)
+print(f"cache length: {cache.length}")
+```
 
-base_quantizer = KVQuantMSE(dim=D, num_bits=2)
-lrc = LowRankCorrection(quantizer=base_quantizer, rank=4)
+---
 
-keys_2d     = keys.reshape(-1, D)   # (N, head_dim)
-k_corrected = lrc.forward(keys_2d)  # quantize → low-rank residual correction → reconstruct
+### AdaptiveKVCache — importance-based bit allocation
 
-# ── AdaptiveKVCache (EMA importance + sink token protection) ────────────────
+Tracks a running EMA importance score per token position and dynamically reassigns bits. High-importance tokens get more bits; low-importance tokens are compressed further. Sink tokens (positions 0–3) are always kept at `hi_bits`.
+
+```python
 from kvquant import AdaptiveKVCache
 
-cache = AdaptiveKVCache(head_dim=D, hi_bits=4, mid_bits=3, lo_bits=2, n_sink_tokens=4)
-for t in range(T):
-    cache.push(keys[:, :, t, :], values[:, :, t, :])
+cache = AdaptiveKVCache(head_dim=head_dim)   # tiers: 4 / 3 / 2 / 1 bits
 
-# after each forward pass, provide softmax attention weights -> updates bit tiers
-attn_weights = torch.softmax(torch.randn(B, H, T), dim=-1)
-cache.attend(attn_weights)
+# Prefill
+for k_new, v_new in token_stream:
+    cache.push(k_new, v_new)
 
-K_adaptive, V_adaptive = cache.get()
-print(cache.bit_allocation())   # {4: N_hi, 3: N_mid, 2: N_lo, 1: N_evict}
+# After each forward pass, supply the softmax attention weights
+cache.attend(attn_weights)    # attn_weights: (..., T) from your softmax
+
+K_hat, V_hat = cache.get()
+print(cache.bit_allocation()) # e.g. {4: 8, 3: 50, 2: 60, 1: 10}
+print(f"avg bits: {cache.avg_bits():.2f}")
+```
+
+---
+
+### LowRankCorrection — SVD residual correction
+
+Captures the structured part of quantization error with a rank-r SVD. Reduces MSE by ~11% at rank-4, ~19% at rank-8, using only 6–7% extra storage.
+
+```python
+from kvquant import LowRankCorrection, KVQuantMSE
+
+lrc = LowRankCorrection(quantizer=KVQuantMSE(dim=head_dim, num_bits=2), rank=4)
+
+# Quantize + correct in one call
+k_corrected = lrc.forward(keys)
+
+# Analyse how much energy each rank captures
+energy = lrc.residual_rank_analysis(keys, max_rank=8)
+print(energy)   # cumulative fraction at each rank
+```
+
+---
+
+### ProductQuantizer — subspace codebook quantization
+
+Splits each vector into M subspaces and encodes each independently using a learned codebook. Encode is 73x faster than a cdist loop via the included Triton kernel.
+
+```python
+from kvquant import ProductQuantizer
+
+pq = ProductQuantizer(dim=head_dim, num_subspaces=16, bits_per_subspace=8)
+
+# Calibrate codebooks on a pool of vectors
+pq.calibrate(keys.reshape(-1, head_dim))
+
+compressed = pq.quantize(keys.reshape(-1, head_dim))
+k_hat      = pq.dequantize(compressed)
+
+print(f"compression ratio: {pq.compression_ratio():.1f}x vs float32")
+print(f"effective bits/dim: {pq.effective_bits:.2f}")
 ```
 
 ---
@@ -281,6 +594,7 @@ print(cache.bit_allocation())   # {4: N_hi, 3: N_mid, 2: N_lo, 1: N_evict}
 ## Running tests
 
 ```bash
+# From the repo root
 python -m pytest test_kvquant.py -v   # 88 tests, all pass
 # or simply:
 pytest
