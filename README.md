@@ -4,6 +4,18 @@
 
 **Attention-aware KV cache quantization for LLM inference.**
 
+---
+
+## The problem
+
+Every token an LLM generates requires storing its Key and Value vectors across all transformer layers the KV cache. It grows linearly with sequence length. For a 70B model at FP16, that is roughly 140 MB per 1,000 tokens. A 32K context window consumes ~4.5 GB of VRAM just for the cache, on top of model weights. On consumer hardware this means truncated context, slow CPU offloading, or out-of-memory errors.
+
+Naïve quantization (uniform grid) fails because KV vectors have heavy-tailed outliers a few large-magnitude coordinates dominate the distribution. Rounding those aggressively collapses attention scores.
+
+KVQUANT compresses the KV cache from 16-bit floats down to 2–4 bits while preserving attention accuracy. It isolates outlier dimensions at higher precision, fits per-layer non-uniform codebooks to the actual KV distribution, and minimises distortion directly on the `<Q,K>` dot products rather than pointwise values. The result is a 4–8× reduction in KV cache memory with less than 0.5 perplexity degradation enough to run long-context inference on hardware that would otherwise run out of memory.
+
+---
+
 KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) with five novel extensions and several implementation improvements. It achieves near-optimal KV cache compression by combining information-theoretically grounded vector quantization with transformer-specific structure exploitation.
 
 ---
@@ -141,7 +153,7 @@ This installs all dependencies (`torch`, `transformers`, `numpy`, `matplotlib`, 
 
 **Requirements:** Python >= 3.10, PyTorch >= 2.1, Transformers >= 4.40
 
-GPU kernels (Triton JIT softmax, flash attention, matmul) are included in the base install — no `[cuda]` extra needed. All paths fall back to pure PyTorch automatically on CPU, AMD, or Apple MPS. For maximum flash attention performance, build the optional WMMA/CUTLASS CUDA extensions from source (see [GPU Acceleration](#gpu-acceleration) below).
+GPU kernels (Triton JIT softmax, flash attention, matmul) are included in the base install no `[cuda]` extra needed. All paths fall back to pure PyTorch automatically on CPU, AMD, or Apple MPS. For maximum flash attention performance, build the optional WMMA/CUTLASS CUDA extensions from source (see [GPU Acceleration](#gpu-acceleration) below).
 
 ### 4. Configure VS Code (optional)
 
@@ -180,7 +192,7 @@ python -m kvquant.eval_ppl
 python -m kvquant.eval_ppl --model gpt2-medium --correction-rank 4
 ```
 
-### demo_llm — interactive generation at different bit-widths
+### demo_llm interactive generation at different bit-widths
 
 Runs the same prompt through unquantized, 2-bit, 3-bit, and 4-bit KV caches side by side so you can see the quality difference directly.
 
@@ -188,50 +200,50 @@ Runs the same prompt through unquantized, 2-bit, 3-bit, and 4-bit KV caches side
 # Default benchmark (distilgpt2, no download)
 python -m kvquant.demo_llm
 
-# Base model — auto Q/A prompt format
+# Base model auto Q/A prompt format
 python -m kvquant.demo_llm \
   --model distilgpt2 \
   --prompt "What is the capital of France?" \
   --max-new-tokens 30
 
-# Instruct model — uses the model's built-in chat template
+# Instruct model uses the model's built-in chat template
 python -m kvquant.demo_llm \
   --model Qwen/Qwen2.5-1.5B-Instruct \
   --prompt "Explain machine learning in simple terms" \
   --max-new-tokens 80
 
-# TinyLlama — fast, recommended for quick tests
+# TinyLlama fast, recommended for quick tests
 python -m kvquant.demo_llm \
   --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
   --prompt "What is nihilism?" \
   --max-new-tokens 100
 
-# Hybrid model (Qwen3.5) — auto-detected, uses native cache
+# Hybrid model (Qwen3.5) auto-detected, uses native cache
 python -m kvquant.demo_llm \
   --model Qwen/Qwen3.5-0.8B \
   --prompt "What is AI?" \
   --max-new-tokens 60
 
-# Sentence completion — skip chat template with --raw
+# Sentence completion skip chat template with --raw
 python -m kvquant.demo_llm \
   --model distilgpt2 \
   --prompt "The Eiffel Tower is located in" \
   --raw --max-new-tokens 20
 
-# Low-rank correction — +11% quality at 3-bit
+# Low-rank correction +11% quality at 3-bit
 python -m kvquant.demo_llm \
   --model Qwen/Qwen2.5-1.5B-Instruct \
   --prompt "Describe the water cycle" \
   --correction-rank 4
 
-# Product Quantization — 2 bits/dim via learned codebooks (73x faster encode)
+# Product Quantization 2 bits/dim via learned codebooks (73x faster encode)
 python -m kvquant.demo_llm \
   --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
   --prompt "What is nihilism?" \
   --max-new-tokens 100 \
   --product-quant
 
-# PQ + low-rank correction — strongest combination at 2 bits/dim
+# PQ + low-rank correction strongest combination at 2 bits/dim
 # PQ captures inter-dimension correlations; correction cleans up the residual
 python -m kvquant.demo_llm \
   --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
@@ -263,7 +275,7 @@ pip install kvquant-plus-plus
 
 ---
 
-### generate() — full response
+### generate() full response
 
 Pass a prompt string, get back text. The model is downloaded on first call and cached in memory for subsequent calls.
 
@@ -286,7 +298,7 @@ print(out.text)
 
 ---
 
-### stream() — print tokens as they arrive
+### stream() print tokens as they arrive
 
 ```python
 from kvquant import stream
@@ -298,9 +310,9 @@ print()
 
 ---
 
-### System prompt — role, persona, or instructions
+### System prompt role, persona, or instructions
 
-Pass any combination of system and user prompt. Both are quantized together in a single prefill pass — no extra compute cost.
+Pass any combination of system and user prompt. Both are quantized together in a single prefill pass no extra compute cost.
 
 ```python
 from kvquant import generate, stream
@@ -313,11 +325,11 @@ out = generate(
 )
 print(out.text)
 
-# User prompt only (system omitted — same as before)
+# User prompt only (system omitted same as before)
 out = generate("What is quantum entanglement?", bits=3)
 print(out.text)
 
-# Long document analysis — system sets the task, user supplies the document.
+# Long document analysis system sets the task, user supplies the document.
 # prefill_chunk_size keeps each attention step at chunk² instead of T²,
 # so even a 10 000-token contract fits on an 8 GB GPU.
 contract = open("contract.txt").read()
@@ -349,20 +361,20 @@ from kvquant import generate
 
 # 2-bit: most compressed (~8x smaller than float16), some quality loss
 out = generate("Summarise the French Revolution", bits=2)
-print(f"{out.compression_ratio:.1f}x  — {out.text}")
+print(f"{out.compression_ratio:.1f}x  {out.text}")
 
 # 3-bit: recommended default (~5x smaller, minimal quality loss)
 out = generate("Summarise the French Revolution", bits=3)
-print(f"{out.compression_ratio:.1f}x  — {out.text}")
+print(f"{out.compression_ratio:.1f}x  {out.text}")
 
 # 4-bit: best quality (~4x smaller, near-lossless)
 out = generate("Summarise the French Revolution", bits=4)
-print(f"{out.compression_ratio:.1f}x  — {out.text}")
+print(f"{out.compression_ratio:.1f}x  {out.text}")
 ```
 
 ---
 
-### Sampling — creative / varied output
+### Sampling creative / varied output
 
 ```python
 from kvquant import generate
@@ -383,7 +395,7 @@ print(out.text)
 
 ### Different models
 
-Works with any HuggingFace causal LM — instruct, base, and hybrid architectures (Qwen, Llama, Phi, Mistral, Falcon, Gemma …).
+Works with any HuggingFace causal LM instruct, base, and hybrid architectures (Qwen, Llama, Phi, Mistral, Falcon, Gemma …).
 
 ```python
 from kvquant import generate
@@ -392,7 +404,7 @@ from kvquant import generate
 out = generate("What is quantum entanglement?",
                model="Qwen/Qwen2.5-1.5B-Instruct", bits=3)
 
-# TinyLlama — fast, great for testing
+# TinyLlama fast, great for testing
 out = generate("What is the capital of France?",
                model="TinyLlama/TinyLlama-1.1B-Chat-v1.0", bits=3)
 
@@ -400,7 +412,7 @@ out = generate("What is the capital of France?",
 out = generate("Explain the Turing test",
                model="Qwen/Qwen2.5-7B-Instruct", bits=3)
 
-# Base (non-instruct) model — use raw=True for sentence completion
+# Base (non-instruct) model use raw=True for sentence completion
 out = generate("The Eiffel Tower is located in",
                model="distilgpt2", bits=3, raw=True)
 
@@ -409,7 +421,7 @@ print(out.text)
 
 ---
 
-### Multi-GPU — large models
+### Multi-GPU large models
 
 ```python
 from kvquant import generate
@@ -427,9 +439,9 @@ print(f"{out.compression_ratio:.1f}x vs float16")
 
 ---
 
-### Long documents — contracts, papers, codebases
+### Long documents contracts, papers, codebases
 
-Prefill attention is O(T²). A 6 000-token contract on an 8 GB GPU OOMs with a single full-context forward pass. `prefill_chunk_size` processes the context in chunks so each attention step stays at `chunk² × heads` instead of `T² × heads`. The full context is still captured in the KV cache — no information is lost.
+Prefill attention is O(T²). A 6 000-token contract on an 8 GB GPU OOMs with a single full-context forward pass. `prefill_chunk_size` processes the context in chunks so each attention step stays at `chunk² × heads` instead of `T² × heads`. The full context is still captured in the KV cache no information is lost.
 
 ```python
 from kvquant import generate, stream
@@ -441,7 +453,7 @@ out = generate(
     system="You are a legal analyst. Extract facts only.",
     bits=3,
     max_new_tokens=300,
-    prefill_chunk_size=512,   # default — fits on 8 GB GPU
+    prefill_chunk_size=512,   # default fits on 8 GB GPU
 )
 print(out.text)
 
@@ -465,7 +477,7 @@ for token in stream(
     contract + "\n\nWhat are the termination conditions?",
     system="You are a legal analyst.",
     bits=3,
-    prefill_chunk_size=256,   # most conservative — works on 6 GB GPUs
+    prefill_chunk_size=256,   # most conservative works on 6 GB GPUs
 ):
     print(token, end="", flush=True)
 print()
@@ -506,7 +518,7 @@ print(out.text)
 ---
 
 > **What are keys and values?**  When a language model processes text it stores intermediate
-> representations called the KV cache — one key and value vector per token per layer.
+> representations called the KV cache one key and value vector per token per layer.
 > These tensors grow with context length and consume most of GPU memory during inference.
 > kvquant compresses them from 16 bits to 2–4 bits with minimal quality loss.
 
@@ -514,11 +526,11 @@ print(out.text)
 
 ## Low-level API
 
-For integrating directly into a training loop, custom transformer, or research pipeline. All classes accept KV tensors as-is — `(T, head_dim)`, `(B, H, T, head_dim)`, or anything in between.
+For integrating directly into a training loop, custom transformer, or research pipeline. All classes accept KV tensors as-is `(T, head_dim)`, `(B, H, T, head_dim)`, or anything in between.
 
 ---
 
-### KVCacheQuantizer — compress / decompress a KV cache
+### KVCacheQuantizer compress / decompress a KV cache
 
 ```python
 from kvquant import KVCacheQuantizer
@@ -528,7 +540,7 @@ head_dim = keys.shape[-1]
 
 quant = KVCacheQuantizer(head_dim=head_dim, num_bits=3)
 
-# One-shot calibration — use the actual prefill KVs from your context
+# One-shot calibration use the actual prefill KVs from your context
 quant.calibrate(keys, values)
 
 # Compress (K uses inner-product-optimal, V uses MSE-optimal quantization)
@@ -540,7 +552,7 @@ print(f"avg bits/dim: {quant.avg_bits:.2f}")
 
 ---
 
-### AttentionWeightedQuantizer — more bits for tokens the model attends to
+### AttentionWeightedQuantizer more bits for tokens the model attends to
 
 Sink tokens (positions 0–3) are always pinned to `hi_bits` regardless of their attention score.
 
@@ -558,7 +570,7 @@ print(f"avg bits: {awq.avg_bits:.2f}")   # 3.0 at top_fraction=0.5
 
 ---
 
-### DeltaKVCache — streaming / autoregressive generation
+### DeltaKVCache streaming / autoregressive generation
 
 Compresses token-to-token deltas instead of absolute vectors. Works because consecutive KV vectors are highly correlated (1.1–2.2x lower MSE than absolute compression at the same bit-width).
 
@@ -567,7 +579,7 @@ from kvquant import DeltaKVCache
 
 cache = DeltaKVCache(head_dim=head_dim, num_bits=3)
 
-# During generation — call once per new token
+# During generation call once per new token
 for k_new, v_new in token_stream:     # k_new, v_new: (..., head_dim)
     cache.push(k_new, v_new)
 
@@ -577,7 +589,7 @@ print(f"cache length: {cache.length}")
 
 ---
 
-### AdaptiveKVCache — importance-based bit allocation
+### AdaptiveKVCache importance-based bit allocation
 
 Tracks a running EMA importance score per token position and dynamically reassigns bits. High-importance tokens get more bits; low-importance tokens are compressed further. Sink tokens (positions 0–3) are always kept at `hi_bits`.
 
@@ -600,7 +612,7 @@ print(f"avg bits: {cache.avg_bits():.2f}")
 
 ---
 
-### LowRankCorrection — SVD residual correction
+### LowRankCorrection SVD residual correction
 
 Captures the structured part of quantization error with a rank-r SVD. Reduces MSE by ~11% at rank-4, ~19% at rank-8, using only 6–7% extra storage.
 
@@ -619,7 +631,7 @@ print(energy)   # cumulative fraction at each rank
 
 ---
 
-### ProductQuantizer — subspace codebook quantization
+### ProductQuantizer subspace codebook quantization
 
 Splits each vector into M subspaces and encodes each independently using a learned codebook. Encode is 73x faster than a cdist loop via the included Triton kernel.
 
@@ -653,7 +665,7 @@ pytest
 
 ## GPU Acceleration
 
-GPU kernels are included in the base install — no extra flag needed:
+GPU kernels are included in the base install no extra flag needed:
 
 ```bash
 pip install kvquant-plus-plus
@@ -667,17 +679,17 @@ pip install "kvquant-plus-plus[cuda]"
 
 | Hot path | Mechanism | Speedup |
 |---|---|---|
-| PQ encode (M=16 subspace lookups) | Triton kernel — all M subspaces in one GPU launch | **10--15x** |
-| FWHT (d=128, 7 butterfly iterations) | `torch.compile` — fuses 7 kernel launches into 1 | **2--3x** |
+| PQ encode (M=16 subspace lookups) | Triton kernel all M subspaces in one GPU launch | **10--15x** |
+| FWHT (d=128, 7 butterfly iterations) | `torch.compile` fuses 7 kernel launches into 1 | **2--3x** |
 | Attention softmax (AWQ path) | Triton row-wise fused exp+sum+div | **3.5--8x** |
-| QJL projection `r @ S.T > 0` | `torch.compile` — fuses matmul + compare | **1.5--2x** |
+| QJL projection `r @ S.T > 0` | `torch.compile` fuses matmul + compare | **1.5--2x** |
 | Flash attention (post-decompression) | WMMA / CuTe CUDA → Triton → PyTorch SDPA cascade | **up to native FA-2 speed** |
 
-Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) and compile JIT on first call — no `nvcc`, no build step.
+Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) and compile JIT on first call no `nvcc`, no build step.
 
 ### Flash attention backend
 
-`pip install "kvquant-plus-plus[cuda]"` also installs `cuda-triton-kernels`, which provides `attention_bhsd` — a multi-head flash attention function for `(B, H, T, d)` tensors (KVQuant's native layout):
+`pip install "kvquant-plus-plus[cuda]"` also installs `cuda-triton-kernels`, which provides `attention_bhsd` a multi-head flash attention function for `(B, H, T, d)` tensors (KVQuant's native layout):
 
 ```python
 from kvquant.csrc.attention import attention_bhsd, attention_backend
@@ -686,9 +698,9 @@ from kvquant.csrc.attention import attention_bhsd, attention_backend
 out = attention_bhsd(q, k, v, is_causal=False)
 
 print(attention_backend())
-# → "flash_attn_cuda (WMMA)"           fastest — requires CUDA build step (see below)
-# → "flash_attn_cutlass (CuTe)"        fast — requires CUDA build step (see below)
-# → "flash_attention_triton (Triton)"  JIT — available with [cuda] install, no build
+# → "flash_attn_cuda (WMMA)"           fastest requires CUDA build step (see below)
+# → "flash_attn_cutlass (CuTe)"        fast requires CUDA build step (see below)
+# → "flash_attention_triton (Triton)"  JIT available with [cuda] install, no build
 # → "scaled_dot_product_attention (PyTorch)"  always available fallback
 ```
 
@@ -711,7 +723,7 @@ powershell -ExecutionPolicy Bypass -File Makefile.windows.ps1 build-fac
 powershell -ExecutionPolicy Bypass -File Makefile.windows.ps1 build-fac-cutlass
 ```
 
-After building, `attention_bhsd` automatically picks up the compiled extensions — no code changes needed. Check the active backend with `attention_backend()`.
+After building, `attention_bhsd` automatically picks up the compiled extensions no code changes needed. Check the active backend with `attention_backend()`.
 
 **GPU support:** any NVIDIA GPU SM >= 7.5 (RTX 20xx / 30xx / 40xx / 50xx, A100, H100). Falls back silently to PyTorch on CPU, AMD, or Apple MPS.
 
@@ -725,7 +737,7 @@ After building, `attention_bhsd` automatically picks up the compiled extensions 
 | H100 | SM 90 | Yes |
 | CPU / Apple MPS | -- | PyTorch fallback |
 
-**Windows support:** `pip install "kvquant-plus-plus[cuda]"` automatically installs `triton-windows` on Windows and `triton` on Linux/macOS — no manual steps. GPU kernel performance is identical across platforms (same PTX/CUBIN). Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) which also supports Windows natively.
+**Windows support:** `pip install "kvquant-plus-plus[cuda]"` automatically installs `triton-windows` on Windows and `triton` on Linux/macOS no manual steps. GPU kernel performance is identical across platforms (same PTX/CUBIN). Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) which also supports Windows natively.
 
 ---
 
@@ -765,7 +777,7 @@ kvquant/
 +-- csrc/              # GPU acceleration (optional, requires [cuda] extra)
     |-- pq_encode.py   # Triton PQ encode kernel (10-15x vs cdist loop)
     |-- softmax.py     # Triton row-wise softmax (3.5-8x vs F.softmax)
-    +-- attention.py   # Flash attention bridge — WMMA/CuTe/Triton/SDPA cascade
+    +-- attention.py   # Flash attention bridge WMMA/CuTe/Triton/SDPA cascade
 ```
 
 ## Example Output
