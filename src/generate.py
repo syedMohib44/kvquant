@@ -216,10 +216,33 @@ def _int8_quantize_cache(past_key_values, kvs):
     return cache_q
 
 
-def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank):
+def _chunked_prefill(mdl, ids, chunk_size: int):
+    """
+    Prefill the model in chunks of `chunk_size` tokens to avoid OOM on long
+    documents.  Each chunk is fed with the previous chunk's KV cache as
+    past_key_values, so attention over the full context is preserved.
+
+    Returns the same object as a single full-context forward pass
+    (past_key_values covering all T_p tokens).
+    """
+    T = ids.shape[1]
+    past = None
+    for start in range(0, T, chunk_size):
+        chunk = ids[:, start : start + chunk_size]
+        with torch.no_grad():
+            out = mdl(chunk, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+    return past
+
+
+def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size: int = 512):
     """
     Run prefill on input_ids, calibrate per-layer quantizers on the resulting
     KV vectors, compress the cache, and return (past, avg_bits, T_p).
+
+    Long prompts (contracts, documents) are prefilled in chunks of
+    `prefill_chunk_size` tokens so the O(T²) attention matrix never exceeds
+    VRAM — the full context is still captured in the KV cache.
 
     The cache used for generation is an int8 round-trip (faithful per-vector
     scalar quantization) so that attention computation stays accurate.
@@ -234,10 +257,8 @@ def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank):
     ids = input_ids.to(device)
     T_p = ids.shape[1]
 
-    # Prefill — the resulting KV tensors are calibration data
-    with torch.no_grad():
-        prefill = mdl(ids, use_cache=True)
-    native_cache = prefill.past_key_values
+    # Prefill — chunked to keep each attention matrix at chunk_size² instead of T²
+    native_cache = _chunked_prefill(mdl, ids, prefill_chunk_size)
     kvs = kvs_from_cache(native_cache)
 
     # Per-layer calibration: compute avg_bits for the compression ratio stat
@@ -296,6 +317,7 @@ def generate(
     correction_rank: int = 0,
     raw: bool = False,
     system: Optional[str] = None,
+    prefill_chunk_size: int = 512,
     device: Optional[str] = None,
     device_map: Optional[str] = None,
 ) -> GenerateResult:
@@ -329,6 +351,13 @@ def generate(
                             Its KV vectors are quantized together with the user prompt
                             as part of the same prefill pass — no extra compute needed.
                             Ignored when raw=True.
+        prefill_chunk_size: Tokens processed per prefill step (default 512).
+                            Prefill attention is O(T²) — a long document on a
+                            consumer GPU (8 GB) will OOM with a single full-context
+                            forward pass.  Chunked prefill keeps each step at
+                            chunk_size² while the full context is still captured
+                            in the KV cache.  Lower values (256) use less VRAM;
+                            higher values (1024+) are faster on GPUs with more memory.
         device:             "cuda", "cpu", or None (auto-detect).
         device_map:         HuggingFace device_map for multi-GPU or CPU offload,
                             e.g. "auto", "balanced", "sequential".  When set,
@@ -377,7 +406,9 @@ def generate(
         mdl = mdl.to(_device)
 
     input_ids = _format_prompt(tok, prompt, raw, system=system)
-    past, avg_bits, T_p, ids = _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank)
+    past, avg_bits, T_p, ids = _build_quantized_cache(
+        mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size
+    )
 
     suppress_ids = _get_suppress_ids(tok)
 
@@ -433,6 +464,7 @@ def stream(
     correction_rank: int = 0,
     raw: bool = False,
     system: Optional[str] = None,
+    prefill_chunk_size: int = 512,
     device: Optional[str] = None,
     device_map: Optional[str] = None,
 ) -> Generator[str, None, None]:
@@ -469,7 +501,9 @@ def stream(
         mdl = mdl.to(_device)
 
     input_ids = _format_prompt(tok, prompt, raw, system=system)
-    past, _, T_p, ids = _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank)
+    past, _, T_p, ids = _build_quantized_cache(
+        mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size
+    )
 
     suppress_ids = _get_suppress_ids(tok)
 

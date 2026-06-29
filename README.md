@@ -317,13 +317,16 @@ print(out.text)
 out = generate("What is quantum entanglement?", bits=3)
 print(out.text)
 
-# Long document analysis — system sets the task, user supplies the document
+# Long document analysis — system sets the task, user supplies the document.
+# prefill_chunk_size keeps each attention step at chunk² instead of T²,
+# so even a 10 000-token contract fits on an 8 GB GPU.
 contract = open("contract.txt").read()
 out = generate(
     contract + "\n\nList all payment terms.",
     system="You are a legal analyst. Extract facts only, be concise.",
     bits=3,
     max_new_tokens=300,
+    prefill_chunk_size=512,   # lower (256) = less VRAM, higher (1024) = faster
 )
 print(out.text)
 
@@ -420,6 +423,52 @@ out = generate(
 )
 print(out.text)
 print(f"{out.compression_ratio:.1f}x vs float16")
+```
+
+---
+
+### Long documents — contracts, papers, codebases
+
+Prefill attention is O(T²). A 6 000-token contract on an 8 GB GPU OOMs with a single full-context forward pass. `prefill_chunk_size` processes the context in chunks so each attention step stays at `chunk² × heads` instead of `T² × heads`. The full context is still captured in the KV cache — no information is lost.
+
+```python
+from kvquant import generate, stream
+
+# Contract / legal document
+contract = open("contract.txt").read()
+out = generate(
+    contract + "\n\nList all payment terms.",
+    system="You are a legal analyst. Extract facts only.",
+    bits=3,
+    max_new_tokens=300,
+    prefill_chunk_size=512,   # default — fits on 8 GB GPU
+)
+print(out.text)
+
+# Research paper summary
+paper = open("paper.txt").read()
+out = generate(
+    paper + "\n\nSummarise the key contributions in bullet points.",
+    bits=3,
+    max_new_tokens=200,
+    prefill_chunk_size=512,
+)
+print(out.text)
+
+# Tune chunk size for your GPU:
+#   prefill_chunk_size=256   →  ~0.5 GB prefill VRAM  (very safe, slower)
+#   prefill_chunk_size=512   →  ~1.5 GB prefill VRAM  (default, balanced)
+#   prefill_chunk_size=1024  →  ~4.0 GB prefill VRAM  (faster, needs more VRAM)
+
+# Stream a long document on limited VRAM
+for token in stream(
+    contract + "\n\nWhat are the termination conditions?",
+    system="You are a legal analyst.",
+    bits=3,
+    prefill_chunk_size=256,   # most conservative — works on 6 GB GPUs
+):
+    print(token, end="", flush=True)
+print()
 ```
 
 ---
