@@ -122,160 +122,28 @@ End-to-end perplexity on distilgpt2 confirms that quantization quality improveme
 
 ---
 
+---
+
+# Using the package
+
+> Install via pip and use from any Python environment. No repo clone needed.
+
+---
+
 ## Installation
 
-### 1. Create and activate a conda environment
-
 ```bash
-conda create -n kvquant python=3.11 -y
-conda activate kvquant
+pip install kvquant-plus-plus           # GPU kernels (Triton JIT) included
+pip install "kvquant-plus-plus[cuda]"   # same + explicit Triton version pin
 ```
-
-### 2. Install PyTorch
-
-Follow the instructions at https://pytorch.org/get-started/locally/ for your platform, or for a CPU-only install:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
-
-### 3. Install the package (editable)
-
-Run this from the `kvquant/` directory (the folder that contains `pyproject.toml`):
-
-```bash
-pip install -e .           # includes GPU kernels (Triton JIT) + PyTorch fallbacks
-pip install -e ".[dev]"    # + pytest
-pip install -e ".[cuda]"   # + explicit Triton version pin (optional)
-```
-
-This installs all dependencies (`torch`, `transformers`, `numpy`, `matplotlib`, `cuda-triton-kernels`) and makes the `kvquant` package importable from anywhere as long as the environment is active.
 
 **Requirements:** Python >= 3.10, PyTorch >= 2.1, Transformers >= 4.40
 
-GPU kernels (Triton JIT softmax, flash attention, matmul) are included in the base install no `[cuda]` extra needed. All paths fall back to pure PyTorch automatically on CPU, AMD, or Apple MPS. For maximum flash attention performance, build the optional WMMA/CUTLASS CUDA extensions from source (see [GPU Acceleration](#gpu-acceleration) below).
-
-### 4. Configure VS Code (optional)
-
-1. Open VS Code in the `kvquant` folder.
-2. Press `Ctrl+Shift+P` -> **Python: Select Interpreter** -> choose the `kvquant` conda environment (path will look like `~\anaconda3\envs\kvquant\python.exe`).
-3. Press `Ctrl+Shift+P` -> **Developer: Reload Window**.
-
-If Pylance still shows `Import "kvquant" could not be resolved`, add this to your `.vscode/settings.json`:
-
-```json
-{
-  "python.analysis.extraPaths": [".."]
-}
-```
-
-(The `..` points one level above the `kvquant` folder so that `import kvquant` resolves correctly.)
+GPU kernels (Triton JIT softmax, flash attention, matmul) are included in the base install no `[cuda]` extra needed. All paths fall back to pure PyTorch automatically on CPU, AMD, or Apple MPS.
 
 ---
 
-## Running demos
-
-Run from the repo root with the `kvquant` conda env active:
-
-```bash
-# Basic quantization examples (no model download needed)
-python -m kvquant.demo
-
-# All 5 novel extensions on real data
-python -m kvquant.demo_extensions
-
-# Regenerate all plots
-python -m kvquant.visualize
-
-# Perplexity benchmark (distilgpt2 vs 2/3/4-bit KV cache)
-python -m kvquant.eval_ppl
-python -m kvquant.eval_ppl --model gpt2-medium --correction-rank 4
-```
-
-### demo_llm interactive generation at different bit-widths
-
-Runs the same prompt through unquantized, 2-bit, 3-bit, and 4-bit KV caches side by side so you can see the quality difference directly.
-
-```bash
-# Default benchmark (distilgpt2, no download)
-python -m kvquant.demo_llm
-
-# Base model auto Q/A prompt format
-python -m kvquant.demo_llm \
-  --model distilgpt2 \
-  --prompt "What is the capital of France?" \
-  --max-new-tokens 30
-
-# Instruct model uses the model's built-in chat template
-python -m kvquant.demo_llm \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --prompt "Explain machine learning in simple terms" \
-  --max-new-tokens 80
-
-# TinyLlama fast, recommended for quick tests
-python -m kvquant.demo_llm \
-  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --prompt "What is nihilism?" \
-  --max-new-tokens 100
-
-# Hybrid model (Qwen3.5) auto-detected, uses native cache
-python -m kvquant.demo_llm \
-  --model Qwen/Qwen3.5-0.8B \
-  --prompt "What is AI?" \
-  --max-new-tokens 60
-
-# Sentence completion skip chat template with --raw
-python -m kvquant.demo_llm \
-  --model distilgpt2 \
-  --prompt "The Eiffel Tower is located in" \
-  --raw --max-new-tokens 20
-
-# Low-rank correction +11% quality at 3-bit
-python -m kvquant.demo_llm \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --prompt "Describe the water cycle" \
-  --correction-rank 4
-
-# Product Quantization 2 bits/dim via learned codebooks (73x faster encode)
-python -m kvquant.demo_llm \
-  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --prompt "What is nihilism?" \
-  --max-new-tokens 100 \
-  --product-quant
-
-# PQ + low-rank correction strongest combination at 2 bits/dim
-# PQ captures inter-dimension correlations; correction cleans up the residual
-python -m kvquant.demo_llm \
-  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --prompt "Explain the Turing test" \
-  --product-quant --pq-bits 8 --pq-subspaces 16 --correction-rank 4
-
-# Large model (requires enough VRAM or use device_map in Python API)
-python -m kvquant.demo_llm \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --prompt "Explain quantum entanglement" \
-  --max-new-tokens 80 --correction-rank 4
-
-# Mac / Apple MPS (suppress tokenizer parallelism warning)
-OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m kvquant.demo_llm \
-  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --prompt "What is the capital of France?" \
-  --max-new-tokens 20
-```
-
----
-
-## Quick start
-
-### Install from PyPI
-
-```bash
-pip install kvquant-plus-plus
-```
-
----
-
-### generate() full response
+## generate() full response
 
 Pass a prompt string, get back text. The model is downloaded on first call and cached in memory for subsequent calls.
 
@@ -298,7 +166,7 @@ print(out.text)
 
 ---
 
-### stream() print tokens as they arrive
+## stream() print tokens as they arrive
 
 ```python
 from kvquant import stream
@@ -310,23 +178,19 @@ print()
 
 ---
 
-### System prompt role, persona, or instructions
+## System prompt role, persona, or instructions
 
 Pass any combination of system and user prompt. Both are quantized together in a single prefill pass no extra compute cost.
 
 ```python
 from kvquant import generate, stream
 
-# System prompt only sets the model's role; user prompt is the question
+# System prompt sets the model's role; user prompt is the question
 out = generate(
     "What is quantum entanglement?",
     system="You are a physics professor. Answer at undergraduate level.",
     bits=3,
 )
-print(out.text)
-
-# User prompt only (system omitted same as before)
-out = generate("What is quantum entanglement?", bits=3)
 print(out.text)
 
 # Long document analysis system sets the task, user supplies the document.
@@ -354,7 +218,7 @@ print()
 
 ---
 
-### Bit-width options (2 / 3 / 4)
+## Bit-width options (2 / 3 / 4)
 
 ```python
 from kvquant import generate
@@ -374,110 +238,87 @@ print(f"{out.compression_ratio:.1f}x  {out.text}")
 
 ---
 
-### Sampling creative / varied output
+## Sampling creative / varied output
 
 ```python
 from kvquant import generate
 
-# Greedy (deterministic, default)
-out = generate("Once upon a time", bits=3, temperature=0.0)
-
-# Sampling with temperature
-out = generate("Once upon a time", bits=3, temperature=0.8)
-
-# Nucleus (top-p) sampling
-out = generate("Once upon a time", bits=3, temperature=0.8, top_p=0.95)
+out = generate("Once upon a time", bits=3, temperature=0.0)   # greedy
+out = generate("Once upon a time", bits=3, temperature=0.8)   # sampling
+out = generate("Once upon a time", bits=3, temperature=0.8, top_p=0.95)  # nucleus
 
 print(out.text)
 ```
 
 ---
 
-### Different models
+## Different models
 
 Works with any HuggingFace causal LM instruct, base, and hybrid architectures (Qwen, Llama, Phi, Mistral, Falcon, Gemma …).
 
 ```python
 from kvquant import generate
 
-# Small instruct model (default, downloads ~1 GB)
 out = generate("What is quantum entanglement?",
-               model="Qwen/Qwen2.5-1.5B-Instruct", bits=3)
+               model="Qwen/Qwen2.5-1.5B-Instruct", bits=3)       # default
 
-# TinyLlama fast, great for testing
 out = generate("What is the capital of France?",
-               model="TinyLlama/TinyLlama-1.1B-Chat-v1.0", bits=3)
+               model="TinyLlama/TinyLlama-1.1B-Chat-v1.0", bits=3)  # fast/small
 
-# Larger instruct model
 out = generate("Explain the Turing test",
-               model="Qwen/Qwen2.5-7B-Instruct", bits=3)
+               model="Qwen/Qwen2.5-7B-Instruct", bits=3)          # larger
 
-# Base (non-instruct) model use raw=True for sentence completion
 out = generate("The Eiffel Tower is located in",
-               model="distilgpt2", bits=3, raw=True)
+               model="distilgpt2", bits=3, raw=True)               # base model
 
 print(out.text)
 ```
 
 ---
 
-### Multi-GPU large models
+## Multi-GPU large models
 
 ```python
 from kvquant import generate
 
-# device_map="auto" spreads the model across all available GPUs
 out = generate(
     "Explain quantum computing in detail",
     model="meta-llama/Llama-3.1-8B-Instruct",
     bits=3,
-    device_map="auto",
+    device_map="auto",   # spreads model across all available GPUs
 )
 print(out.text)
-print(f"{out.compression_ratio:.1f}x vs float16")
 ```
 
 ---
 
-### Long documents contracts, papers, codebases
+## Long documents contracts, papers, codebases
 
-Prefill attention is O(T²). A 6 000-token contract on an 8 GB GPU OOMs with a single full-context forward pass. `prefill_chunk_size` processes the context in chunks so each attention step stays at `chunk² × heads` instead of `T² × heads`. The full context is still captured in the KV cache no information is lost.
+Prefill attention is O(T²). A 6 000-token contract on an 8 GB GPU OOMs in a single forward pass. `prefill_chunk_size` processes context in chunks each step stays at `chunk² × heads` while the full context accumulates in the KV cache. No information is lost.
 
 ```python
 from kvquant import generate, stream
 
-# Contract / legal document
 contract = open("contract.txt").read()
 out = generate(
     contract + "\n\nList all payment terms.",
     system="You are a legal analyst. Extract facts only.",
     bits=3,
     max_new_tokens=300,
-    prefill_chunk_size=512,   # default fits on 8 GB GPU
-)
-print(out.text)
-
-# Research paper summary
-paper = open("paper.txt").read()
-out = generate(
-    paper + "\n\nSummarise the key contributions in bullet points.",
-    bits=3,
-    max_new_tokens=200,
     prefill_chunk_size=512,
 )
 print(out.text)
 
-# Tune chunk size for your GPU:
-#   prefill_chunk_size=256   →  ~0.5 GB prefill VRAM  (very safe, slower)
-#   prefill_chunk_size=512   →  ~1.5 GB prefill VRAM  (default, balanced)
-#   prefill_chunk_size=1024  →  ~4.0 GB prefill VRAM  (faster, needs more VRAM)
+# Tune for your GPU:
+#   prefill_chunk_size=256   →  ~0.5 GB prefill VRAM  (safe, slower)
+#   prefill_chunk_size=512   →  ~1.5 GB prefill VRAM  (default)
+#   prefill_chunk_size=1024  →  ~4.0 GB prefill VRAM  (faster)
 
-# Stream a long document on limited VRAM
 for token in stream(
     contract + "\n\nWhat are the termination conditions?",
     system="You are a legal analyst.",
     bits=3,
-    prefill_chunk_size=256,   # most conservative works on 6 GB GPUs
+    prefill_chunk_size=256,
 ):
     print(token, end="", flush=True)
 print()
@@ -485,18 +326,15 @@ print()
 
 ---
 
-### Low-rank error correction (+11% quality)
-
-At 2-bit and 3-bit, a rank-4 SVD correction of the quantization residual recovers ~11% of the MSE at only 6–7% extra storage. Recommended for low bit-widths.
+## Low-rank error correction (+11% quality)
 
 ```python
 from kvquant import generate
 
 out = generate(
     "Explain the history of the Roman Empire",
-    model="Qwen/Qwen2.5-1.5B-Instruct",
     bits=3,
-    correction_rank=4,    # 0 = disabled (default), 4 = recommended
+    correction_rank=4,    # 0 = off (default), 4 = recommended at 2–3 bit
     max_new_tokens=300,
 )
 print(out.text)
@@ -504,23 +342,16 @@ print(out.text)
 
 ---
 
-### Repetition control
+## Repetition control
 
 ```python
 from kvquant import generate
 
-# Default repetition_penalty=1.3 already handles most cases
-# Increase to 1.5-2.0 if you see looping at 2-bit
+# Default repetition_penalty=1.3 handles most cases
+# Raise to 1.5–2.0 if you see looping at 2-bit
 out = generate("Tell me about AI", bits=2, repetition_penalty=1.5)
 print(out.text)
 ```
-
----
-
-> **What are keys and values?**  When a language model processes text it stores intermediate
-> representations called the KV cache one key and value vector per token per layer.
-> These tensors grow with context length and consume most of GPU memory during inference.
-> kvquant compresses them from 16 bits to 2–4 bits with minimal quality loss.
 
 ---
 
@@ -528,216 +359,87 @@ print(out.text)
 
 For integrating directly into a training loop, custom transformer, or research pipeline. All classes accept KV tensors as-is `(T, head_dim)`, `(B, H, T, head_dim)`, or anything in between.
 
----
-
-### KVCacheQuantizer compress / decompress a KV cache
+### KVCacheQuantizer
 
 ```python
 from kvquant import KVCacheQuantizer
 
-# keys, values: KV tensors from your transformer, shape (..., head_dim)
-head_dim = keys.shape[-1]
-
 quant = KVCacheQuantizer(head_dim=head_dim, num_bits=3)
+quant.calibrate(keys, values)           # calibrate on actual prefill KVs
 
-# One-shot calibration use the actual prefill KVs from your context
-quant.calibrate(keys, values)
-
-# Compress (K uses inner-product-optimal, V uses MSE-optimal quantization)
 k_c, v_c     = quant.compress_kv(keys, values)
 k_hat, v_hat = quant.decompress_kv(k_c, v_c)
 
 print(f"avg bits/dim: {quant.avg_bits:.2f}")
 ```
 
----
-
-### AttentionWeightedQuantizer more bits for tokens the model attends to
-
-Sink tokens (positions 0–3) are always pinned to `hi_bits` regardless of their attention score.
+### AttentionWeightedQuantizer
 
 ```python
 from kvquant import AttentionWeightedQuantizer
 
 awq = AttentionWeightedQuantizer(dim=head_dim, hi_bits=4, lo_bits=2, top_fraction=0.5)
-
-# keys: (..., T, head_dim)   query: (..., head_dim)
 compressed = awq.quantize(keys, query)
 k_hat      = awq.dequantize(compressed)
-
-print(f"avg bits: {awq.avg_bits:.2f}")   # 3.0 at top_fraction=0.5
+print(f"avg bits: {awq.avg_bits:.2f}")
 ```
 
----
-
-### DeltaKVCache streaming / autoregressive generation
-
-Compresses token-to-token deltas instead of absolute vectors. Works because consecutive KV vectors are highly correlated (1.1–2.2x lower MSE than absolute compression at the same bit-width).
+### DeltaKVCache
 
 ```python
 from kvquant import DeltaKVCache
 
 cache = DeltaKVCache(head_dim=head_dim, num_bits=3)
-
-# During generation call once per new token
-for k_new, v_new in token_stream:     # k_new, v_new: (..., head_dim)
+for k_new, v_new in token_stream:
     cache.push(k_new, v_new)
 
-K_hat, V_hat = cache.get()            # full reconstructed cache, O(1)
-print(f"cache length: {cache.length}")
+K_hat, V_hat = cache.get()
 ```
 
----
-
-### AdaptiveKVCache importance-based bit allocation
-
-Tracks a running EMA importance score per token position and dynamically reassigns bits. High-importance tokens get more bits; low-importance tokens are compressed further. Sink tokens (positions 0–3) are always kept at `hi_bits`.
+### AdaptiveKVCache
 
 ```python
 from kvquant import AdaptiveKVCache
 
-cache = AdaptiveKVCache(head_dim=head_dim)   # tiers: 4 / 3 / 2 / 1 bits
-
-# Prefill
+cache = AdaptiveKVCache(head_dim=head_dim)
 for k_new, v_new in token_stream:
     cache.push(k_new, v_new)
 
-# After each forward pass, supply the softmax attention weights
-cache.attend(attn_weights)    # attn_weights: (..., T) from your softmax
-
+cache.attend(attn_weights)    # attn_weights: (..., T)
 K_hat, V_hat = cache.get()
 print(cache.bit_allocation()) # e.g. {4: 8, 3: 50, 2: 60, 1: 10}
-print(f"avg bits: {cache.avg_bits():.2f}")
 ```
 
----
-
-### LowRankCorrection SVD residual correction
-
-Captures the structured part of quantization error with a rank-r SVD. Reduces MSE by ~11% at rank-4, ~19% at rank-8, using only 6–7% extra storage.
+### LowRankCorrection
 
 ```python
 from kvquant import LowRankCorrection, KVQuantMSE
 
 lrc = LowRankCorrection(quantizer=KVQuantMSE(dim=head_dim, num_bits=2), rank=4)
-
-# Quantize + correct in one call
 k_corrected = lrc.forward(keys)
-
-# Analyse how much energy each rank captures
 energy = lrc.residual_rank_analysis(keys, max_rank=8)
-print(energy)   # cumulative fraction at each rank
 ```
 
----
-
-### ProductQuantizer subspace codebook quantization
-
-Splits each vector into M subspaces and encodes each independently using a learned codebook. Encode is 73x faster than a cdist loop via the included Triton kernel.
+### ProductQuantizer
 
 ```python
 from kvquant import ProductQuantizer
 
 pq = ProductQuantizer(dim=head_dim, num_subspaces=16, bits_per_subspace=8)
-
-# Calibrate codebooks on a pool of vectors
 pq.calibrate(keys.reshape(-1, head_dim))
 
 compressed = pq.quantize(keys.reshape(-1, head_dim))
 k_hat      = pq.dequantize(compressed)
-
 print(f"compression ratio: {pq.compression_ratio():.1f}x vs float32")
-print(f"effective bits/dim: {pq.effective_bits:.2f}")
-```
-
----
-
-## Running tests
-
-```bash
-# From the repo root
-python -m pytest test_kvquant.py -v   # 88 tests, all pass
-# or simply:
-pytest
 ```
 
 ---
 
 ## GPU Acceleration
 
-GPU kernels are included in the base install no extra flag needed:
+GPU kernels (Triton JIT) are included in the base install and compile on first use no build step needed. Falls back to PyTorch automatically on CPU, AMD, or Apple MPS.
 
-```bash
-pip install kvquant-plus-plus
-```
-
-For an explicit Triton version pin:
-
-```bash
-pip install "kvquant-plus-plus[cuda]"
-```
-
-| Hot path | Mechanism | Speedup |
-|---|---|---|
-| PQ encode (M=16 subspace lookups) | Triton kernel all M subspaces in one GPU launch | **10--15x** |
-| FWHT (d=128, 7 butterfly iterations) | `torch.compile` fuses 7 kernel launches into 1 | **2--3x** |
-| Attention softmax (AWQ path) | Triton row-wise fused exp+sum+div | **3.5--8x** |
-| QJL projection `r @ S.T > 0` | `torch.compile` fuses matmul + compare | **1.5--2x** |
-| Flash attention (post-decompression) | WMMA / CuTe CUDA → Triton → PyTorch SDPA cascade | **up to native FA-2 speed** |
-
-Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) and compile JIT on first call no `nvcc`, no build step.
-
-### Flash attention backend
-
-`pip install "kvquant-plus-plus[cuda]"` also installs `cuda-triton-kernels`, which provides `attention_bhsd` a multi-head flash attention function for `(B, H, T, d)` tensors (KVQuant's native layout):
-
-```python
-from kvquant.csrc.attention import attention_bhsd, attention_backend
-
-# q, k, v: (batch, heads, seqlen, head_dim)
-out = attention_bhsd(q, k, v, is_causal=False)
-
-print(attention_backend())
-# → "flash_attn_cuda (WMMA)"           fastest requires CUDA build step (see below)
-# → "flash_attn_cutlass (CuTe)"        fast requires CUDA build step (see below)
-# → "flash_attention_triton (Triton)"  JIT available with [cuda] install, no build
-# → "scaled_dot_product_attention (PyTorch)"  always available fallback
-```
-
-The Triton backend is active out of the box after `pip install "kvquant-plus-plus[cuda]"`. The WMMA and CuTe CUDA backends give additional speedups but require building C++ extensions from source (see below).
-
-### Optional: build CUDA flash attention extensions
-
-For maximum flash attention performance, build the CUDA extensions from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch). These require `nvcc` (CUDA Toolkit 12.x/13.x) and, on Windows, Visual Studio Build Tools 2019+.
-
-```bash
-git clone https://github.com/syedMohib44/cuda-triton-multiarch.git
-cd cuda-triton-multiarch
-
-# Linux / WSL2
-make build-fac            # WMMA FlashAttention (SM75/80/86/89/120)
-make build-fac-cutlass    # CuTe/CUTLASS FlashAttention (SM80+)
-
-# Windows (Native)
-powershell -ExecutionPolicy Bypass -File Makefile.windows.ps1 build-fac
-powershell -ExecutionPolicy Bypass -File Makefile.windows.ps1 build-fac-cutlass
-```
-
-After building, `attention_bhsd` automatically picks up the compiled extensions no code changes needed. Check the active backend with `attention_backend()`.
-
-**GPU support:** any NVIDIA GPU SM >= 7.5 (RTX 20xx / 30xx / 40xx / 50xx, A100, H100). Falls back silently to PyTorch on CPU, AMD, or Apple MPS.
-
-| GPU family | SM | Supported |
-|---|---|---|
-| RTX 20xx / T4 | SM 75 | Yes |
-| RTX 30xx / A10 | SM 86 | Yes |
-| RTX 40xx / L40S | SM 89 | Yes |
-| RTX 50xx (Blackwell) | SM 120 | Yes |
-| A100 | SM 80 | Yes |
-| H100 | SM 90 | Yes |
-| CPU / Apple MPS | -- | PyTorch fallback |
-
-**Windows support:** `pip install "kvquant-plus-plus[cuda]"` automatically installs `triton-windows` on Windows and `triton` on Linux/macOS no manual steps. GPU kernel performance is identical across platforms (same PTX/CUBIN). Kernels are adapted from [cuda-triton-multiarch](https://github.com/syedMohib44/cuda-triton-multiarch) which also supports Windows natively.
+For full details on supported GPUs, backends, and performance numbers see the [cuda-triton-multiarch README](https://github.com/syedMohib44/cuda-triton-multiarch/blob/main/README.md).
 
 ---
 
@@ -759,109 +461,86 @@ After building, `attention_bhsd` automatically picks up the compiled extensions 
 
 ---
 
+---
+
+# For contributors
+
+> Clone the repo and set up a local dev environment.
+
+---
+
+## Setup
+
+```bash
+conda create -n kvquant python=3.11 -y
+conda activate kvquant
+
+# Install PyTorch follow https://pytorch.org/get-started/locally/ or CPU-only:
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install package in editable mode
+pip install -e .          # base + GPU kernels
+pip install -e ".[dev]"   # + pytest
+```
+
+---
+
+## Running demos
+
+```bash
+# Basic quantization (no model download needed)
+python -m kvquant.demo
+
+# All 5 extensions on real data
+python -m kvquant.demo_extensions
+
+# Regenerate all plots
+python -m kvquant.visualize
+
+# Perplexity benchmark
+python -m kvquant.eval_ppl
+python -m kvquant.eval_ppl --model gpt2-medium --correction-rank 4
+
+# Interactive generation at different bit-widths
+python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "Explain ML" --max-new-tokens 80
+```
+
+---
+
+## Running tests
+
+```bash
+python -m pytest test_kvquant.py -v   # 88 tests, all pass
+```
+
+---
+
+## Building CUDA flash attention extensions (optional)
+
+Build instructions, requirements, and supported SM targets are in the [cuda-triton-multiarch README](https://github.com/syedMohib44/cuda-triton-multiarch/blob/main/README.md).
+
+---
+
 ## Architecture
 
 ```
 kvquant/
-|-- quantizer.py       # KVQuantMSE, KVQuantIP
-|-- rotation.py        # RandomRotation (QR), HadamardRotation (WHT)
-|-- codebook.py        # Lloyd-Max on true sphere distribution
-|-- entropy.py         # Huffman coding on indices
-|-- outlier.py         # Per-channel bit allocation for outliers
-|-- kv_cache.py        # KVCacheQuantizer - high-level (B,H,T,d) API
-|-- attn_weighted.py   # Extension 1: attention-weighted quantization
-|-- delta.py           # Extension 2: delta / temporal compression
-|-- adaptive.py        # Extension 3: EMA-based adaptive bit allocation
-|-- correction.py      # Extension 4: low-rank error correction
+|-- quantizer.py          # KVQuantMSE, KVQuantIP
+|-- rotation.py           # RandomRotation (QR), HadamardRotation (WHT)
+|-- codebook.py           # Lloyd-Max on true sphere distribution
+|-- entropy.py            # Huffman coding on indices
+|-- outlier.py            # Per-channel bit allocation for outliers
+|-- kv_cache.py           # KVCacheQuantizer - high-level (B,H,T,d) API
+|-- attn_weighted.py      # Extension 1: attention-weighted quantization
+|-- delta.py              # Extension 2: delta / temporal compression
+|-- adaptive.py           # Extension 3: EMA-based adaptive bit allocation
+|-- correction.py         # Extension 4: low-rank error correction
 |-- product_quantizer.py  # Extension 5: product quantization
-+-- csrc/              # GPU acceleration (optional, requires [cuda] extra)
-    |-- pq_encode.py   # Triton PQ encode kernel (10-15x vs cdist loop)
-    |-- softmax.py     # Triton row-wise softmax (3.5-8x vs F.softmax)
-    +-- attention.py   # Flash attention bridge WMMA/CuTe/Triton/SDPA cascade
++-- csrc/                 # GPU acceleration
+    |-- pq_encode.py      # Triton PQ encode kernel (10-15x vs cdist loop)
+    |-- softmax.py        # Triton row-wise softmax (3.5-8x vs F.softmax)
+    +-- attention.py      # Flash attention bridge: WMMA/CuTe/Triton/SDPA
 ```
-
-## Example Output
-
-```bash
-python -m kvquant.demo_llm --prompt "Hi how are you?"
-```
----- Interactive generation ------------------------------------
-  Prompt : 'Hi how are you?'
-
-  Unquant: Hi how are you? I'm a big fan of the game and I'm really excited to see how it will be released. I'm really excited to see how it will be released. I'm really excited to see how
-
-  2-bit  : Hi how are you? I's a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is a guy who is
-
-  3-bit  : Hi how are you? I'm a little bit shy, but I'm a little bit shy, but I'm a little bit shy, but I'm a little bit shy, but
-  
-  4-bit  : Hi how are you? I'm a big fan of the game and I'm really excited to see what you do. I'm really excited to see what you do. I'm a big fan of the game and I'm
-----------------------------------------------------------------
-
----
-
-## Publishing to PyPI
-
-### Build the package
-
-Run from the **parent** directory of `kvquant/` (i.e., one level up):
-
-```bash
-cd ..
-python -m build kvquant
-```
-
-This produces two files in `kvquant/dist/`:
-- `kvquant_plus_plus-x.x.x-py3-none-any.whl`
-- `kvquant_plus_plus-x.x.x.tar.gz`
-
-### Upload to PyPI
-
-```bash
-twine upload kvquant/dist/kvquant_plus_plus-x.x.x*
-```
-
-Credentials are read from `~/.pypirc`:
-
-```ini
-[pypi]
-username = __token__
-password = pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-Or via environment variables:
-
-```bash
-set TWINE_USERNAME=__token__
-set TWINE_PASSWORD=pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-twine upload kvquant/dist/*
-```
-
-### Version bumps
-
-Update `version` in `pyproject.toml` before each release. PyPI does not allow overwriting an existing version.
-
-```toml
-[project]
-version = "0.1.2"
-```
-
-Then rebuild and upload:
-
-```bash
-python -m build kvquant
-twine upload kvquant/dist/kvquant_plus_plus-0.1.2*
-```
-
-### Install from PyPI
-
-```bash
-pip install kvquant-plus-plus              # GPU kernels included (Triton JIT)
-pip install "kvquant-plus-plus[cuda]"      # same + explicit Triton version pin
-```
-
-PyPI page: https://pypi.org/project/kvquant-plus-plus/
-
----
 
 ## Citation
 
