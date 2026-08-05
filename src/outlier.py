@@ -160,10 +160,8 @@ class OutlierKVQuant(nn.Module):
         """
         self._check_calibrated()
         shape = x.shape
-        # Permute channels to contiguous layout: outliers first, then regular.
-        # Slicing [:, :n_outlier] / [:, n_outlier:] is a simple strided view -
-        # no scatter/gather overhead compared to fancy indexing.
-        flat = x.reshape(-1, self.dim)[:, self.perm]  # (N, d) contiguous
+        perm = self.perm.to(x.device)
+        flat = x.reshape(-1, self.dim)[:, perm]  # (N, d) contiguous
 
         x_out = flat[:, : self.n_outlier]  # (N, n_outlier)
         x_reg = flat[:, self.n_outlier :]  # (N, n_regular)
@@ -191,7 +189,8 @@ class OutlierKVQuant(nn.Module):
         # Concatenate in permuted order, then invert permutation back to original
         # channel order.  inv_perm indexing is a single gather - no scatter needed.
         permuted = torch.cat([x_out, x_reg], dim=1)  # (N, d) in perm order
-        out = permuted[:, self.inv_perm]  # (N, d) original order
+        inv_perm = self.inv_perm.to(permuted.device)
+        out = permuted[:, inv_perm]  # (N, d) original order
 
         return out.reshape(q.shape)
 

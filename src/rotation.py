@@ -47,11 +47,11 @@ class RandomRotation(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """y = x @ Pi.T"""
-        return x @ self.Pi.T
+        return x @ self.Pi.to(x.device).T
 
     def inverse(self, y: Tensor) -> Tensor:
         """x = y @ Pi  (Pi^{-1} = Pi^T for orthogonal matrices)"""
-        return y @ self.Pi
+        return y @ self.Pi.to(y.device)
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, seed={self.seed}"
@@ -101,12 +101,12 @@ class HadamardRotation(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, x: Tensor) -> Tensor:
         """y = WHT(D * x) / sqrt(d)"""
-        return _fwht(x * self.signs) / math.sqrt(self.dim)
+        return _fwht(x * self.signs.to(x.device)) / math.sqrt(self.dim)
 
     def inverse(self, y: Tensor) -> Tensor:
         """x = D * (WHT(y) / sqrt(d))  - WHT is self-inverse up to 1/d factor"""
         # H^{-1} = H / d, so: x = D * H(y) / d = D * (H(y) / sqrt(d)) / sqrt(d)
-        return self.signs * (_fwht(y) / math.sqrt(self.dim))
+        return self.signs.to(y.device) * (_fwht(y) / math.sqrt(self.dim))
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, seed={self.seed}"

@@ -67,6 +67,7 @@ _qjl_project_compiled = None
 def _qjl_project_dispatch(r_unit: Tensor, S: Tensor):
     global _qjl_project_compiled
     N = r_unit.shape[0]
+    S = S.to(r_unit.device)
     if r_unit.is_cuda and N >= _QJL_COMPILE_MIN_N:
         if _qjl_project_compiled is None:
             for backend in ("inductor", "cudagraphs"):
@@ -187,7 +188,7 @@ class KVQuantMSE(nn.Module):
         y = self.rotation(x_unit)  # (N, d)
 
         # Nearest centroid via binary search - boundaries cached from build_codebook
-        indices = torch.bucketize(y, self.boundaries)  # (N, d)
+        indices = torch.bucketize(y, self.boundaries.to(y.device))  # (N, d)
 
         return QuantizedMSE(
             indices=indices.reshape(*shape[:-1], self.dim),
@@ -208,12 +209,13 @@ class KVQuantMSE(nn.Module):
         N = q.indices.reshape(-1, self.dim).shape[0]
         idx_flat = q.indices.reshape(N, self.dim)
         norms_flat = q.norms.reshape(N, 1)
+        device = idx_flat.device
 
-        y_tilde = self.centroids[idx_flat]  # (N, d)
-        x_unit_hat = self.rotation.inverse(y_tilde)  # (N, d)
+        y_tilde = self.centroids[idx_flat.to(self.centroids.device)]  # (N, d)
+        x_unit_hat = self.rotation.inverse(y_tilde).to(device)  # (N, d)
 
         # Restore scale
-        x_hat = x_unit_hat * norms_flat
+        x_hat = x_unit_hat * norms_flat.to(device)
         return x_hat.reshape(q.shape)
 
     def _quantize_unit(self, x_unit: Tensor) -> Tensor:
@@ -222,7 +224,7 @@ class KVQuantMSE(nn.Module):
         Skips norm computation and QuantizedMSE allocation.
         Used by KVQuantIP.quantize() to avoid double-normalising.
         """
-        return torch.bucketize(self.rotation(x_unit), self.boundaries)  # (N, d)
+        return torch.bucketize(self.rotation(x_unit), self.boundaries.to(x_unit.device))  # (N, d)
 
     def _dequantize_unit(self, idx_flat: Tensor) -> Tensor:
         """
@@ -230,8 +232,10 @@ class KVQuantMSE(nn.Module):
         Skips the norm-restore multiply and the QuantizedMSE allocation.
         Used internally by KVQuantIP.dequantize() where norms are always 1.
         """
-        y_tilde = self.centroids[idx_flat]  # (N, d)
-        return self.rotation.inverse(y_tilde)  # (N, d)
+        device = idx_flat.device
+        y_tilde = self.centroids[idx_flat.to(self.centroids.device)]  # (N, d)
+        result = self.rotation.inverse(y_tilde)
+        return result.to(device) if result.device != device else result
 
     def forward(self, x: Tensor) -> Tensor:
         """Quantize then immediately dequantize."""
@@ -375,6 +379,7 @@ class KVQuantIP(nn.Module):
         bits_flat = q.qjl_bits.reshape(N, self.dim).to(self.S.dtype)
         r_norm_flat = q.r_norm.reshape(N, 1)
         vec_norms_flat = q.vec_norms.reshape(N, 1)
+        device = idx_flat.device
 
         # --- Recover MSE component (unit scale) ---
         if self.mse_quantizer is not None:
@@ -383,7 +388,7 @@ class KVQuantIP(nn.Module):
             x_hat_unit = self.mse_quantizer._dequantize_unit(idx_flat)
         else:
             x_hat_unit = torch.zeros(
-                N, self.dim, device=self.S.device, dtype=self.S.dtype
+                N, self.dim, device=device, dtype=self.S.dtype
             )
 
         # --- QJL residual correction ---
@@ -392,12 +397,12 @@ class KVQuantIP(nn.Module):
         signs = 2.0 * bits_flat - 1.0  # {-1, +1}
         # signs @ S  ≡ per-row  S.T @ sign(S @ r)
         correction = (
-            (math.sqrt(math.pi / 2.0) / self.dim) * r_norm_flat * (signs @ self.S)
+            (math.sqrt(math.pi / 2.0) / self.dim) * r_norm_flat * (signs @ self.S.to(device))
         )
 
         # Combine and restore original scale
         x_tilde_unit = x_hat_unit + correction  # (N, d)
-        x_tilde = x_tilde_unit * vec_norms_flat
+        x_tilde = x_tilde_unit * vec_norms_flat.to(device)
 
         return x_tilde.reshape(q.shape)
 

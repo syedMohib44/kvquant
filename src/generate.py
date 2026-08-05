@@ -16,6 +16,21 @@ Supports any HuggingFace causal LM: instruct models, base models, hybrid
 architectures (Qwen2.5, Llama-3, Phi-3, Mistral, Falcon, Gemma, Mamba …).
 Works on CPU, single GPU, and multi-GPU via device_map="auto".
 
+Memory-efficient mode
+---------------------
+Pass offload_to_disk=True to enable tiered VRAM/RAM/disk offload of the
+quantized KV cache.  This is essential on GPUs with ≤ 8 GB VRAM (RTX 3070,
+3060, …) or when processing long prompts:
+
+    out = generate(
+        long_document + "\\n\\nSummarise:",
+        model="Qwen/Qwen2.5-1.5B-Instruct",
+        bits=3,
+        offload_to_disk=True,
+        max_vram_tokens=512,      # keep at most 512 token positions in VRAM
+        prefill_chunk_size=256,   # smaller chunks = lower peak VRAM
+    )
+
 The user's own prompt context is used as calibration data — the KV vectors
 from the prefill pass are exactly the data being quantized, so they are
 the ideal and most accurate calibration source. No separate corpus needed.
@@ -23,13 +38,14 @@ the ideal and most accurate calibration source. No separate corpus needed.
 
 from __future__ import annotations
 
+import gc
 import re
 from dataclasses import dataclass
 from typing import Generator, Optional
 
 import torch
 
-from .kv_cache import KVCacheQuantizer, kvs_from_cache, crop_model_cache
+from .kv_cache import KVCacheQuantizer, kvs_from_cache, crop_model_cache, KVCacheDiskOffload
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +192,6 @@ def _int8_quantize_cache(past_key_values, kvs):
     quantized to int8, then dequantized back to float.  Round-trip error is
     at most range/254 per coordinate, which is negligible compared to FP16.
     """
-    import copy
-
-    cache_q = copy.deepcopy(past_key_values)
-
     def _q8(t: torch.Tensor) -> torch.Tensor:
         """Per-vector (last dim) uint8 round-trip (stored as float, no dtype cast)."""
         dt = t.dtype
@@ -192,28 +204,28 @@ def _int8_quantize_cache(past_key_values, kvs):
         q = ((t_f - mn) / scale).round().clamp(0, 255)
         return (q * scale + mn).to(dt)
 
-    if hasattr(cache_q, "layers"):
-        for layer in cache_q.layers:
+    if hasattr(past_key_values, "layers"):
+        for layer in past_key_values.layers:
             k = getattr(layer, "keys", None)
             if isinstance(k, torch.Tensor):
                 layer.keys   = _q8(k)
                 layer.values = _q8(layer.values)
-    elif hasattr(cache_q, "key_cache"):
-        for i in range(len(cache_q.key_cache)):
-            k = cache_q.key_cache[i]
+    elif hasattr(past_key_values, "key_cache"):
+        for i in range(len(past_key_values.key_cache)):
+            k = past_key_values.key_cache[i]
             if isinstance(k, torch.Tensor):
-                cache_q.key_cache[i]   = _q8(k)
-                cache_q.value_cache[i] = _q8(cache_q.value_cache[i])
-    elif isinstance(cache_q, (tuple, list)):
+                past_key_values.key_cache[i]   = _q8(k)
+                past_key_values.value_cache[i] = _q8(past_key_values.value_cache[i])
+    elif isinstance(past_key_values, (tuple, list)):
         result = []
-        for k, v in cache_q:
+        for k, v in past_key_values:
             if isinstance(k, torch.Tensor):
                 result.append((_q8(k), _q8(v)))
             else:
                 result.append((k, v))
         return tuple(result)
 
-    return cache_q
+    return past_key_values
 
 
 def _chunked_prefill(mdl, ids, chunk_size: int):
@@ -320,6 +332,10 @@ def generate(
     prefill_chunk_size: int = 512,
     device: Optional[str] = None,
     device_map: Optional[str] = None,
+    offload_to_disk: bool = False,
+    max_vram_tokens: int = 512,
+    warm_size: int = 16,
+    disk_dir: Optional[str] = None,
 ) -> GenerateResult:
     """
     Generate text from a prompt using a quantized KV cache.
@@ -362,6 +378,16 @@ def generate(
         device_map:         HuggingFace device_map for multi-GPU or CPU offload,
                             e.g. "auto", "balanced", "sequential".  When set,
                             `device` is ignored.
+        offload_to_disk:    If True, quantized KV cache is spilled to RAM/disk
+                            between forward passes to keep VRAM bounded.  Essential
+                            for long-context generation on GPUs with ≤ 8 GB VRAM.
+                            Uses KVCacheDiskOffload internally.
+        max_vram_tokens:    Max token positions to keep dequantized in VRAM at once
+                            when offload_to_disk=True (default 512).
+        warm_size:          Max full-layer quantized entries to keep in CPU RAM
+                            before spilling to disk (default 16).
+        disk_dir:           Directory for disk spill files.  Defaults to a temp dir
+                            that is auto-cleaned on exit.
 
     Returns:
         GenerateResult with .text, .bits, .avg_bits_per_dim, .compression_ratio.
@@ -392,6 +418,16 @@ def generate(
                        bits=3, device_map="auto")
         print(out.text)
         print(f"{out.compression_ratio:.1f}x vs float16")
+
+        # Memory-constrained laptop (RTX 3070, 16 GB RAM)
+        out = generate(
+            long_document + "\\n\\nSummarise:",
+            model="Qwen/Qwen2.5-1.5B-Instruct",
+            bits=3,
+            offload_to_disk=True,
+            max_vram_tokens=512,
+            prefill_chunk_size=256,
+        )
     """
     # Resolve device
     if device_map is not None:
@@ -412,33 +448,86 @@ def generate(
 
     suppress_ids = _get_suppress_ids(tok)
 
-    # First token from the compressed cache.
-    # Crop to T_p-1 so the last prefill token is processed at the correct position,
-    # then keep the updated cache (use_cache=True) for the generation loop.
-    # Older transformers honoured past_key_values with use_cache=False; transformers
-    # 5.x ignores it, so we always use use_cache=True here.
-    past_crop = crop_model_cache(past, T_p - 1)
-    with torch.no_grad():
-        first_out = mdl(ids[:, -1:], past_key_values=past_crop, use_cache=True)
-    first_logits = first_out.logits[:, -1, :]
-    past = first_out.past_key_values   # T_p KVs — quantized prefill + exact last token
+    if offload_to_disk:
+        # Build per-layer quantizers for disk offload
+        n_heads, n_kv_heads, head_dim = _model_dims(mdl)
+        gqa      = n_heads // n_kv_heads
+        n_outlier = max(4, head_dim // 4)
+        kvc_layers: list[KVCacheQuantizer] = []
+        kvs = kvs_from_cache(past)
+        for lk, lv in kvs:
+            kvc_l = KVCacheQuantizer(
+                head_dim=head_dim,
+                num_bits=bits,
+                use_outlier=True,
+                n_outlier=n_outlier,
+                outlier_bits=min(bits + 1, 8),
+                regular_bits=max(bits - 1, 1),
+                gqa_factor=gqa,
+            )
+            kvc_l.calibrate(lk, lv)
+            kvc_layers.append(kvc_l)
+
+        offload = KVCacheDiskOffload(
+            quantizer=kvc_layers,
+            max_vram_tokens=max_vram_tokens,
+            warm_size=warm_size,
+            disk_dir=disk_dir,
+        )
+        offload.store(past)
+        del past
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # First token
+        past_first = offload.stage_for_forward()
+        with torch.no_grad():
+            first_out = mdl(ids[:, -1:], past_key_values=past_first, use_cache=True)
+        first_logits = first_out.logits[:, -1, :]
+        offload.replace(first_out.past_key_values)
+        del past_first
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        # Original path: crop and run first token
+        past_crop = crop_model_cache(past, T_p - 1)
+        with torch.no_grad():
+            first_out = mdl(ids[:, -1:], past_key_values=past_crop, use_cache=True)
+        first_logits = first_out.logits[:, -1, :]
+        past = first_out.past_key_values   # T_p KVs — quantized prefill + exact last token
+
     first_logits = _suppress(first_logits, suppress_ids)
 
     generated = [_sample_next(first_logits, temperature, top_p)]
     seen_ids  = ids[0].tolist()
 
     for _ in range(max_new_tokens - 1):
-        with torch.no_grad():
-            step = mdl(generated[-1], past_key_values=past, use_cache=True)
+        if offload_to_disk:
+            past_step = offload.stage_for_forward()
+            with torch.no_grad():
+                step = mdl(generated[-1], past_key_values=past_step, use_cache=True)
+            offload.replace(step.past_key_values)
+            del past_step
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            with torch.no_grad():
+                step = mdl(generated[-1], past_key_values=past, use_cache=True)
+            past = step.past_key_values
         logits = step.logits[:, -1, :]
         logits = _suppress(logits, suppress_ids)
         logits = _apply_repetition_penalty(logits, seen_ids, repetition_penalty)
         next_tok = _sample_next(logits, temperature, top_p)
         seen_ids.append(next_tok.item())
         generated.append(next_tok)
-        past = step.past_key_values
         if next_tok.item() == tok.eos_token_id:
             break
+
+    if offload_to_disk:
+        offload.close()
 
     gen_ids = torch.cat(generated, dim=1)
     text = _clean_text(tok.decode(gen_ids[0], skip_special_tokens=True))
@@ -467,6 +556,10 @@ def stream(
     prefill_chunk_size: int = 512,
     device: Optional[str] = None,
     device_map: Optional[str] = None,
+    offload_to_disk: bool = False,
+    max_vram_tokens: int = 512,
+    warm_size: int = 16,
+    disk_dir: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """
     Stream generated text token-by-token from a quantized KV cache.
@@ -507,11 +600,53 @@ def stream(
 
     suppress_ids = _get_suppress_ids(tok)
 
-    past_crop = crop_model_cache(past, T_p - 1)
-    with torch.no_grad():
-        first_out = mdl(ids[:, -1:], past_key_values=past_crop, use_cache=True)
-    first_logits = first_out.logits[:, -1, :]
-    past = first_out.past_key_values   # T_p KVs — quantized prefill + exact last token
+    if offload_to_disk:
+        n_heads, n_kv_heads, head_dim = _model_dims(mdl)
+        gqa      = n_heads // n_kv_heads
+        n_outlier = max(4, head_dim // 4)
+        kvc_layers: list[KVCacheQuantizer] = []
+        kvs = kvs_from_cache(past)
+        for lk, lv in kvs:
+            kvc_l = KVCacheQuantizer(
+                head_dim=head_dim,
+                num_bits=bits,
+                use_outlier=True,
+                n_outlier=n_outlier,
+                outlier_bits=min(bits + 1, 8),
+                regular_bits=max(bits - 1, 1),
+                gqa_factor=gqa,
+            )
+            kvc_l.calibrate(lk, lv)
+            kvc_layers.append(kvc_l)
+
+        offload = KVCacheDiskOffload(
+            quantizer=kvc_layers,
+            max_vram_tokens=max_vram_tokens,
+            warm_size=warm_size,
+            disk_dir=disk_dir,
+        )
+        offload.store(past)
+        del past
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        past_first = offload.stage_for_forward()
+        with torch.no_grad():
+            first_out = mdl(ids[:, -1:], past_key_values=past_first, use_cache=True)
+        first_logits = first_out.logits[:, -1, :]
+        offload.replace(first_out.past_key_values)
+        del past_first
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        past_crop = crop_model_cache(past, T_p - 1)
+        with torch.no_grad():
+            first_out = mdl(ids[:, -1:], past_key_values=past_crop, use_cache=True)
+        first_logits = first_out.logits[:, -1, :]
+        past = first_out.past_key_values
+
     first_logits = _suppress(first_logits, suppress_ids)
 
     generated  = [_sample_next(first_logits, temperature, top_p)]
@@ -531,17 +666,30 @@ def stream(
             yield fragment
         prev_len = len(current_text)
 
-        with torch.no_grad():
-            step = mdl(generated[-1], past_key_values=past, use_cache=True)
+        if offload_to_disk:
+            past_step = offload.stage_for_forward()
+            with torch.no_grad():
+                step = mdl(generated[-1], past_key_values=past_step, use_cache=True)
+            offload.replace(step.past_key_values)
+            del past_step
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            with torch.no_grad():
+                step = mdl(generated[-1], past_key_values=past, use_cache=True)
+            past = step.past_key_values
         logits = step.logits[:, -1, :]
         logits = _suppress(logits, suppress_ids)
         logits   = _apply_repetition_penalty(logits, seen_ids, repetition_penalty)
         next_tok = _sample_next(logits, temperature, top_p)
         seen_ids.append(next_tok.item())
         generated.append(next_tok)
-        past = step.past_key_values
         if next_tok.item() == tok.eos_token_id:
             break
+
+    if offload_to_disk:
+        offload.close()
 
     # Yield any remaining text after the last token, skipping incomplete sequences.
     # Use the same raw decode as the loop (no _clean_text) so whitespace is consistent.

@@ -3,6 +3,16 @@ KVQuant hands-on demo.
 
 Run:  python -m kvquant.demo
 
+Memory tips for RTX 3070 / 16 GB RAM
+-------------------------------------
+1. Use bits=3 (default) or bits=2 for smaller KV cache.
+2. Use prefill_chunk_size=256 in generate() to reduce peak VRAM during prefill.
+3. Enable offload_to_disk=True in generate() / stream() to spill quantized cache
+   to RAM and disk between forward passes (uses KVCacheDiskOffload).
+4. Use device_map="auto" for CPU offload of model weights (CPU handles some
+   layers, GPU handles others).
+5. For very long contexts (>2K tokens), use --offload --max-vram-tokens 256.
+
 Sections
 --------
 1. MSE distortion vs bit-width  (Table 1 of the paper)

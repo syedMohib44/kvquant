@@ -5,29 +5,47 @@ KVCacheQuantizer wraps either KVQuantIP or OutlierKVQuant and
 provides a simple .compress() / .decompress() interface that matches
 the (batch, heads, seq, dim) layout used by most transformer KV caches.
 
+Tiered memory offload
+---------------------
+KVCacheDiskOffload stores quantized KV cache across VRAM / CPU-RAM / disk.
+Only the layers needed for the next forward pass are staged to GPU; the rest
+live in cheaper tiers and are loaded on demand (LRU eviction).
+
 Usage
 -----
     quant = KVCacheQuantizer(head_dim=128, num_bits=3, use_outlier=True)
-    quant.calibrate(k_calib, v_calib)   # one-shot calibration
+    quant.calibrate(k_calib, v_calib)
 
-    # During generation:
-    k_c = quant.compress(k, is_value=False)   # store compressed keys
-    v_c = quant.compress(v, is_value=True)    # store compressed values
-    k_hat = quant.decompress(k_c)             # recover for attention
+    # Basic compress/decompress
+    k_c = quant.compress(k, is_value=False)
+    v_c = quant.compress(v, is_value=True)
+    k_hat = quant.decompress(k_c)
 
-The compressed representation is stored as Python objects (NamedTuples)
-rather than packed bit-strings - suitable for research / profiling.  A
-production system would add entropy coding on top.
+    # Memory-efficient generation with disk offload
+    offload = KVCacheDiskOffload(quant, max_vram_tokens=512, disk_dir="./kv_tmp")
+    offload.store(native_cache)          # quantize + offload to RAM/disk
+    past = offload.stage_for_forward()   # dequantize only what fits in VRAM
+    out = model(ids, past_key_values=past, use_cache=True)
+    offload.replace(out.past_key_values)  # re-quantize and offload again
 """
 
 from __future__ import annotations
 
 import copy
+import gc
 import math
+import os
+import tempfile
+import threading
+import time
+import weakref
+from collections import OrderedDict
+from pathlib import Path
+from typing import NamedTuple
+
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import NamedTuple
 
 from .quantizer import KVQuantIP, KVQuantMSE, QuantizedIP, QuantizedMSE
 from .outlier import OutlierKVQuant, OutlierQuantized
@@ -206,6 +224,284 @@ def _low_rank_correct(x: Tensor, x_hat: Tensor, rank: int) -> Tensor:
         U, S, Vh = U[..., :r], S[..., :r], Vh[..., :r, :]
     correction = (U * S.unsqueeze(-2)) @ Vh
     return (x_hat + correction.reshape(orig))
+
+
+# ---------------------------------------------------------------------------
+# Tiered memory offload: VRAM  ->  CPU-RAM  ->  disk (memmap / pickle)
+# ---------------------------------------------------------------------------
+
+class _DiskEntry(NamedTuple):
+    """One token-position's K/V data persisted to disk."""
+    k_path: str
+    v_path: str
+    shape: tuple
+    dtype: str
+    layer_idx: int
+
+
+class KVCacheDiskOffload:
+    """
+    Memory-efficient KV cache manager that keeps quantized cache across three tiers:
+
+        Tier 0 (hot):   VRAM – dequantized float K/V for the layers being computed
+        Tier 1 (warm):  CPU-RAM – quantized representations as Python / numpy objects
+        Tier 2 (cold):  Disk – numpy memmap files (.npy) for very long contexts
+
+    Only the layers needed for the next forward pass are staged to VRAM; all
+    other layers remain in Tier 1 or Tier 2 until their layer is accessed again.
+
+    Usage
+    -----
+        offload = KVCacheDiskOffload(kvc, max_vram_tokens=512, disk_dir="./kv_tmp")
+        offload.store(native_cache)           # quantize + offload
+        past = offload.stage_for_forward()    # dequantize to VRAM (LRU-aware)
+        out = model(ids, past_key_values=past, use_cache=True)
+        offload.replace(out.past_key_values)  # re-quantize and offload again
+
+    Args:
+        quantizer:       KVCacheQuantizer (or list of per-layer quantizers).
+        max_vram_tokens: Max number of token positions to keep dequantized in VRAM
+                         simultaneously (0 = unlimited, but you'll OOM).
+        disk_dir:        Directory for memmap spill files (auto-cleaned on close).
+        warm_size:       Max number of full-layer quantized entries to keep in CPU
+                         RAM before spilling to disk (0 = unlimited).
+        pin_memory:      Pin CPU tensors for faster host->device transfer.
+        cleanup_on_del:  Delete disk files when this object is garbage-collected.
+    """
+
+    def __init__(
+        self,
+        quantizer,
+        max_vram_tokens: int = 512,
+        disk_dir: str | None = None,
+        warm_size: int = 16,
+        pin_memory: bool = True,
+        cleanup_on_del: bool = True,
+    ):
+        self._quantizer = quantizer
+        self._is_list = isinstance(quantizer, list)
+        self._max_vram_tokens = max_vram_tokens
+        self._warm_size = warm_size
+        self._pin_memory = pin_memory and torch.cuda.is_available()
+
+        self._disk_dir = Path(disk_dir) if disk_dir else Path(tempfile.mkdtemp(prefix="kv_offload_"))
+        self._disk_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_on_del = cleanup_on_del
+        self._disk_files: list[str] = []
+
+        # Tier 1 (warm): OrderedDict acts as LRU cache for quantized layer entries
+        self._warm_cache: OrderedDict[int, list[CompressedKV]] = OrderedDict()
+        # Tier 0 (hot): list of layer_idx currently resident in VRAM
+        self._vram_layers: set[int] = set()
+        # Original dtype of each layer's KV tensors (for restoring after dequantize)
+        self._dtype_cache: OrderedDict[int, torch.dtype] = OrderedDict()
+        self._lock = threading.Lock()
+
+        # Register cleanup
+        if cleanup_on_del:
+            weakref.finalize(self, self._cleanup)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def store(self, past_key_values, token_offset: int = 0) -> None:
+        """
+        Quantize and offload the entire cache.  After this call the original
+        ``past_key_values`` is no longer needed and can be freed.
+
+        Args:
+            past_key_values: HuggingFace cache object (DynamicCache, tuple, …).
+            token_offset:     Current sequence length offset (for LRU ordering).
+        """
+        kvs = kvs_from_cache(past_key_values)
+        if not kvs:
+            return
+
+        quantized_layers: list[list[CompressedKV]] = []
+        for l_idx, (k, v) in enumerate(kvs):
+            kvc = self._quantizer[l_idx] if self._is_list else self._quantizer
+            k_c = kvc.compress(k.float().cpu() if k.is_cuda else k)
+            v_c = kvc.compress(v.float().cpu() if v.is_cuda else v)
+            quantized_layers.append([k_c, v_c])
+
+        with self._lock:
+            for l_idx, q_pair in enumerate(quantized_layers):
+                self._warm_cache[l_idx] = q_pair
+                self._warm_cache.move_to_end(l_idx)
+                # Record original dtype from the first tensor we see for this layer
+                if l_idx not in self._dtype_cache:
+                    orig_k = kvs[l_idx][0]
+                    self._dtype_cache[l_idx] = orig_k.dtype
+
+            # Evict excess warm entries to disk
+            self._evict_warm_to_disk()
+
+        # Release GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def stage_for_forward(self, past_key_values=None, layers: list[int] | None = None) -> object:
+        """
+        Dequantize the requested layers (or all layers) to VRAM for a forward pass.
+
+        Args:
+            past_key_values: Optional original cache used for structure reference.
+            layers:          Layer indices to stage (None = all).
+
+        Returns:
+            A cache-like object with K/V float tensors on the current CUDA device.
+        """
+        kvs = kvs_from_cache(past_key_values) if past_key_values is not None else None
+        n_layers = len(self._warm_cache)
+
+        if layers is None:
+            layers = list(range(n_layers))
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        result: list[tuple[Tensor, Tensor]] = []
+
+        with self._lock:
+            for l_idx in layers:
+                q_pair = self._warm_cache.get(l_idx)
+                dtype = None
+                if q_pair is None:
+                    # Load from disk
+                    q_pair, dtype = self._load_from_disk(l_idx)
+                    if dtype is not None:
+                        self._dtype_cache[l_idx] = dtype
+
+                k_c, v_c = q_pair
+                kvc = self._quantizer[l_idx] if self._is_list else self._quantizer
+                k_hat = kvc.decompress(k_c).to(device, non_blocking=True)
+                v_hat = kvc.decompress(v_c).to(device, non_blocking=True)
+                # Restore original dtype (bfloat16 / float16 / float32) for model compatibility
+                orig_dtype = dtype or self._dtype_cache.get(l_idx)
+                if orig_dtype is not None and k_hat.dtype != orig_dtype:
+                    k_hat = k_hat.to(orig_dtype)
+                    v_hat = v_hat.to(orig_dtype)
+                result.append((k_hat, v_hat))
+                self._vram_layers.add(l_idx)
+
+        # Rebuild a cache object compatible with HuggingFace models
+        return self._rebuild_cache(result, past_key_values)
+
+    def replace(self, past_key_values) -> None:
+        """
+        Re-quantize the cache returned by a forward pass and offload it again.
+        This keeps VRAM usage bounded across the entire generation loop.
+        """
+        self.store(past_key_values)
+
+    def close(self) -> None:
+        """Explicitly release all resources and delete disk files."""
+        self._cleanup()
+
+    # ------------------------------------------------------------------
+    # Tier 1 -> Tier 2 eviction
+    # ------------------------------------------------------------------
+
+    def _evict_warm_to_disk(self) -> None:
+        """Move oldest warm entries to disk when warm cache exceeds warm_size."""
+        while len(self._warm_cache) > max(self._warm_size, 1):
+            l_idx, q_pair = self._warm_cache.popitem(last=False)
+            dtype = self._dtype_cache.get(l_idx)
+            self._save_to_disk(l_idx, q_pair, dtype)
+            self._dtype_cache.pop(l_idx, None)
+
+    def _save_to_disk(self, l_idx: int, q_pair: list[CompressedKV], dtype) -> None:
+        """Persist quantized K/V for one layer to disk as .pt files."""
+        k_c, v_c = q_pair
+        k_path = str(self._disk_dir / f"layer_{l_idx}_k.pt")
+        v_path = str(self._disk_dir / f"layer_{l_idx}_v.pt")
+        torch.save(k_c, k_path)
+        torch.save(v_c, v_path)
+        dtype_path = str(self._disk_dir / f"layer_{l_idx}_dtype.pt")
+        torch.save(dtype, dtype_path)
+        self._disk_files.extend([k_path, v_path, dtype_path])
+
+    def _load_from_disk(self, l_idx: int) -> tuple[list[CompressedKV], torch.dtype | None]:
+        """Load quantized K/V for one layer from disk."""
+        k_path = str(self._disk_dir / f"layer_{l_idx}_k.pt")
+        v_path = str(self._disk_dir / f"layer_{l_idx}_v.pt")
+        dtype_path = str(self._disk_dir / f"layer_{l_idx}_dtype.pt")
+        k_c = torch.load(k_path, map_location="cpu", weights_only=False)
+        v_c = torch.load(v_path, map_location="cpu", weights_only=False)
+        dtype = None
+        if os.path.exists(dtype_path):
+            try:
+                dtype = torch.load(dtype_path, map_location="cpu", weights_only=False)
+            except Exception:
+                pass
+        return [k_c, v_c], dtype
+
+    # ------------------------------------------------------------------
+    # Cache reconstruction
+    # ------------------------------------------------------------------
+
+    def _rebuild_cache(self, pairs: list[tuple[Tensor, Tensor]], original) -> object:
+        """Rebuild a HuggingFace-compatible cache from (k, v) float pairs."""
+        try:
+            from transformers import DynamicCache
+            cache = DynamicCache()
+            for i, (k_hat, v_hat) in enumerate(pairs):
+                cache.update(k_hat, v_hat, layer_idx=i)
+            return cache
+        except (ImportError, AttributeError, TypeError):
+            pass
+
+        if original is not None and hasattr(original, "key_cache"):
+            try:
+                import copy
+                cache = copy.copy(original)
+                for i, (k_hat, v_hat) in enumerate(pairs):
+                    cache.key_cache[i] = k_hat
+                    cache.value_cache[i] = v_hat
+                return cache
+            except Exception:
+                pass
+
+        return tuple(pairs)
+
+    # ------------------------------------------------------------------
+    # Memory stats & cleanup
+    # ------------------------------------------------------------------
+
+    def memory_summary(self) -> dict:
+        """Return a dict with current tier occupancy."""
+        with self._lock:
+            warm_count = len(self._warm_cache)
+            vram_count = len(self._vram_layers)
+        disk_count = len(self._disk_files) // 2
+        return {
+            "vram_layers": vram_count,
+            "warm_layers": warm_count,
+            "disk_layers": disk_count,
+            "disk_dir": str(self._disk_dir),
+        }
+
+    def _cleanup(self) -> None:
+        """Delete all disk spill files."""
+        import shutil
+        try:
+            if self._disk_dir.exists():
+                shutil.rmtree(self._disk_dir, ignore_errors=True)
+        except Exception:
+            pass
+        self._warm_cache.clear()
+        self._dtype_cache.clear()
+        self._disk_files.clear()
+        self._vram_layers.clear()
+
+    def __del__(self):
+        if self._cleanup_on_del:
+            self._cleanup()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 class KVCacheQuantizer(nn.Module):

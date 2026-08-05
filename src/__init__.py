@@ -9,7 +9,7 @@ from .quantizer import (
     CompressedMSE,
 )
 from .outlier import OutlierKVQuant
-from .kv_cache import KVCacheQuantizer, kvs_from_cache, quantize_model_cache, crop_model_cache
+from .kv_cache import KVCacheQuantizer, kvs_from_cache, quantize_model_cache, crop_model_cache, KVCacheDiskOffload
 from .entropy import HuffmanCodec, codebook_probs, entropy_bits, analyse
 from .attn_weighted import AttentionWeightedQuantizer, weighted_distortion
 from .delta import DeltaKVCache
@@ -41,6 +41,7 @@ __all__ = [
     "kvs_from_cache",
     "quantize_model_cache",
     "crop_model_cache",
+    "KVCacheDiskOffload",
     # entropy
     "HuffmanCodec",
     "codebook_probs",
