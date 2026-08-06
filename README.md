@@ -292,6 +292,211 @@ print(out.text)
 
 ---
 
+## Avoiding out-of-memory (OOM) on low-VRAM GPUs
+
+There are **two different** OOMs, and they need different fixes. Diagnose first:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Crashes **while loading the model**, before any output | Model **weights** too big (a 7B is ~15 GB, an 8 GB GPU cannot hold it) | `weights="4bit"` or `weights="offload"` (below) |
+| Loads fine, then crashes **during a long prompt** | Prefill attention is O(T²) | `prefill_chunk_size=256` (see [Long documents](#long-documents-contracts-papers-codebases)) |
+| Runs, but VRAM creeps up over a long generation | KV **cache** grows per token | lower `bits` (2 or 3) more compression, or `offload_to_disk=True` to spill the cache to SSD (below) |
+
+All the memory levers on `generate()` / `stream()`:
+
+| Lever | Shrinks / moves | Example |
+|---|---|---|
+| `weights="4bit"` | model weights → 4-bit on GPU | fits a 7B in ~5 GB |
+| `weights="8bit"` | model weights → 8-bit on GPU | fits a 7B in ~8 GB |
+| `weights="offload"` | model weights → CPU RAM → **SSD** | fits **any** size, slow |
+| `max_gpu_mem` / `max_cpu_mem` | caps for the offload tiers | `"6GiB"` / `"12GiB"` |
+| `weights_disk_dir` | where SSD weight shards go | `"D:/kv_weights"` |
+| `device_map="auto"` | spreads weights across GPUs / CPU | multi-GPU |
+| `bits` (2/3/4) | KV **cache** precision | `bits=2` = most compression |
+| `offload_to_disk=True` | KV **cache** → CPU RAM → **SSD** | fits any context, slow |
+| `prefill_chunk_size` | peak prefill VRAM | `256` = safest |
+
+---
+
+### Offload model weights to SSD (`weights=`)
+
+A 7B model is ~15 GB in float16 it cannot fit in an 8 GB GPU (RTX 3070/3060) **at
+load time**, before generation even starts. The `weights=` option controls how the
+model **weights** are placed so large models fit on small GPUs. (This is separate
+from KV-cache compression `bits` shrinks the cache, `weights` shrinks/offloads
+the model itself.)
+
+| `weights=` | What it does | 7B on 8 GB? | Speed | Needs |
+|---|---|---|---|---|
+| `None` / `"full"` (default) | float16/auto weights | no | fast | |
+| `"4bit"` | 4-bit NF4 weights on GPU | **yes, ~5 GB** | **fast** | bitsandbytes |
+| `"8bit"` | 8-bit weights on GPU | tight, ~8 GB | fast | bitsandbytes |
+| `"offload"` | weights spilled GPU → CPU RAM → **SSD** | **any size** | slow | accelerate |
+
+Install the extra once:
+
+```bash
+pip install "kvquant-plus-plus[quant]"     # bitsandbytes + accelerate
+```
+
+**Recommended for an 8 GB GPU 4-bit weights (fast, fits):**
+
+```python
+from kvquant import generate
+
+out = generate(
+    "What is machine learning?",
+    model="Qwen/Qwen2.5-7B-Instruct",
+    weights="4bit",           # a 7B now fits in ~5 GB VRAM
+)
+print(out.text)
+```
+
+**Offload weights to SSD when even 4-bit will not fit (any size, slower):**
+
+```python
+from kvquant import generate
+
+out = generate(
+    "Explain quantum computing in detail",
+    model="Qwen/Qwen2.5-7B-Instruct",
+    weights="offload",              # GPU → CPU RAM → SSD
+    max_gpu_mem="6GiB",             # cap VRAM (default: ~90% of free VRAM)
+    max_cpu_mem="12GiB",            # cap CPU RAM
+    weights_disk_dir="D:/kv_weights",  # SSD folder for weight shards
+)
+print(out.text)
+```
+
+### How to test it
+
+Quick CPU-safe check (no model download needed) confirms the option is wired up:
+
+```bash
+python -c "import inspect, kvquant; print('weights' in inspect.signature(kvquant.generate).parameters)"
+# -> True
+```
+
+Run the real thing from the CLI (watch VRAM in a second terminal with `nvidia-smi`):
+
+```bash
+# 4-bit  should complete without OOM; nvidia-smi shows ~5 GB VRAM
+python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --weights 4bit \
+    --prompt "What is machine learning?" --max-new-tokens 40
+
+# SSD offload  fits any size; weights_disk_dir fills with shards during load
+python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --weights offload \
+    --max-gpu-mem 6GiB --weights-disk-dir D:/kv_weights \
+    --prompt "What is machine learning?" --max-new-tokens 40
+```
+
+Or from Python:
+
+```python
+from kvquant import generate
+
+# Baseline (may OOM on 8 GB) vs 4-bit (fits) prove the difference:
+out = generate("What is the capital of France?",
+               model="Qwen/Qwen2.5-7B-Instruct", weights="4bit", max_new_tokens=20)
+print(out.text)
+print(f"{out.compression_ratio:.1f}x KV compression")
+```
+
+If bitsandbytes/accelerate is missing, the call raises a clear error telling you to
+`pip install "kvquant-plus-plus[quant]"`.
+
+`weights=` is accepted by both `generate()` and `stream()`, and by the
+`--weights {full,4bit,8bit,offload}` CLI flag in `demo_llm`.
+
+### Combine everything (worst case: big model + long prompt + 8 GB GPU)
+
+The levers stack. For a large model on a small GPU with a long document, use 4-bit
+weights (so the model fits) **and** chunked prefill **and** aggressive KV bits:
+
+```python
+from kvquant import generate
+
+doc = open("contract.txt").read()
+out = generate(
+    doc + "\n\nSummarise the key obligations.",
+    model="Qwen/Qwen2.5-7B-Instruct",
+    weights="4bit",            # model fits in ~5 GB VRAM
+    bits=2,                    # most KV-cache compression
+    prefill_chunk_size=256,    # keep prefill attention small
+    max_new_tokens=200,
+)
+print(out.text)
+```
+
+If 4-bit still will not fit (e.g. a 14B/32B model), swap `weights="4bit"` for
+`weights="offload"` + `max_gpu_mem="6GiB"` fits any size, just slower.
+
+### No GPU at all (CPU / RAM only)
+
+Everything runs on CPU with no changes it is slow but never OOMs on VRAM:
+
+```python
+out = generate("What is machine learning?",
+               model="Qwen/Qwen2.5-1.5B-Instruct", device="cpu")
+print(out.text)
+```
+
+---
+
+### Offload the KV cache to SSD (`offload_to_disk=`)
+
+`weights=` moves the **model**; `offload_to_disk=` moves the **KV cache**. Use this
+when the model itself fits but the *cache* is what overflows a very long context
+whose per-token K/V no longer fits in VRAM. The cache is spilled across three tiers
+**VRAM → CPU RAM → SSD**, so only the layers needed for the next forward pass stay
+resident.
+
+It is stored with faithful per-vector **int8** (uint8 + min + scale) the same
+scalar quantization the in-memory path uses (logit correlation ~0.996 vs float16), so
+generated text is **identical** to the non-offloaded run. It deliberately does *not*
+use the research KVQuant-IP estimator, which cannot reconstruct a usable cache.
+
+```python
+from kvquant import generate
+
+doc = open("long_document.txt").read()
+out = generate(
+    doc + "\n\nSummarise the key points.",
+    model="Qwen/Qwen2.5-7B-Instruct",
+    offload_to_disk=True,          # spill KV cache VRAM → RAM → SSD
+    max_vram_tokens=512,           # token positions kept dequantized in VRAM
+    warm_size=16,                  # layer entries kept in CPU RAM before disk spill
+    disk_dir="D:/kv_cache",        # SSD folder for spilled cache (auto-cleaned)
+    prefill_chunk_size=256,        # also keep prefill attention small
+)
+print(out.text)
+```
+
+| Lever | Effect | Default |
+|---|---|---|
+| `offload_to_disk=True` | enable the VRAM → RAM → SSD KV-cache spill | `False` |
+| `max_vram_tokens` | token positions kept dequantized (hot) in VRAM | `512` |
+| `warm_size` | full-layer int8 entries kept in CPU RAM before spilling to SSD | `16` |
+| `disk_dir` | SSD folder for spilled cache files (temp dir if unset, auto-cleaned) | `None` |
+
+Both `offload_to_disk=` and `weights=` can be combined the KV-cache path is
+independent of where the weights live:
+
+```python
+out = generate(
+    doc + "\n\nSummarise.",
+    model="Qwen/Qwen2.5-7B-Instruct",
+    weights="4bit",            # model weights fit in ~5 GB VRAM
+    offload_to_disk=True,      # and the growing KV cache spills to SSD
+    disk_dir="D:/kv_cache",
+    prefill_chunk_size=256,
+)
+```
+
+`offload_to_disk=` and its knobs are accepted by both `generate()` and `stream()`.
+
+---
+
 ## Long documents contracts, papers, codebases
 
 Prefill attention is O(T²). A 6 000-token contract on an 8 GB GPU OOMs in a single forward pass. `prefill_chunk_size` processes context in chunks each step stays at `chunk² × heads` while the full context accumulates in the KV cache. No information is lost.

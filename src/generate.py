@@ -16,21 +16,6 @@ Supports any HuggingFace causal LM: instruct models, base models, hybrid
 architectures (Qwen2.5, Llama-3, Phi-3, Mistral, Falcon, Gemma, Mamba …).
 Works on CPU, single GPU, and multi-GPU via device_map="auto".
 
-Memory-efficient mode
----------------------
-Pass offload_to_disk=True to enable tiered VRAM/RAM/disk offload of the
-quantized KV cache.  This is essential on GPUs with ≤ 8 GB VRAM (RTX 3070,
-3060, …) or when processing long prompts:
-
-    out = generate(
-        long_document + "\\n\\nSummarise:",
-        model="Qwen/Qwen2.5-1.5B-Instruct",
-        bits=3,
-        offload_to_disk=True,
-        max_vram_tokens=512,      # keep at most 512 token positions in VRAM
-        prefill_chunk_size=256,   # smaller chunks = lower peak VRAM
-    )
-
 The user's own prompt context is used as calibration data — the KV vectors
 from the prefill pass are exactly the data being quantized, so they are
 the ideal and most accurate calibration source. No separate corpus needed.
@@ -39,7 +24,9 @@ the ideal and most accurate calibration source. No separate corpus needed.
 from __future__ import annotations
 
 import gc
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from typing import Generator, Optional
 
@@ -53,18 +40,127 @@ from .kv_cache import KVCacheQuantizer, kvs_from_cache, crop_model_cache, KVCach
 # ---------------------------------------------------------------------------
 _MODEL_CACHE: dict[str, tuple] = {}
 
+# Weight-placement modes that internally set device_map (via bitsandbytes or
+# accelerate) and therefore OWN device placement — callers must NOT also call
+# mdl.to(device) afterwards.  bitsandbytes-quantized models actively reject .to().
+_MANAGED_PLACEMENT_MODES = frozenset({"4bit", "8bit", "offload"})
 
-def _load_model(model_name: str, device_map: str | None):
-    """Load and cache a model+tokenizer. Reuses cached instance on repeat calls."""
-    cache_key = f"{model_name}::{device_map}"
+
+def _mode_manages_placement(weights: str | None) -> bool:
+    """True if the weights mode places the model itself (skip mdl.to(device))."""
+    return weights in _MANAGED_PLACEMENT_MODES
+
+
+def _default_max_gpu_mem() -> str:
+    """~90% of currently-free VRAM as a GiB string, e.g. '7GiB'.  Fallback '4GiB'."""
+    if torch.cuda.is_available():
+        free_bytes, _ = torch.cuda.mem_get_info()
+        gib = max(1, int((free_bytes * 0.9) / (1024 ** 3)))
+        return f"{gib}GiB"
+    return "4GiB"
+
+
+def _build_load_kwargs(
+    weights: str | None,
+    device_map: str | None,
+    max_gpu_mem: str | None,
+    max_cpu_mem: str | None,
+    weights_disk_dir: str | None,
+) -> dict:
+    """
+    Build the from_pretrained kwargs for the requested weight-placement mode.
+
+    Modes:
+      None / "full" — current behaviour: fp16/auto weights, optional device_map.
+      "4bit"/"8bit" — bitsandbytes on-GPU quantization (fast, low VRAM).
+      "offload"     — accelerate tiered placement GPU -> CPU RAM -> SSD (fits
+                      anything, slow).
+    """
+    if weights in (None, "full"):
+        load_kwargs: dict = {"torch_dtype": "auto"}
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
+        return load_kwargs
+
+    if weights in ("4bit", "8bit"):
+        try:
+            from transformers import BitsAndBytesConfig
+            import bitsandbytes  # noqa: F401  (ensures the backend is importable)
+        except ImportError as e:
+            raise ImportError(
+                f"weights={weights!r} needs bitsandbytes. Install it with:\n"
+                '    pip install "kvquant-plus-plus[quant]"\n'
+                "or:  pip install bitsandbytes"
+            ) from e
+        if weights == "4bit":
+            qcfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+        else:
+            qcfg = BitsAndBytesConfig(load_in_8bit=True)
+        return {
+            "quantization_config": qcfg,
+            "device_map": device_map or "auto",
+        }
+
+    if weights == "offload":
+        try:
+            import accelerate  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "weights='offload' needs accelerate. Install it with:\n"
+                '    pip install "kvquant-plus-plus[quant]"\n'
+                "or:  pip install accelerate"
+            ) from e
+        gpu_mem = max_gpu_mem or _default_max_gpu_mem()
+        cpu_mem = max_cpu_mem or "12GiB"
+        max_memory: dict = {"cpu": cpu_mem}
+        if torch.cuda.is_available():
+            max_memory[0] = gpu_mem
+        disk_dir = weights_disk_dir or tempfile.mkdtemp(prefix="kv_weights_offload_")
+        os.makedirs(disk_dir, exist_ok=True)
+        return {
+            "torch_dtype": "auto",
+            "device_map": "auto",
+            "max_memory": max_memory,
+            "offload_folder": disk_dir,
+            "offload_state_dict": True,
+            "low_cpu_mem_usage": True,
+        }
+
+    raise ValueError(
+        f"Unknown weights mode {weights!r}. "
+        "Choose from: None/'full', '4bit', '8bit', 'offload'."
+    )
+
+
+def _load_model(
+    model_name: str,
+    device_map: str | None,
+    weights: str | None = None,
+    max_gpu_mem: str | None = None,
+    max_cpu_mem: str | None = None,
+    weights_disk_dir: str | None = None,
+):
+    """
+    Load and cache a model+tokenizer. Reuses cached instance on repeat calls.
+
+    ``weights`` selects how model weights are placed so large models fit on
+    low-VRAM GPUs (see _build_load_kwargs for the modes).  The mode is part of
+    the cache key so switching modes in one session reloads correctly.
+    """
+    cache_key = f"{model_name}::{device_map}::{weights}::{max_gpu_mem}::{max_cpu_mem}"
     if cache_key not in _MODEL_CACHE:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         tok = AutoTokenizer.from_pretrained(model_name)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
-        load_kwargs: dict = {"torch_dtype": "auto"}
-        if device_map is not None:
-            load_kwargs["device_map"] = device_map
+        load_kwargs = _build_load_kwargs(
+            weights, device_map, max_gpu_mem, max_cpu_mem, weights_disk_dir
+        )
         mdl = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         mdl.eval()
         _MODEL_CACHE[cache_key] = (mdl, tok)
@@ -192,6 +288,10 @@ def _int8_quantize_cache(past_key_values, kvs):
     quantized to int8, then dequantized back to float.  Round-trip error is
     at most range/254 per coordinate, which is negligible compared to FP16.
     """
+    import copy
+
+    cache_q = copy.deepcopy(past_key_values)
+
     def _q8(t: torch.Tensor) -> torch.Tensor:
         """Per-vector (last dim) uint8 round-trip (stored as float, no dtype cast)."""
         dt = t.dtype
@@ -204,28 +304,28 @@ def _int8_quantize_cache(past_key_values, kvs):
         q = ((t_f - mn) / scale).round().clamp(0, 255)
         return (q * scale + mn).to(dt)
 
-    if hasattr(past_key_values, "layers"):
-        for layer in past_key_values.layers:
+    if hasattr(cache_q, "layers"):
+        for layer in cache_q.layers:
             k = getattr(layer, "keys", None)
             if isinstance(k, torch.Tensor):
                 layer.keys   = _q8(k)
                 layer.values = _q8(layer.values)
-    elif hasattr(past_key_values, "key_cache"):
-        for i in range(len(past_key_values.key_cache)):
-            k = past_key_values.key_cache[i]
+    elif hasattr(cache_q, "key_cache"):
+        for i in range(len(cache_q.key_cache)):
+            k = cache_q.key_cache[i]
             if isinstance(k, torch.Tensor):
-                past_key_values.key_cache[i]   = _q8(k)
-                past_key_values.value_cache[i] = _q8(past_key_values.value_cache[i])
-    elif isinstance(past_key_values, (tuple, list)):
+                cache_q.key_cache[i]   = _q8(k)
+                cache_q.value_cache[i] = _q8(cache_q.value_cache[i])
+    elif isinstance(cache_q, (tuple, list)):
         result = []
-        for k, v in past_key_values:
+        for k, v in cache_q:
             if isinstance(k, torch.Tensor):
                 result.append((_q8(k), _q8(v)))
             else:
                 result.append((k, v))
         return tuple(result)
 
-    return past_key_values
+    return cache_q
 
 
 def _chunked_prefill(mdl, ids, chunk_size: int):
@@ -295,6 +395,33 @@ def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank, prefill_c
     return past, avg_bits, T_p, ids
 
 
+def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper", bits=3):
+    """
+    Build a KVCacheDiskOffload for tiered VRAM->RAM->SSD storage of the KV cache.
+
+    Two codecs, both parameter-free at the call site:
+      - "paper" (default): the paper's rotate + Lloyd-Max (MSE) scheme, indices
+        bit-packed to `bits` (2-4) -> smallest SSD footprint, follows kvquant.pdf.
+      - "int8": per-vector min-max uint8 -> near-lossless (cosine ~1.0), larger.
+
+    Returns a manager that has NOT yet stored anything (caller decides when).
+    """
+    return KVCacheDiskOffload(
+        max_vram_tokens=max_vram_tokens,
+        warm_size=warm_size,
+        disk_dir=disk_dir,
+        codec=offload_codec,
+        bits=bits,
+    )
+
+
+def _gpu_gc():
+    """Collect Python garbage and empty the CUDA cache (bounds VRAM between steps)."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------------------
 # Public result type
 # ---------------------------------------------------------------------------
@@ -332,10 +459,15 @@ def generate(
     prefill_chunk_size: int = 512,
     device: Optional[str] = None,
     device_map: Optional[str] = None,
+    weights: Optional[str] = None,
+    max_gpu_mem: Optional[str] = None,
+    max_cpu_mem: Optional[str] = None,
+    weights_disk_dir: Optional[str] = None,
     offload_to_disk: bool = False,
     max_vram_tokens: int = 512,
     warm_size: int = 16,
     disk_dir: Optional[str] = None,
+    offload_codec: str = "paper",
 ) -> GenerateResult:
     """
     Generate text from a prompt using a quantized KV cache.
@@ -378,16 +510,39 @@ def generate(
         device_map:         HuggingFace device_map for multi-GPU or CPU offload,
                             e.g. "auto", "balanced", "sequential".  When set,
                             `device` is ignored.
-        offload_to_disk:    If True, quantized KV cache is spilled to RAM/disk
-                            between forward passes to keep VRAM bounded.  Essential
-                            for long-context generation on GPUs with ≤ 8 GB VRAM.
-                            Uses KVCacheDiskOffload internally.
-        max_vram_tokens:    Max token positions to keep dequantized in VRAM at once
-                            when offload_to_disk=True (default 512).
-        warm_size:          Max full-layer quantized entries to keep in CPU RAM
-                            before spilling to disk (default 16).
-        disk_dir:           Directory for disk spill files.  Defaults to a temp dir
-                            that is auto-cleaned on exit.
+        weights:            How to place model WEIGHTS so large models fit on
+                            low-VRAM GPUs.  This is the fix for "OOM loading a 7B
+                            model on an 8 GB card" — it controls the weights, not
+                            the KV cache.  Options:
+                              None / "full" — default, fp16/auto weights (today's
+                                              behaviour, unchanged).
+                              "4bit"        — 4-bit NF4 weights (bitsandbytes).
+                                              A 7B fits in ~5 GB VRAM and stays
+                                              fast.  Recommended for 8 GB GPUs.
+                              "8bit"        — 8-bit weights (bitsandbytes).
+                                              A 7B needs ~8 GB VRAM.
+                              "offload"     — accelerate tiered placement
+                                              GPU -> CPU RAM -> SSD.  Fits any
+                                              model size but is slow (SSD-bound).
+                            "4bit"/"8bit" need bitsandbytes; "offload" needs
+                            accelerate.  Install both with
+                            `pip install "kvquant-plus-plus[quant]"`.
+        max_gpu_mem:        VRAM cap for weights="offload" (e.g. "6GiB").
+                            Default: ~90% of free VRAM.
+        max_cpu_mem:        CPU-RAM cap for weights="offload" (e.g. "12GiB").
+        weights_disk_dir:   SSD folder for offloaded weight shards
+                            (weights="offload" only).  Default: an auto-cleaned
+                            temp directory.
+        offload_to_disk:    Spill the KV *cache* across VRAM->CPU RAM->SSD so long
+                            contexts do not OOM (separate from weights= offload).
+        max_vram_tokens:    Token positions kept dequantized (hot) in VRAM.
+        warm_size:          Compressed layer entries kept in CPU RAM before disk.
+        disk_dir:           SSD folder for spilled cache (auto-cleaned temp if None).
+        offload_codec:      Compression for spilled cache.  "paper" (default) uses
+                            the paper's rotate + Lloyd-Max scheme, indices bit-packed
+                            to `bits` (2-4) -> smallest SSD footprint.  "int8" uses
+                            near-lossless per-vector uint8 (larger, output identical
+                            to non-offloaded).
 
     Returns:
         GenerateResult with .text, .bits, .avg_bits_per_dim, .compression_ratio.
@@ -419,15 +574,10 @@ def generate(
         print(out.text)
         print(f"{out.compression_ratio:.1f}x vs float16")
 
-        # Memory-constrained laptop (RTX 3070, 16 GB RAM)
-        out = generate(
-            long_document + "\\n\\nSummarise:",
-            model="Qwen/Qwen2.5-1.5B-Instruct",
-            bits=3,
-            offload_to_disk=True,
-            max_vram_tokens=512,
-            prefill_chunk_size=256,
-        )
+        # 7B model on an 8 GB GPU without OOM (4-bit weights, fast)
+        out = generate("What is machine learning?",
+                       model="Qwen/Qwen2.5-7B-Instruct", weights="4bit")
+        print(out.text)
     """
     # Resolve device
     if device_map is not None:
@@ -437,8 +587,12 @@ def generate(
         _device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         _map    = None
 
-    mdl, tok = _load_model(model, _map)
-    if _device and _map is None:
+    mdl, tok = _load_model(
+        model, _map, weights, max_gpu_mem, max_cpu_mem, weights_disk_dir
+    )
+    # Skip .to() when the weights mode owns placement (bitsandbytes / offload set
+    # device_map internally, and bnb-quantized models reject .to()).
+    if _device and _map is None and not _mode_manages_placement(weights):
         mdl = mdl.to(_device)
 
     input_ids = _format_prompt(tok, prompt, raw, system=system)
@@ -448,51 +602,33 @@ def generate(
 
     suppress_ids = _get_suppress_ids(tok)
 
+    # Crop to T_p-1 so the last prefill token is processed at the correct position.
+    # This MUST happen before any offload store — otherwise the last token is fed
+    # twice (once already in the cache, once via ids[:, -1:]) and every position
+    # misaligns, producing garbage output.
+    past_crop = crop_model_cache(past, T_p - 1)
+
+    offload = None
     if offload_to_disk:
-        # Build per-layer quantizers for disk offload
-        n_heads, n_kv_heads, head_dim = _model_dims(mdl)
-        gqa      = n_heads // n_kv_heads
-        n_outlier = max(4, head_dim // 4)
-        kvc_layers: list[KVCacheQuantizer] = []
-        kvs = kvs_from_cache(past)
-        for lk, lv in kvs:
-            kvc_l = KVCacheQuantizer(
-                head_dim=head_dim,
-                num_bits=bits,
-                use_outlier=True,
-                n_outlier=n_outlier,
-                outlier_bits=min(bits + 1, 8),
-                regular_bits=max(bits - 1, 1),
-                gqa_factor=gqa,
-            )
-            kvc_l.calibrate(lk, lv)
-            kvc_layers.append(kvc_l)
-
-        offload = KVCacheDiskOffload(
-            quantizer=kvc_layers,
-            max_vram_tokens=max_vram_tokens,
-            warm_size=warm_size,
-            disk_dir=disk_dir,
-        )
-        offload.store(past)
+        # Tiered VRAM->RAM->SSD storage of the KV cache.  Store the CROPPED cache,
+        # then stage it back for the first-token forward — identical positions to
+        # the in-memory path, just spilled to disk between steps.
+        offload = _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec, bits)
         del past
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # First token
+        offload.store(past_crop)
+        del past_crop
+        _gpu_gc()
         past_first = offload.stage_for_forward()
         with torch.no_grad():
             first_out = mdl(ids[:, -1:], past_key_values=past_first, use_cache=True)
         first_logits = first_out.logits[:, -1, :]
         offload.replace(first_out.past_key_values)
         del past_first
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _gpu_gc()
     else:
-        # Original path: crop and run first token
-        past_crop = crop_model_cache(past, T_p - 1)
+        # In-memory path: keep the updated cache (use_cache=True) for the loop.
+        # Older transformers honoured past_key_values with use_cache=False;
+        # transformers 5.x ignores it, so we always use use_cache=True here.
         with torch.no_grad():
             first_out = mdl(ids[:, -1:], past_key_values=past_crop, use_cache=True)
         first_logits = first_out.logits[:, -1, :]
@@ -504,15 +640,13 @@ def generate(
     seen_ids  = ids[0].tolist()
 
     for _ in range(max_new_tokens - 1):
-        if offload_to_disk:
+        if offload is not None:
             past_step = offload.stage_for_forward()
             with torch.no_grad():
                 step = mdl(generated[-1], past_key_values=past_step, use_cache=True)
             offload.replace(step.past_key_values)
             del past_step
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _gpu_gc()
         else:
             with torch.no_grad():
                 step = mdl(generated[-1], past_key_values=past, use_cache=True)
@@ -526,7 +660,7 @@ def generate(
         if next_tok.item() == tok.eos_token_id:
             break
 
-    if offload_to_disk:
+    if offload is not None:
         offload.close()
 
     gen_ids = torch.cat(generated, dim=1)
@@ -556,17 +690,23 @@ def stream(
     prefill_chunk_size: int = 512,
     device: Optional[str] = None,
     device_map: Optional[str] = None,
+    weights: Optional[str] = None,
+    max_gpu_mem: Optional[str] = None,
+    max_cpu_mem: Optional[str] = None,
+    weights_disk_dir: Optional[str] = None,
     offload_to_disk: bool = False,
     max_vram_tokens: int = 512,
     warm_size: int = 16,
     disk_dir: Optional[str] = None,
+    offload_codec: str = "paper",
 ) -> Generator[str, None, None]:
     """
     Stream generated text token-by-token from a quantized KV cache.
 
-    Same parameters as generate(). Yields decoded text fragments as each
-    token is produced — use this when you want to display output incrementally
-    rather than waiting for the full response.
+    Same parameters as generate() — including ``weights`` ("4bit"/"8bit"/
+    "offload") to fit large models on low-VRAM GPUs without OOM.  Yields decoded
+    text fragments as each token is produced — use this when you want to display
+    output incrementally rather than waiting for the full response.
 
     Example::
 
@@ -589,8 +729,10 @@ def stream(
         _device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         _map    = None
 
-    mdl, tok = _load_model(model, _map)
-    if _device and _map is None:
+    mdl, tok = _load_model(
+        model, _map, weights, max_gpu_mem, max_cpu_mem, weights_disk_dir
+    )
+    if _device and _map is None and not _mode_manages_placement(weights):
         mdl = mdl.to(_device)
 
     input_ids = _format_prompt(tok, prompt, raw, system=system)
@@ -600,52 +742,28 @@ def stream(
 
     suppress_ids = _get_suppress_ids(tok)
 
+    # Crop BEFORE storing (see generate() for why this ordering is essential).
+    past_crop = crop_model_cache(past, T_p - 1)
+
+    offload = None
     if offload_to_disk:
-        n_heads, n_kv_heads, head_dim = _model_dims(mdl)
-        gqa      = n_heads // n_kv_heads
-        n_outlier = max(4, head_dim // 4)
-        kvc_layers: list[KVCacheQuantizer] = []
-        kvs = kvs_from_cache(past)
-        for lk, lv in kvs:
-            kvc_l = KVCacheQuantizer(
-                head_dim=head_dim,
-                num_bits=bits,
-                use_outlier=True,
-                n_outlier=n_outlier,
-                outlier_bits=min(bits + 1, 8),
-                regular_bits=max(bits - 1, 1),
-                gqa_factor=gqa,
-            )
-            kvc_l.calibrate(lk, lv)
-            kvc_layers.append(kvc_l)
-
-        offload = KVCacheDiskOffload(
-            quantizer=kvc_layers,
-            max_vram_tokens=max_vram_tokens,
-            warm_size=warm_size,
-            disk_dir=disk_dir,
-        )
-        offload.store(past)
+        offload = _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec, bits)
         del past
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+        offload.store(past_crop)
+        del past_crop
+        _gpu_gc()
         past_first = offload.stage_for_forward()
         with torch.no_grad():
             first_out = mdl(ids[:, -1:], past_key_values=past_first, use_cache=True)
         first_logits = first_out.logits[:, -1, :]
         offload.replace(first_out.past_key_values)
         del past_first
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _gpu_gc()
     else:
-        past_crop = crop_model_cache(past, T_p - 1)
         with torch.no_grad():
             first_out = mdl(ids[:, -1:], past_key_values=past_crop, use_cache=True)
         first_logits = first_out.logits[:, -1, :]
-        past = first_out.past_key_values
+        past = first_out.past_key_values   # T_p KVs — quantized prefill + exact last token
 
     first_logits = _suppress(first_logits, suppress_ids)
 
@@ -666,15 +784,13 @@ def stream(
             yield fragment
         prev_len = len(current_text)
 
-        if offload_to_disk:
+        if offload is not None:
             past_step = offload.stage_for_forward()
             with torch.no_grad():
                 step = mdl(generated[-1], past_key_values=past_step, use_cache=True)
             offload.replace(step.past_key_values)
             del past_step
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _gpu_gc()
         else:
             with torch.no_grad():
                 step = mdl(generated[-1], past_key_values=past, use_cache=True)
@@ -688,7 +804,7 @@ def stream(
         if next_tok.item() == tok.eos_token_id:
             break
 
-    if offload_to_disk:
+    if offload is not None:
         offload.close()
 
     # Yield any remaining text after the last token, skipping incomplete sequences.

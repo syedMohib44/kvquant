@@ -20,15 +20,11 @@ Interactive generation (any model):
     python -m kvquant.demo_llm --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "Once upon a time"
     python -m kvquant.demo_llm --model Qwen/Qwen3.5-0.8B --prompt "What is AI?"
 
-Memory-constrained mode (RTX 3070, 16 GB RAM):
-    python -m kvquant.demo_llm --prompt "Your long document here..." --offload --max-vram-tokens 512 --prefill-chunk-size 256
-
 Auto-detects hybrid models (Qwen3.5, Mamba, etc.) and uses native-cache quantization
 so that both pure-transformer and hybrid architectures work transparently.
 """
 
 import argparse
-import gc
 import re
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -49,14 +45,24 @@ BITS_LIST = [2, 3, 4]
 # ---------------------------------------------------------------------------
 
 
-def load_model(name, device_map=None):
-    print(f"Loading {name}...")
+def load_model(name, weights=None, max_gpu_mem=None, max_cpu_mem=None, weights_disk_dir=None):
+    """
+    Load a model + tokenizer, optionally with weight-placement offload so large
+    models fit on low-VRAM GPUs (see --weights).
+
+    Reuses _build_load_kwargs from kvquant.generate so the offload logic lives in
+    one place (4bit/8bit via bitsandbytes, offload via accelerate).
+    """
+    from kvquant.generate import _build_load_kwargs
+
+    mode = None if weights in (None, "full") else weights
+    print(f"Loading {name}  (weights={mode or 'full'})...")
     tok = AutoTokenizer.from_pretrained(name)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    load_kwargs = {"torch_dtype": "auto"}
-    if device_map is not None:
-        load_kwargs["device_map"] = device_map
+    load_kwargs = _build_load_kwargs(
+        mode, None, max_gpu_mem, max_cpu_mem, weights_disk_dir
+    )
     model = AutoModelForCausalLM.from_pretrained(name, **load_kwargs)
     model.eval()
     return model, tok
@@ -82,9 +88,9 @@ def _is_hybrid_model(model):
     """
     True if the model mixes standard transformer attention with linear/state-space
     attention layers (e.g. Qwen3.5, Jamba, Zamba).  Detects by:
-       1. Class name of any submodule containing a known hybrid keyword.
-       2. Presence of 'linear_attn' as a named child (Qwen3.5 pattern).
-       3. Any submodule exposing has_previous_state (Mamba cache marker).
+      1. Class name of any submodule containing a known hybrid keyword.
+      2. Presence of 'linear_attn' as a named child (Qwen3.5 pattern).
+      3. Any submodule exposing has_previous_state (Mamba cache marker).
     """
     for _, module in model.named_modules():
         cls = type(module).__name__
@@ -106,6 +112,8 @@ def _is_hybrid_model(model):
         if hasattr(module, "has_previous_state"):
             return True
     return False
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +162,7 @@ def sep(title=""):
         print("-" * w)
 
 
-def _suppress(logits: torch.Tensor, suppress_ids: list[int]) -> torch.Tensor:
-    if suppress_ids:
-        logits[:, suppress_ids] = float("-inf")
-    return logits
+def _apply_repetition_penalty(logits, generated_ids, penalty):
     """
     Penalize tokens that appear in generated_ids.
     Scores > 0 are divided by penalty; scores < 0 are multiplied by penalty.
@@ -171,98 +176,16 @@ def _suppress(logits: torch.Tensor, suppress_ids: list[int]) -> torch.Tensor:
 
 
 def _clean(text):
-    """Strip <think>…</think> and <environment_details>…</environment_details> blocks."""
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
-    lower = text.lower()
-    start_tag = '<environment_details>'
-    end_tag = '</environment_details>'
-    while True:
-        start = lower.find(start_tag)
-        if start == -1:
-            break
-        end = lower.find(end_tag, start + len(start_tag))
-        if end != -1:
-            end += len(end_tag)
-        else:
-            end = len(text)
-        text = text[:start] + text[end:]
-        lower = text.lower()
-    return re.sub(r'\s+', ' ', text).strip()
+    """Strip <think>…</think> reasoning blocks (closed or unclosed) and collapse whitespace."""
+    # Closed think block -> drop entirely
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Unclosed think block (hit token limit mid-think) -> drop tag and all content after
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # ---------------------------------------------------------------------------
-# Memory-efficient generation helper
-# ---------------------------------------------------------------------------
 
-class _OffloadConfig:
-    """Simple namespace for offload settings passed to the generation helper."""
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-def _memory_efficient_generate(model, tok, input_ids, kvc_layers, max_new_tokens,
-                                repetition_penalty, newline_id, past, T_p,
-                                max_vram_tokens=512, warm_size=16, disk_dir=None,
-                                suppress_ids=None):
-    """
-    Run generation with KVCacheDiskOffload to keep VRAM bounded.
-    """
-    from kvquant import KVCacheDiskOffload
-
-    offload_obj = KVCacheDiskOffload(
-        quantizer=kvc_layers,
-        max_vram_tokens=max_vram_tokens,
-        warm_size=warm_size,
-        disk_dir=disk_dir,
-    )
-    offload_obj.store(past)
-    del past
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # First token
-    past_first = offload_obj.stage_for_forward()
-    with torch.no_grad():
-        q1_out = model(input_ids[:, -1:], past_key_values=past_first, use_cache=False)
-    first_logits_m = q1_out.logits[:, -1, :].clone()
-    if suppress_ids:
-        first_logits_m[:, suppress_ids] = float("-inf")
-    generated = [first_logits_m.argmax(-1, keepdim=True)]
-    seen_ids = input_ids[0].tolist()
-
-    for _ in range(max_new_tokens - 1):
-        past_step = offload_obj.stage_for_forward()
-        with torch.no_grad():
-            step = model(generated[-1], past_key_values=past_step, use_cache=True)
-        offload_obj.replace(step.past_key_values)
-        del past_step
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        logits_s = step.logits[:, -1, :].clone()
-        if suppress_ids:
-            logits_s[:, suppress_ids] = float("-inf")
-        if repetition_penalty != 1.0 and seen_ids:
-            seen = torch.tensor(list(set(seen_ids)), dtype=torch.long)
-            scores = logits_s[:, seen]
-            logits_s[:, seen] = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
-        next_tok = logits_s.argmax(-1, keepdim=True)
-        seen_ids.append(next_tok.item())
-        generated.append(next_tok)
-        if next_tok.item() == tok.eos_token_id:
-            break
-
-    offload_obj.close()
-    gen_ids = torch.cat(generated, dim=1)
-    return gen_ids
-
-
-# ---------------------------------------------------------------------------
-# Main benchmark / interactive generation
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -274,14 +197,6 @@ def main():
         default=DEFAULT_MODEL,
         help=f"HuggingFace model name (default: {DEFAULT_MODEL}). "
         "Works with pure-transformer and hybrid (Qwen3.5, Mamba, …) models.",
-    )
-    parser.add_argument(
-        "--device-map",
-        type=str,
-        default=None,
-        help="HuggingFace device_map for model loading (e.g. 'auto', 'balanced', "
-        "'sequential'). Use 'auto' for models larger than your GPU VRAM "
-        "(e.g. Qwen2.5-7B on RTX 3070).",
     )
     parser.add_argument(
         "--prompt",
@@ -339,34 +254,48 @@ def main():
         "Must divide head_dim. Fewer subspaces = larger sub_dim = richer codebook.",
     )
     parser.add_argument(
-        "--offload",
-        action="store_true",
-        help="Enable VRAM/RAM/disk offload for the quantized KV cache. "
-        "Essential for long-context generation on GPUs with <= 8 GB VRAM "
-        "(RTX 3070, 3060, ...). Quantized cache is spilled to RAM and disk "
-        "between forward passes to keep peak VRAM bounded.",
+        "--weights",
+        choices=["full", "4bit", "8bit", "offload"],
+        default="full",
+        help="How to place model WEIGHTS so large models fit on low-VRAM GPUs "
+        "(the fix for OOM loading e.g. a 7B model on an 8 GB card). "
+        "full = fp16/auto (default). "
+        "4bit = 4-bit NF4 weights (bitsandbytes); a 7B fits in ~5 GB VRAM, fast. "
+        "8bit = 8-bit weights (bitsandbytes); a 7B needs ~8 GB VRAM. "
+        "offload = accelerate tiered GPU->RAM->SSD placement; fits any size, slow. "
+        'Needs the [quant] extra: pip install "kvquant-plus-plus[quant]".',
     )
     parser.add_argument(
-        "--max-vram-tokens",
-        type=int,
-        default=512,
-        help="Max token positions to keep dequantized in VRAM at once when "
-        "--offload is enabled (default: 512). Lower = less VRAM, slower.",
+        "--max-gpu-mem",
+        type=str,
+        default=None,
+        help="VRAM cap for --weights offload (e.g. '6GiB'). Default: ~90%% of free VRAM.",
     )
     parser.add_argument(
-        "--prefill-chunk-size",
-        type=int,
-        default=512,
-        help="Tokens processed per prefill chunk (default: 512). "
-        "Lower values (128-256) reduce peak VRAM during prefill on memory-"
-        "constrained GPUs.",
+        "--max-cpu-mem",
+        type=str,
+        default=None,
+        help="CPU-RAM cap for --weights offload (e.g. '12GiB').",
+    )
+    parser.add_argument(
+        "--weights-disk-dir",
+        type=str,
+        default=None,
+        help="SSD folder for offloaded weight shards (--weights offload only). "
+        "Default: an auto-cleaned temp directory.",
     )
     args = parser.parse_args()
 
-    model, tok = load_model(args.model, device_map=args.device_map)
+    model, tok = load_model(
+        args.model,
+        weights=args.weights,
+        max_gpu_mem=args.max_gpu_mem,
+        max_cpu_mem=args.max_cpu_mem,
+        weights_disk_dir=args.weights_disk_dir,
+    )
     n_layers, n_heads, n_kv_heads, head_dim = get_model_dims(model)
     n_outlier = max(4, head_dim // 4)
-    gqa_factor = n_heads // n_kv_heads  # 1 for MHA; >1 for GQA (Qwen, Llama-3, ...)
+    gqa_factor = n_heads // n_kv_heads  # 1 for MHA; >1 for GQA (Qwen, Llama-3, …)
     hybrid = _is_hybrid_model(model)
 
     print(
@@ -375,9 +304,6 @@ def main():
     print(
         f"  layers : {n_layers}  heads : {n_heads}  kv_heads : {n_kv_heads}  head_dim : {head_dim}"
     )
-
-    if args.offload:
-        print(f"  offload: VRAM/RAM/disk (max_vram_tokens={args.max_vram_tokens})")
 
     # -----------------------------------------------------------------------
     # --prompt  Interactive generation
@@ -423,7 +349,6 @@ def main():
 
         print(f"  Mode   : {mode_label}\n")
         input_ids = enc["input_ids"]
-        input_ids = input_ids.to(next(model.parameters()).device)
         T_p = input_ids.shape[1]
 
         # Prefill: run the model on the full prompt once.
@@ -439,35 +364,6 @@ def main():
         bad_words = [[t] for t in newline_ids] if newline_ids else None
         newline_id = newline_ids[0] if newline_ids else -1
 
-        # Suppress <environment_details> blocks (Qwen2.5 hallucination)
-        env_variants = [
-            "<environment_details>",
-            "< environment_details >",
-            "< environment_details>",
-            "<environment_details >",
-        ]
-        env_end_variants = [
-            "</environment_details>",
-            "</ environment_details >",
-            "</ environment_details>",
-            "</environment_details >",
-        ]
-        bad_words = list(bad_words or [])
-        for variant in env_variants + env_end_variants:
-            ids = tok.encode(variant, add_special_tokens=False)
-            if ids:
-                bad_words.append(ids)
-        # Also suppress the individual tag tokens as single-token bad words
-        for tid in [27, 23294, 13260, 29, 522]:
-            bad_words.append([tid])
-
-        suppress_ids: list[int] = []
-        if newline_id >= 0:
-            suppress_ids.append(newline_id)
-        for variant in env_variants + env_end_variants:
-            ids = tok.encode(variant, add_special_tokens=False)
-            suppress_ids.extend([tid for tid in ids if tid is not None])
-
         attn_mask = torch.ones_like(input_ids)
 
         # Suppress HuggingFace warnings that fire on every greedy generate() call
@@ -479,11 +375,6 @@ def main():
         _hf.setLevel(_logging.ERROR)
 
         # Unquantized baseline
-        # Unquantized baseline
-        logits_procs = []
-        if suppress_ids:
-            from transformers import LogitsProcessorList, SuppressTokensLogitsProcessor
-            logits_procs.append(SuppressTokensLogitsProcessor(suppress_ids))
         with torch.no_grad():
             true_ids = model.generate(
                 input_ids,
@@ -493,7 +384,6 @@ def main():
                 do_sample=False,
                 bad_words_ids=bad_words,
                 repetition_penalty=args.repetition_penalty,
-                logits_processor=logits_procs,
             )
 
         _hf.setLevel(_prev_hf)
@@ -534,54 +424,43 @@ def main():
                 native_cache_orig, kvc_layers, correction_rank=effective_rank
             )
 
-            if args.offload:
-                gen_ids = _memory_efficient_generate(
-                    model, tok, input_ids, kvc_layers,
-                    args.max_new_tokens, args.repetition_penalty, newline_id,
-                    past, T_p,
-                    max_vram_tokens=args.max_vram_tokens,
-                    warm_size=16,
-                    disk_dir=None,
-                    suppress_ids=suppress_ids,
+            # Greedy decode: get the first-token logit from the QUANTIZED cache
+            # by cropping to T_p-1 positions and running the last prompt token
+            # through. Using the unquantized prefill logit here would make all
+            # bit-widths produce the same first token - hiding the real degradation.
+            past_crop = crop_model_cache(past, T_p - 1)
+            with torch.no_grad():
+                q1_out = model(
+                    input_ids[:, -1:], past_key_values=past_crop, use_cache=False
                 )
-            else:
-                # Greedy decode: get the first-token logit from the QUANTIZED cache
-                # by cropping to T_p-1 positions and running the last prompt token
-                # through. Using the unquantized prefill logit here would make all
-                # bit-widths produce the same first token - hiding the real degradation.
-                past_crop = crop_model_cache(past, T_p - 1)
+            first_logits_m = q1_out.logits[:, -1, :].clone()
+            if newline_id >= 0:
+                first_logits_m[:, newline_id] = float("-inf")
+            generated = [first_logits_m.argmax(-1, keepdim=True)]
+            seen_ids = input_ids[0].tolist()  # seed with prompt tokens
+
+            for _ in range(args.max_new_tokens - 1):
                 with torch.no_grad():
-                    q1_out = model(
-                        input_ids[:, -1:], past_key_values=past_crop, use_cache=False
-                    )
-                first_logits_m = q1_out.logits[:, -1, :].clone()
-                if suppress_ids:
-                    first_logits_m[:, suppress_ids] = float("-inf")
-                generated = [first_logits_m.argmax(-1, keepdim=True)]
-                seen_ids = input_ids[0].tolist()  # seed with prompt tokens
+                    step = model(generated[-1], past_key_values=past, use_cache=True)
+                logits_s = step.logits[:, -1, :].clone()
+                if newline_id >= 0:
+                    logits_s[:, newline_id] = float("-inf")
+                logits_s = _apply_repetition_penalty(
+                    logits_s, seen_ids, args.repetition_penalty
+                )
+                next_tok = logits_s.argmax(-1, keepdim=True)
+                seen_ids.append(next_tok.item())
+                generated.append(next_tok)
+                past = step.past_key_values
+                if next_tok.item() == tok.eos_token_id:
+                    break
 
-                for _ in range(args.max_new_tokens - 1):
-                    with torch.no_grad():
-                        step = model(generated[-1], past_key_values=past, use_cache=True)
-                    logits_s = step.logits[:, -1, :].clone()
-                    if suppress_ids:
-                        logits_s[:, suppress_ids] = float("-inf")
-                    logits_s = _apply_repetition_penalty(
-                        logits_s, seen_ids, args.repetition_penalty
-                    )
-                    next_tok = logits_s.argmax(-1, keepdim=True)
-                    seen_ids.append(next_tok.item())
-                    generated.append(next_tok)
-                    past = step.past_key_values
-                    if next_tok.item() == tok.eos_token_id:
-                        break
-
-                gen_ids = torch.cat(generated, dim=1)
+            gen_ids = torch.cat(generated, dim=1)
             eff_bits = kvc.avg_bits
             label = (
                 f"{bits}-bit"
                 if gqa_factor == 1
-                else f"{bits}-bit\u2192{eff_bits:.0f}b (g={gqa_factor})"
+                else f"{bits}-bit→{eff_bits:.0f}b (g={gqa_factor})"
             )
             print(
                 f"  {label}  : {_clean(tok.decode(gen_ids[0], skip_special_tokens=True))}"
@@ -589,7 +468,7 @@ def main():
 
         # Product Quantization run (optional, --product-quant flag)
         if args.product_quant:
-            from kvquant.product_quantizer import ProductKVCache
+            from .src.product_quantizer import ProductKVCache
 
             # PQ config: M=16 subspaces x b=8 bits  →  128 bits/vector = 2 bits/dim.
             # M (subspaces), b (bits each)
@@ -611,9 +490,9 @@ def main():
             #     sum M lookups) avoids reconstruction entirely and is faster.
             #
             # Other combinations worth trying
-            #   num_subspaces=8, bits_per_subspace=8
-            #   num_subspaces=16, bits_per_subspace=4
-            #   num_subspaces=8, bits_per_subspace=4
+            # num_subspaces=8, bits_per_subspace=8
+            # num_subspaces=16, bits_per_subspace=4
+            # num_subspaces=8, bits_per_subspace=4
 
             pq_kvc = ProductKVCache(
                 head_dim,

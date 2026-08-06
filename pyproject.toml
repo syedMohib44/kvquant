@@ -30,6 +30,14 @@ cuda = [
     "triton>=2.1.0; sys_platform != 'win32'",
     "triton-windows>=3.1.0; sys_platform == 'win32'",
 ]
+quant = [
+    # Weight-placement offload for large models on low-VRAM GPUs, selected via
+    # generate(..., weights="4bit"|"8bit"|"offload").
+    #   4bit/8bit -> bitsandbytes on-GPU quantization (a 7B fits in ~5 GB / ~8 GB)
+    #   offload   -> accelerate tiered GPU -> CPU RAM -> SSD placement
+    "bitsandbytes>=0.43.0",
+    "accelerate>=0.26.0",
+]
 
 [tool.setuptools]
 packages = ["kvquant", "kvquant.csrc"]

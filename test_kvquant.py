@@ -523,3 +523,209 @@ class TestDeltaKVCache:
         assert (
             mse_adaptive < mse_no_adapt
         ), f"Adaptive MSE {mse_adaptive:.5f} should be < no-adapt MSE {mse_no_adapt:.5f}"
+
+
+# ===========================================================================
+# kv_cache.py — int8 tiered disk offload (KVCacheDiskOffload)
+# ===========================================================================
+
+from src.kv_cache import (  # noqa: E402
+    KVCacheDiskOffload,
+    _Int8KV,
+    _PaperKV,
+    _int8_compress,
+    _int8_dequantize,
+    _paper_compress,
+    _paper_dequantize,
+    _pack_indices,
+    _unpack_indices,
+)
+from src.quantizer import KVQuantMSE  # noqa: E402
+
+
+def _mse_factory(dim, num_bits):
+    """Same fixed-seed KVQuantMSE the offloader builds internally."""
+    return KVQuantMSE(dim=dim, num_bits=num_bits, seed=0)
+
+
+def _fake_cache(n_layers=6, B=1, H=2, T=8, d=D):
+    """Build a plain tuple-of-tuples KV cache of random (k, v) pairs."""
+    torch.manual_seed(SEED)
+    return tuple(
+        (torch.randn(B, H, T, d), torch.randn(B, H, T, d)) for _ in range(n_layers)
+    )
+
+
+def _staged_pairs(staged):
+    """Normalise stage_for_forward output (tuple or DynamicCache) to a list of (k, v)."""
+    if isinstance(staged, tuple):
+        return list(staged)
+    return [(l.keys, l.values) for l in staged.layers]
+
+
+class TestInt8KV:
+    """The faithful per-vector int8 representation used by the offloader."""
+
+    def test_roundtrip_within_step(self):
+        """int8 reconstruction error never exceeds one quant step (max-min)/255."""
+        torch.manual_seed(SEED)
+        t = torch.randn(4, 8, D)
+        q = _int8_compress(t)
+        t_hat = _int8_dequantize(q)
+        step = (t.amax(dim=-1, keepdim=True) - t.amin(dim=-1, keepdim=True)) / 255.0
+        err = (t - t_hat).abs()
+        # every element within half a step (min-max rounding), allow tiny fp slack
+        assert (err <= step.expand_as(err) + 1e-5).all()
+
+    def test_preserves_dtype(self):
+        """Original dtype is restored on dequantize."""
+        t = torch.randn(3, D, dtype=torch.float16)
+        assert _int8_dequantize(_int8_compress(t)).dtype == torch.float16
+
+    def test_codes_are_uint8(self):
+        q = _int8_compress(torch.randn(2, D))
+        assert q.codes.dtype == torch.uint8
+        assert isinstance(q, _Int8KV)
+
+    def test_constant_vector_no_nan(self):
+        """A constant vector has zero range; clamped scale must not produce NaN."""
+        t = torch.full((2, D), 3.14)
+        t_hat = _int8_dequantize(_int8_compress(t))
+        assert torch.isfinite(t_hat).all()
+
+
+class TestKVCacheDiskOffload:
+    """Tiered VRAM->RAM->disk offload, exercised on both codecs."""
+
+    @pytest.mark.parametrize("codec", ["int8", "paper"])
+    def test_store_stage_roundtrip(self, codec):
+        """stage_for_forward reconstructs every layer; shapes and dtype preserved."""
+        cache = _fake_cache()
+        off = KVCacheDiskOffload(
+            max_vram_tokens=512, warm_size=0, disk_dir=None, codec=codec, bits=4
+        )
+        try:
+            off.store(cache)
+            pairs = _staged_pairs(off.stage_for_forward())
+            assert len(pairs) == len(cache)
+            for (k, v), (k_hat, v_hat) in zip(cache, pairs):
+                assert k_hat.shape == k.shape and v_hat.shape == v.shape
+                if codec == "int8":
+                    # near-lossless: within one int8 step
+                    kstep = (k.amax(-1, keepdim=True) - k.amin(-1, keepdim=True)) / 255.0
+                    assert (k - k_hat.cpu()).abs().max() <= kstep.max() + 1e-4
+                else:
+                    # paper Lloyd-Max: lossy but directionally faithful
+                    rel = (k - k_hat.cpu()).norm() / k.norm()
+                    assert rel < 0.5, f"paper K rel_err too high: {rel:.3f}"
+        finally:
+            off.close()
+
+    @pytest.mark.parametrize("codec", ["int8", "paper"])
+    def test_disk_spill_fires(self, codec):
+        """warm_size smaller than n_layers must push the remainder to disk."""
+        n_layers, warm = 6, 2
+        cache = _fake_cache(n_layers=n_layers)
+        off = KVCacheDiskOffload(
+            max_vram_tokens=512, warm_size=warm, disk_dir=None, codec=codec, bits=3
+        )
+        try:
+            off.store(cache)
+            summary = off.memory_summary()
+            assert summary["warm_layers"] == warm
+            assert summary["disk_layers"] == n_layers - warm
+            # spilled layers are still reconstructable
+            assert len(_staged_pairs(off.stage_for_forward())) == n_layers
+        finally:
+            off.close()
+
+    def test_cleanup_removes_disk_dir(self):
+        """close() deletes the spill directory."""
+        cache = _fake_cache(n_layers=4)
+        off = KVCacheDiskOffload(max_vram_tokens=512, warm_size=1, disk_dir=None)
+        off.store(cache)
+        disk_dir = off.memory_summary()["disk_dir"]
+        import os
+        assert os.path.isdir(disk_dir)
+        off.close()
+        assert not os.path.isdir(disk_dir)
+
+    def test_default_codec_is_paper(self):
+        """Default codec follows the paper (rotate + Lloyd-Max)."""
+        off = KVCacheDiskOffload(warm_size=0)
+        try:
+            off.store(_fake_cache(n_layers=2))
+            # the warm entries are the paper representation
+            entry = next(iter(off._warm_cache.values()))
+            assert isinstance(entry[0], _PaperKV)
+        finally:
+            off.close()
+
+    def test_bad_codec_rejected(self):
+        with pytest.raises(ValueError):
+            KVCacheDiskOffload(codec="nope")
+
+    def test_ignores_quantizer_arg(self):
+        """A passed-in quantizer is accepted but ignored (both codecs are parameter-free)."""
+        off = KVCacheDiskOffload(quantizer=object(), warm_size=0)
+        try:
+            off.store(_fake_cache(n_layers=2))
+            assert len(_staged_pairs(off.stage_for_forward())) == 2
+        finally:
+            off.close()
+
+    def test_paper_file_smaller_than_int8(self):
+        """Paper codec (bit-packed 3-bit indices) spills smaller files than int8."""
+        import os
+        cache = _fake_cache(n_layers=4, T=64)
+
+        def spill_bytes(codec, bits):
+            off = KVCacheDiskOffload(warm_size=0, disk_dir=None, codec=codec, bits=bits)
+            off.store(cache)  # warm_size=0 forces everything to disk
+            d = off.memory_summary()["disk_dir"]
+            total = sum(
+                os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)
+            )
+            off.close()
+            return total
+
+        paper = spill_bytes("paper", 3)
+        int8 = spill_bytes("int8", 3)
+        assert paper < int8, f"paper {paper} should be < int8 {int8}"
+
+
+class TestPaperCodec:
+    """The paper's rotate + Lloyd-Max offload codec and its bit-packing."""
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_pack_unpack_exact(self, bits):
+        """Bit-packing indices then unpacking is a lossless round-trip."""
+        torch.manual_seed(SEED)
+        idx = torch.randint(0, 2 ** bits, (1000,))
+        packed = _pack_indices(idx, bits)
+        assert packed.dtype == torch.uint8
+        back = _unpack_indices(packed, bits, idx.numel())
+        assert torch.equal(idx, back)
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_roundtrip_fidelity_and_shape(self, bits):
+        """Higher bits -> lower error; dtype and shape preserved."""
+        torch.manual_seed(SEED)
+        t = torch.randn(1, 4, 32, D, dtype=torch.float16)
+        q = _paper_compress(t, bits, _mse_factory)
+        assert isinstance(q, _PaperKV)
+        t_hat = _paper_dequantize(q, _mse_factory)
+        assert t_hat.shape == t.shape
+        assert t_hat.dtype == torch.float16
+
+    def test_more_bits_more_faithful(self):
+        """4-bit reconstruction must beat 2-bit (paper MSE monotonicity)."""
+        torch.manual_seed(SEED)
+        t = torch.randn(1, 4, 32, D)
+
+        def rel(bits):
+            q = _paper_compress(t, bits, _mse_factory)
+            t_hat = _paper_dequantize(q, _mse_factory).float()
+            return ((t - t_hat).norm() / t.norm()).item()
+
+        assert rel(4) < rel(2)

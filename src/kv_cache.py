@@ -5,47 +5,35 @@ KVCacheQuantizer wraps either KVQuantIP or OutlierKVQuant and
 provides a simple .compress() / .decompress() interface that matches
 the (batch, heads, seq, dim) layout used by most transformer KV caches.
 
-Tiered memory offload
----------------------
-KVCacheDiskOffload stores quantized KV cache across VRAM / CPU-RAM / disk.
-Only the layers needed for the next forward pass are staged to GPU; the rest
-live in cheaper tiers and are loaded on demand (LRU eviction).
-
 Usage
 -----
     quant = KVCacheQuantizer(head_dim=128, num_bits=3, use_outlier=True)
-    quant.calibrate(k_calib, v_calib)
+    quant.calibrate(k_calib, v_calib)   # one-shot calibration
 
-    # Basic compress/decompress
-    k_c = quant.compress(k, is_value=False)
-    v_c = quant.compress(v, is_value=True)
-    k_hat = quant.decompress(k_c)
+    # During generation:
+    k_c = quant.compress(k, is_value=False)   # store compressed keys
+    v_c = quant.compress(v, is_value=True)    # store compressed values
+    k_hat = quant.decompress(k_c)             # recover for attention
 
-    # Memory-efficient generation with disk offload
-    offload = KVCacheDiskOffload(quant, max_vram_tokens=512, disk_dir="./kv_tmp")
-    offload.store(native_cache)          # quantize + offload to RAM/disk
-    past = offload.stage_for_forward()   # dequantize only what fits in VRAM
-    out = model(ids, past_key_values=past, use_cache=True)
-    offload.replace(out.past_key_values)  # re-quantize and offload again
+The compressed representation is stored as Python objects (NamedTuples)
+rather than packed bit-strings - suitable for research / profiling.  A
+production system would add entropy coding on top.
 """
 
 from __future__ import annotations
 
 import copy
-import gc
 import math
-import os
+import shutil as _shutil
 import tempfile
 import threading
-import time
 import weakref
 from collections import OrderedDict
 from pathlib import Path
-from typing import NamedTuple
-
 import torch
 import torch.nn as nn
 from torch import Tensor
+from typing import NamedTuple
 
 from .quantizer import KVQuantIP, KVQuantMSE, QuantizedIP, QuantizedMSE
 from .outlier import OutlierKVQuant, OutlierQuantized
@@ -230,6 +218,119 @@ def _low_rank_correct(x: Tensor, x_hat: Tensor, rank: int) -> Tensor:
 # Tiered memory offload: VRAM  ->  CPU-RAM  ->  disk (memmap / pickle)
 # ---------------------------------------------------------------------------
 
+class _Int8KV(NamedTuple):
+    """
+    Faithful per-vector int8 (uint8) representation of one K or V tensor.
+
+    This is the SAME scalar quantization generate() uses for the in-memory cache
+    (per-vector min-max round-trip, logit correlation ~0.996 vs float16), NOT the
+    research KVQuant-IP quantizer — whose output is an inner-product *estimator*
+    and produces garbage when fed back as an actual KV cache.
+
+    Storage: uint8 codes (1/4 the bytes of float32, 1/2 of float16) + per-vector
+    min and scale (float32).  Reconstruct with:  codes * scale + mn.
+    """
+    codes: Tensor   # uint8   (..., d)  quantized levels 0..255
+    mn: Tensor      # float32 (..., 1)  per-vector minimum
+    scale: Tensor   # float32 (..., 1)  per-vector (max-min)/255
+    dtype: torch.dtype   # original tensor dtype (bf16/fp16/fp32) to restore on dequant
+
+
+def _int8_compress(t: Tensor) -> _Int8KV:
+    """Per-vector (last-dim) uint8 min-max quantization. Faithful, cheap, CPU-friendly."""
+    dt = t.dtype
+    t_f = t.float()
+    mn = t_f.min(dim=-1, keepdim=True).values
+    mx = t_f.max(dim=-1, keepdim=True).values
+    scale = (mx - mn).clamp(min=1e-8) / 255.0
+    codes = ((t_f - mn) / scale).round().clamp(0, 255).to(torch.uint8)
+    return _Int8KV(codes=codes, mn=mn, scale=scale, dtype=dt)
+
+
+def _int8_dequantize(q: _Int8KV, device=None) -> Tensor:
+    """Reconstruct a float tensor from its _Int8KV representation."""
+    codes = q.codes if device is None else q.codes.to(device)
+    mn = q.mn if device is None else q.mn.to(device)
+    scale = q.scale if device is None else q.scale.to(device)
+    return (codes.float() * scale + mn).to(q.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Paper codec: rotate + Lloyd-Max (the paper's core algorithm), stored at the
+# true 2–4 bit width via bit-packing.
+#
+# This is the paper's MSE-optimal path (KVQuantMSE) applied to BOTH K and V.
+# We deliberately do NOT use KVQuant-IP for K here: IP is an inner-product
+# *estimator* (it preserves Q·K scores, not the K vectors themselves), so its
+# per-coordinate reconstruction is unusable as an actual KV cache — feeding it
+# back produces garbled generation.  The MSE path reconstructs faithfully and
+# is exactly the "rotate → Lloyd-Max quantize" scheme the paper validates.
+#
+# The Lloyd-Max indices are integers in [0, 2^bits): KVQuantMSE returns them as
+# int64 (8 bytes each), which on disk would be *larger* than int8.  We bit-pack
+# them to their true `bits` width so the SSD footprint is genuinely ~bits/coord
+# (e.g. 3-bit ≈ 3/8 the bytes of int8, 1/5 of float16).
+# ---------------------------------------------------------------------------
+
+class _PaperKV(NamedTuple):
+    """Rotate + Lloyd-Max representation of one K or V tensor, bit-packed."""
+    packed: Tensor      # uint8   bit-packed Lloyd-Max indices (num_bits per coord)
+    norms: Tensor       # float32 (..., 1)  per-vector L2 norm
+    shape: tuple        # original tensor shape (B, H, T, d)
+    num_bits: int       # bits per coordinate (also the pack width)
+    dtype: torch.dtype  # original dtype to restore on dequant
+
+
+def _pack_indices(idx: Tensor, num_bits: int) -> Tensor:
+    """Bit-pack integer indices (values in [0, 2^num_bits)) into a uint8 stream."""
+    import numpy as np
+    flat = idx.reshape(-1).to(torch.int64).cpu().numpy()
+    # Expand each value to its num_bits bits (MSB first), then pack 8-to-a-byte.
+    shifts = np.arange(num_bits - 1, -1, -1, dtype=np.int64)
+    bits = ((flat[:, None] >> shifts) & 1).astype(np.uint8)
+    packed = np.packbits(bits.reshape(-1))
+    return torch.from_numpy(packed)
+
+
+def _unpack_indices(packed: Tensor, num_bits: int, count: int) -> Tensor:
+    """Inverse of _pack_indices: recover `count` integer indices."""
+    import numpy as np
+    bits = np.unpackbits(packed.cpu().numpy())[: count * num_bits]
+    bits = bits.reshape(count, num_bits).astype(np.int64)
+    weights = (1 << np.arange(num_bits - 1, -1, -1, dtype=np.int64))
+    vals = (bits * weights).sum(axis=1)
+    return torch.from_numpy(vals)
+
+
+def _paper_compress(t: Tensor, num_bits: int, get_mse) -> _PaperKV:
+    """Rotate + Lloyd-Max quantize `t`, returning bit-packed indices + norms."""
+    dt = t.dtype
+    dim = t.shape[-1]
+    mse = get_mse(dim, num_bits)
+    q = mse.quantize(t.float().cpu())          # QuantizedMSE: int64 indices + norms
+    packed = _pack_indices(q.indices, num_bits)
+    return _PaperKV(
+        packed=packed,
+        norms=q.norms.reshape(*t.shape[:-1], 1).float(),
+        shape=tuple(t.shape),
+        num_bits=num_bits,
+        dtype=dt,
+    )
+
+
+def _paper_dequantize(q: _PaperKV, get_mse, device=None) -> Tensor:
+    """Reconstruct a float tensor from its _PaperKV representation."""
+    dim = q.shape[-1]
+    mse = get_mse(dim, q.num_bits)
+    count = 1
+    for s in q.shape:
+        count *= s
+    idx = _unpack_indices(q.packed, q.num_bits, count).reshape(q.shape)
+    rebuilt = QuantizedMSE(indices=idx, norms=q.norms, shape=q.shape)
+    out = mse.dequantize(rebuilt).to(q.dtype)
+    return out if device is None else out.to(device)
+
+
 class _DiskEntry(NamedTuple):
     """One token-position's K/V data persisted to disk."""
     k_path: str
@@ -250,36 +351,54 @@ class KVCacheDiskOffload:
     Only the layers needed for the next forward pass are staged to VRAM; all
     other layers remain in Tier 1 or Tier 2 until their layer is accessed again.
 
+    Reconstruction fidelity
+    ------------------------
+    The cache is stored with faithful per-vector int8 (uint8) min-max
+    quantization — the SAME scheme generate() uses for its in-memory cache
+    (logit correlation ~0.996 vs float16).  It deliberately does NOT use the
+    research KVQuant-IP quantizer: that returns an inner-product *estimator*
+    whose per-coordinate values are wrong, so feeding it back as an actual KV
+    cache produces garbled output.  int8 keeps generation correct while still
+    cutting cache bytes to 1/4 of float32 (1/2 of float16) and enabling the
+    RAM -> SSD spill for very long contexts.
+
     Usage
     -----
-        offload = KVCacheDiskOffload(kvc, max_vram_tokens=512, disk_dir="./kv_tmp")
-        offload.store(native_cache)           # quantize + offload
+        offload = KVCacheDiskOffload(max_vram_tokens=512, disk_dir="./kv_tmp")
+        offload.store(native_cache)           # int8-compress + offload
         past = offload.stage_for_forward()    # dequantize to VRAM (LRU-aware)
         out = model(ids, past_key_values=past, use_cache=True)
-        offload.replace(out.past_key_values)  # re-quantize and offload again
+        offload.replace(out.past_key_values)  # re-compress and offload again
 
     Args:
-        quantizer:       KVCacheQuantizer (or list of per-layer quantizers).
         max_vram_tokens: Max number of token positions to keep dequantized in VRAM
                          simultaneously (0 = unlimited, but you'll OOM).
-        disk_dir:        Directory for memmap spill files (auto-cleaned on close).
-        warm_size:       Max number of full-layer quantized entries to keep in CPU
+        disk_dir:        Directory for spill files (auto-cleaned on close).
+        warm_size:       Max number of full-layer entries to keep in CPU
                          RAM before spilling to disk (0 = unlimited).
         pin_memory:      Pin CPU tensors for faster host->device transfer.
         cleanup_on_del:  Delete disk files when this object is garbage-collected.
+        quantizer:       Deprecated/ignored — kept for backwards-compatible call
+                         sites.  int8 offload needs no calibrated quantizer.
     """
 
     def __init__(
         self,
-        quantizer,
+        quantizer=None,
         max_vram_tokens: int = 512,
         disk_dir: str | None = None,
         warm_size: int = 16,
         pin_memory: bool = True,
         cleanup_on_del: bool = True,
+        codec: str = "paper",
+        bits: int = 3,
     ):
-        self._quantizer = quantizer
-        self._is_list = isinstance(quantizer, list)
+        # quantizer is accepted but ignored — both codecs are parameter-free
+        # (the paper codec builds its own rotation/codebook from `bits`).
+        if codec not in ("paper", "int8"):
+            raise ValueError(f"codec must be 'paper' or 'int8', got {codec!r}")
+        self._codec = codec
+        self._bits = bits
         self._max_vram_tokens = max_vram_tokens
         self._warm_size = warm_size
         self._pin_memory = pin_memory and torch.cuda.is_available()
@@ -289,17 +408,42 @@ class KVCacheDiskOffload:
         self._cleanup_on_del = cleanup_on_del
         self._disk_files: list[str] = []
 
-        # Tier 1 (warm): OrderedDict acts as LRU cache for quantized layer entries
-        self._warm_cache: OrderedDict[int, list[CompressedKV]] = OrderedDict()
+        # Tier 1 (warm): OrderedDict acts as LRU cache for layer entries
+        # (each entry is a [k_c, v_c] pair of _Int8KV or _PaperKV).
+        self._warm_cache: OrderedDict[int, list] = OrderedDict()
         # Tier 0 (hot): list of layer_idx currently resident in VRAM
         self._vram_layers: set[int] = set()
-        # Original dtype of each layer's KV tensors (for restoring after dequantize)
-        self._dtype_cache: OrderedDict[int, torch.dtype] = OrderedDict()
         self._lock = threading.Lock()
+
+        # Cache of KVQuantMSE modules by (dim, bits) so the paper codec doesn't
+        # rebuild the rotation matrix + Lloyd-Max codebook on every K/V tensor.
+        self._mse_cache: dict[tuple[int, int], KVQuantMSE] = {}
 
         # Register cleanup
         if cleanup_on_del:
             weakref.finalize(self, self._cleanup)
+
+    def _get_mse(self, dim: int, num_bits: int) -> KVQuantMSE:
+        """Return a cached KVQuantMSE for (dim, num_bits) — seed fixed for determinism."""
+        key = (dim, num_bits)
+        mse = self._mse_cache.get(key)
+        if mse is None:
+            mse = KVQuantMSE(dim=dim, num_bits=num_bits, seed=0)
+            self._mse_cache[key] = mse
+        return mse
+
+    def _compress_one(self, t: Tensor):
+        """Compress one K or V tensor with the selected codec (on CPU)."""
+        t = t.cpu() if t.is_cuda else t
+        if self._codec == "paper":
+            return _paper_compress(t, self._bits, self._get_mse)
+        return _int8_compress(t)
+
+    def _dequantize_one(self, q, device) -> Tensor:
+        """Reconstruct one K or V tensor, dispatching on the stored codec type."""
+        if isinstance(q, _PaperKV):
+            return _paper_dequantize(q, self._get_mse, device=device)
+        return _int8_dequantize(q, device=device)
 
     # ------------------------------------------------------------------
     # Public API
@@ -307,8 +451,8 @@ class KVCacheDiskOffload:
 
     def store(self, past_key_values, token_offset: int = 0) -> None:
         """
-        Quantize and offload the entire cache.  After this call the original
-        ``past_key_values`` is no longer needed and can be freed.
+        Compress and offload the entire cache with the selected codec.  After this
+        call the original ``past_key_values`` is no longer needed and can be freed.
 
         Args:
             past_key_values: HuggingFace cache object (DynamicCache, tuple, …).
@@ -318,22 +462,17 @@ class KVCacheDiskOffload:
         if not kvs:
             return
 
-        quantized_layers: list[list[CompressedKV]] = []
-        for l_idx, (k, v) in enumerate(kvs):
-            kvc = self._quantizer[l_idx] if self._is_list else self._quantizer
-            k_c = kvc.compress(k.float().cpu() if k.is_cuda else k)
-            v_c = kvc.compress(v.float().cpu() if v.is_cuda else v)
-            quantized_layers.append([k_c, v_c])
+        # Compress on CPU so the float tensors leave VRAM immediately.
+        compressed_layers: list[list] = []
+        for k, v in kvs:
+            k_c = self._compress_one(k)
+            v_c = self._compress_one(v)
+            compressed_layers.append([k_c, v_c])
 
         with self._lock:
-            for l_idx, q_pair in enumerate(quantized_layers):
+            for l_idx, q_pair in enumerate(compressed_layers):
                 self._warm_cache[l_idx] = q_pair
                 self._warm_cache.move_to_end(l_idx)
-                # Record original dtype from the first tensor we see for this layer
-                if l_idx not in self._dtype_cache:
-                    orig_k = kvs[l_idx][0]
-                    self._dtype_cache[l_idx] = orig_k.dtype
-
             # Evict excess warm entries to disk
             self._evict_warm_to_disk()
 
@@ -352,9 +491,7 @@ class KVCacheDiskOffload:
         Returns:
             A cache-like object with K/V float tensors on the current CUDA device.
         """
-        kvs = kvs_from_cache(past_key_values) if past_key_values is not None else None
-        n_layers = len(self._warm_cache)
-
+        n_layers = len(self._warm_cache) + len(self._disk_files) // 2
         if layers is None:
             layers = list(range(n_layers))
 
@@ -364,22 +501,15 @@ class KVCacheDiskOffload:
         with self._lock:
             for l_idx in layers:
                 q_pair = self._warm_cache.get(l_idx)
-                dtype = None
                 if q_pair is None:
-                    # Load from disk
-                    q_pair, dtype = self._load_from_disk(l_idx)
-                    if dtype is not None:
-                        self._dtype_cache[l_idx] = dtype
+                    # Load from disk (cold tier)
+                    q_pair = self._load_from_disk(l_idx)
 
                 k_c, v_c = q_pair
-                kvc = self._quantizer[l_idx] if self._is_list else self._quantizer
-                k_hat = kvc.decompress(k_c).to(device, non_blocking=True)
-                v_hat = kvc.decompress(v_c).to(device, non_blocking=True)
-                # Restore original dtype (bfloat16 / float16 / float32) for model compatibility
-                orig_dtype = dtype or self._dtype_cache.get(l_idx)
-                if orig_dtype is not None and k_hat.dtype != orig_dtype:
-                    k_hat = k_hat.to(orig_dtype)
-                    v_hat = v_hat.to(orig_dtype)
+                # Decode -> float on the target device.  Both codecs carry the
+                # original dtype so bf16/fp16 caches round-trip to their dtype.
+                k_hat = self._dequantize_one(k_c, device=device)
+                v_hat = self._dequantize_one(v_c, device=device)
                 result.append((k_hat, v_hat))
                 self._vram_layers.add(l_idx)
 
@@ -388,7 +518,7 @@ class KVCacheDiskOffload:
 
     def replace(self, past_key_values) -> None:
         """
-        Re-quantize the cache returned by a forward pass and offload it again.
+        Re-compress the cache returned by a forward pass and offload it again.
         This keeps VRAM usage bounded across the entire generation loop.
         """
         self.store(past_key_values)
@@ -405,35 +535,29 @@ class KVCacheDiskOffload:
         """Move oldest warm entries to disk when warm cache exceeds warm_size."""
         while len(self._warm_cache) > max(self._warm_size, 1):
             l_idx, q_pair = self._warm_cache.popitem(last=False)
-            dtype = self._dtype_cache.get(l_idx)
-            self._save_to_disk(l_idx, q_pair, dtype)
-            self._dtype_cache.pop(l_idx, None)
+            self._save_to_disk(l_idx, q_pair)
 
-    def _save_to_disk(self, l_idx: int, q_pair: list[CompressedKV], dtype) -> None:
-        """Persist quantized K/V for one layer to disk as .pt files."""
+    def _save_to_disk(self, l_idx: int, q_pair: list) -> None:
+        """Persist one layer's compressed K/V (int8 or paper codec) to disk as .pt files.
+
+        The codec type rides inside the stored NamedTuple (_Int8KV / _PaperKV),
+        so dtype and bit-width are recovered on load with no side files.
+        """
         k_c, v_c = q_pair
         k_path = str(self._disk_dir / f"layer_{l_idx}_k.pt")
         v_path = str(self._disk_dir / f"layer_{l_idx}_v.pt")
         torch.save(k_c, k_path)
         torch.save(v_c, v_path)
-        dtype_path = str(self._disk_dir / f"layer_{l_idx}_dtype.pt")
-        torch.save(dtype, dtype_path)
-        self._disk_files.extend([k_path, v_path, dtype_path])
+        if k_path not in self._disk_files:
+            self._disk_files.extend([k_path, v_path])
 
-    def _load_from_disk(self, l_idx: int) -> tuple[list[CompressedKV], torch.dtype | None]:
-        """Load quantized K/V for one layer from disk."""
+    def _load_from_disk(self, l_idx: int) -> list:
+        """Load one layer's compressed K/V from disk."""
         k_path = str(self._disk_dir / f"layer_{l_idx}_k.pt")
         v_path = str(self._disk_dir / f"layer_{l_idx}_v.pt")
-        dtype_path = str(self._disk_dir / f"layer_{l_idx}_dtype.pt")
         k_c = torch.load(k_path, map_location="cpu", weights_only=False)
         v_c = torch.load(v_path, map_location="cpu", weights_only=False)
-        dtype = None
-        if os.path.exists(dtype_path):
-            try:
-                dtype = torch.load(dtype_path, map_location="cpu", weights_only=False)
-            except Exception:
-                pass
-        return [k_c, v_c], dtype
+        return [k_c, v_c]
 
     # ------------------------------------------------------------------
     # Cache reconstruction
@@ -482,19 +606,21 @@ class KVCacheDiskOffload:
 
     def _cleanup(self) -> None:
         """Delete all disk spill files."""
-        import shutil
         try:
             if self._disk_dir.exists():
-                shutil.rmtree(self._disk_dir, ignore_errors=True)
+                _shutil.rmtree(self._disk_dir, ignore_errors=True)
         except Exception:
+            # Interpreter shutdown can null out imports before the finalizer
+            # runs; nothing we can do then, and the OS reclaims the temp dir.
             pass
         self._warm_cache.clear()
-        self._dtype_cache.clear()
         self._disk_files.clear()
         self._vram_layers.clear()
 
     def __del__(self):
-        if self._cleanup_on_del:
+        # getattr guard: if __init__ raised before setting attributes (e.g. a
+        # bad codec value), __del__ must not itself raise.
+        if getattr(self, "_cleanup_on_del", False):
             self._cleanup()
 
     def __enter__(self):

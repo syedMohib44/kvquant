@@ -67,6 +67,8 @@ _qjl_project_compiled = None
 def _qjl_project_dispatch(r_unit: Tensor, S: Tensor):
     global _qjl_project_compiled
     N = r_unit.shape[0]
+    # Align S to r_unit's device so QJL works when r_unit is on CPU (disk-offload
+    # path) while S was calibrated on GPU.
     S = S.to(r_unit.device)
     if r_unit.is_cuda and N >= _QJL_COMPILE_MIN_N:
         if _qjl_project_compiled is None:
@@ -209,13 +211,12 @@ class KVQuantMSE(nn.Module):
         N = q.indices.reshape(-1, self.dim).shape[0]
         idx_flat = q.indices.reshape(N, self.dim)
         norms_flat = q.norms.reshape(N, 1)
-        device = idx_flat.device
 
-        y_tilde = self.centroids[idx_flat.to(self.centroids.device)]  # (N, d)
-        x_unit_hat = self.rotation.inverse(y_tilde).to(device)  # (N, d)
+        y_tilde = self.centroids.to(idx_flat.device)[idx_flat]  # (N, d)
+        x_unit_hat = self.rotation.inverse(y_tilde)  # (N, d)
 
         # Restore scale
-        x_hat = x_unit_hat * norms_flat.to(device)
+        x_hat = x_unit_hat * norms_flat
         return x_hat.reshape(q.shape)
 
     def _quantize_unit(self, x_unit: Tensor) -> Tensor:
@@ -232,10 +233,8 @@ class KVQuantMSE(nn.Module):
         Skips the norm-restore multiply and the QuantizedMSE allocation.
         Used internally by KVQuantIP.dequantize() where norms are always 1.
         """
-        device = idx_flat.device
-        y_tilde = self.centroids[idx_flat.to(self.centroids.device)]  # (N, d)
-        result = self.rotation.inverse(y_tilde)
-        return result.to(device) if result.device != device else result
+        y_tilde = self.centroids.to(idx_flat.device)[idx_flat]  # (N, d)
+        return self.rotation.inverse(y_tilde)  # (N, d)
 
     def forward(self, x: Tensor) -> Tensor:
         """Quantize then immediately dequantize."""
@@ -375,11 +374,14 @@ class KVQuantIP(nn.Module):
         """
         N = math.prod(q.shape[:-1])
 
+        # Anchor all ops on the incoming tensors' device so this works when the
+        # quantized data lives on CPU (disk-offload path) but S was calibrated on GPU.
+        device = q.indices.device
         idx_flat = q.indices.reshape(N, self.dim)
         bits_flat = q.qjl_bits.reshape(N, self.dim).to(self.S.dtype)
         r_norm_flat = q.r_norm.reshape(N, 1)
         vec_norms_flat = q.vec_norms.reshape(N, 1)
-        device = idx_flat.device
+        S = self.S.to(device)
 
         # --- Recover MSE component (unit scale) ---
         if self.mse_quantizer is not None:
@@ -397,12 +399,12 @@ class KVQuantIP(nn.Module):
         signs = 2.0 * bits_flat - 1.0  # {-1, +1}
         # signs @ S  ≡ per-row  S.T @ sign(S @ r)
         correction = (
-            (math.sqrt(math.pi / 2.0) / self.dim) * r_norm_flat * (signs @ self.S.to(device))
+            (math.sqrt(math.pi / 2.0) / self.dim) * r_norm_flat * (signs @ S)
         )
 
         # Combine and restore original scale
         x_tilde_unit = x_hat_unit + correction  # (N, d)
-        x_tilde = x_tilde_unit * vec_norms_flat.to(device)
+        x_tilde = x_tilde_unit * vec_norms_flat
 
         return x_tilde.reshape(q.shape)
 
