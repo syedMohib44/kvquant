@@ -408,11 +408,26 @@ class KVCacheDiskOffload:
         self._cleanup_on_del = cleanup_on_del
         self._disk_files: list[str] = []
 
-        # Tier 1 (warm): OrderedDict acts as LRU cache for layer entries
-        # (each entry is a [k_c, v_c] pair of _Int8KV or _PaperKV).
-        self._warm_cache: OrderedDict[int, list] = OrderedDict()
-        # Tier 0 (hot): list of layer_idx currently resident in VRAM
-        self._vram_layers: set[int] = set()
+        # ------------------------------------------------------------------
+        # APPEND-ONLY storage.  Each token position is compressed exactly ONCE
+        # (as the paper does) and then frozen — never re-quantized.  This is
+        # essential for the lossy 'paper' codec: re-compressing an already-
+        # quantized token every generation step makes Lloyd-Max drift (cosine
+        # 0.91 -> 0.60 over 40 steps) and produces gibberish.  int8 happens to be
+        # idempotent so the old design only broke the paper codec, but append-only
+        # is the correct model for both.
+        #
+        # A "chunk" is one contiguous block of already-compressed tokens for one
+        # layer: chunk 0 = the prefill block, chunks 1.. = one per generation step.
+        # Chunks are immutable once written, so old ones spill to disk freely.
+        # ------------------------------------------------------------------
+        self._n_layers = 0
+        self._stored_len = 0                       # token positions already frozen
+        self._num_chunks: dict[int, int] = {}      # l_idx -> number of chunks
+        # Tier 1 (warm): LRU of (l_idx, chunk_idx) -> [k_c, v_c] compressed pairs
+        self._ram: "OrderedDict[tuple[int, int], list]" = OrderedDict()
+        # Tier 2 (cold): set of (l_idx, chunk_idx) currently on disk
+        self._disk: set[tuple[int, int]] = set()
         self._lock = threading.Lock()
 
         # Cache of KVQuantMSE modules by (dim, bits) so the paper codec doesn't
@@ -451,75 +466,83 @@ class KVCacheDiskOffload:
 
     def store(self, past_key_values, token_offset: int = 0) -> None:
         """
-        Compress and offload the entire cache with the selected codec.  After this
-        call the original ``past_key_values`` is no longer needed and can be freed.
+        Compress and offload ONLY the token positions that have not been stored
+        yet (append-only).  Already-frozen tokens are never re-quantized, so the
+        lossy 'paper' codec does not drift across generation steps.
+
+        On the first call this freezes the whole prefill; on each subsequent call
+        it freezes just the new token(s) the last forward pass appended.
 
         Args:
             past_key_values: HuggingFace cache object (DynamicCache, tuple, …).
-            token_offset:     Current sequence length offset (for LRU ordering).
+            token_offset:     Unused (kept for backwards-compatible call sites).
         """
         kvs = kvs_from_cache(past_key_values)
         if not kvs:
             return
 
-        # Compress on CPU so the float tensors leave VRAM immediately.
-        compressed_layers: list[list] = []
-        for k, v in kvs:
-            k_c = self._compress_one(k)
-            v_c = self._compress_one(v)
-            compressed_layers.append([k_c, v_c])
+        self._n_layers = len(kvs)
+        total_len = kvs[0][0].shape[-2]          # sequence length now in the cache
+        new_from = self._stored_len
+        if total_len <= new_from:
+            return                                # nothing new to freeze
 
+        # Compress ONLY the new slice [new_from:total_len] for every layer, on CPU
+        # so the float tensors leave VRAM immediately.  This new block becomes one
+        # immutable chunk per layer.
         with self._lock:
-            for l_idx, q_pair in enumerate(compressed_layers):
-                self._warm_cache[l_idx] = q_pair
-                self._warm_cache.move_to_end(l_idx)
-            # Evict excess warm entries to disk
-            self._evict_warm_to_disk()
+            for l_idx, (k, v) in enumerate(kvs):
+                k_new = k[..., new_from:total_len, :]
+                v_new = v[..., new_from:total_len, :]
+                k_c = self._compress_one(k_new)
+                v_c = self._compress_one(v_new)
+                chunk_idx = self._num_chunks.get(l_idx, 0)
+                self._ram[(l_idx, chunk_idx)] = [k_c, v_c]
+                self._ram.move_to_end((l_idx, chunk_idx))
+                self._num_chunks[l_idx] = chunk_idx + 1
+            self._stored_len = total_len
+            self._evict_to_disk()
 
-        # Release GPU memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def stage_for_forward(self, past_key_values=None, layers: list[int] | None = None) -> object:
         """
-        Dequantize the requested layers (or all layers) to VRAM for a forward pass.
+        Dequantize all stored chunks for the requested layers, concatenate them
+        along the sequence axis, and return a HuggingFace-compatible cache on the
+        current device.
 
         Args:
             past_key_values: Optional original cache used for structure reference.
             layers:          Layer indices to stage (None = all).
 
         Returns:
-            A cache-like object with K/V float tensors on the current CUDA device.
+            A cache-like object with K/V float tensors on the current device.
         """
-        n_layers = len(self._warm_cache) + len(self._disk_files) // 2
         if layers is None:
-            layers = list(range(n_layers))
+            layers = list(range(self._n_layers))
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         result: list[tuple[Tensor, Tensor]] = []
 
         with self._lock:
             for l_idx in layers:
-                q_pair = self._warm_cache.get(l_idx)
-                if q_pair is None:
-                    # Load from disk (cold tier)
-                    q_pair = self._load_from_disk(l_idx)
-
-                k_c, v_c = q_pair
-                # Decode -> float on the target device.  Both codecs carry the
-                # original dtype so bf16/fp16 caches round-trip to their dtype.
-                k_hat = self._dequantize_one(k_c, device=device)
-                v_hat = self._dequantize_one(v_c, device=device)
+                k_parts, v_parts = [], []
+                for chunk_idx in range(self._num_chunks.get(l_idx, 0)):
+                    k_c, v_c = self._get_chunk(l_idx, chunk_idx)
+                    k_parts.append(self._dequantize_one(k_c, device=device))
+                    v_parts.append(self._dequantize_one(v_c, device=device))
+                # Concatenate chunks along the sequence dimension (dim=-2).
+                k_hat = torch.cat(k_parts, dim=-2) if len(k_parts) > 1 else k_parts[0]
+                v_hat = torch.cat(v_parts, dim=-2) if len(v_parts) > 1 else v_parts[0]
                 result.append((k_hat, v_hat))
-                self._vram_layers.add(l_idx)
 
-        # Rebuild a cache object compatible with HuggingFace models
         return self._rebuild_cache(result, past_key_values)
 
     def replace(self, past_key_values) -> None:
         """
-        Re-compress the cache returned by a forward pass and offload it again.
-        This keeps VRAM usage bounded across the entire generation loop.
+        Freeze the new token(s) the forward pass just appended.  Append-only:
+        this never re-compresses already-stored tokens.
         """
         self.store(past_key_values)
 
@@ -528,33 +551,51 @@ class KVCacheDiskOffload:
         self._cleanup()
 
     # ------------------------------------------------------------------
-    # Tier 1 -> Tier 2 eviction
+    # Chunk access + Tier 1 -> Tier 2 eviction
     # ------------------------------------------------------------------
 
-    def _evict_warm_to_disk(self) -> None:
-        """Move oldest warm entries to disk when warm cache exceeds warm_size."""
-        while len(self._warm_cache) > max(self._warm_size, 1):
-            l_idx, q_pair = self._warm_cache.popitem(last=False)
-            self._save_to_disk(l_idx, q_pair)
+    def _get_chunk(self, l_idx: int, chunk_idx: int) -> list:
+        """Return a compressed [k_c, v_c] chunk from RAM or disk (LRU-promoting)."""
+        key = (l_idx, chunk_idx)
+        pair = self._ram.get(key)
+        if pair is not None:
+            self._ram.move_to_end(key)
+            return pair
+        # Cold: load from disk back into RAM (then re-check eviction).
+        pair = self._load_from_disk(l_idx, chunk_idx)
+        self._ram[key] = pair
+        self._ram.move_to_end(key)
+        self._disk.discard(key)
+        self._evict_to_disk()
+        return pair
 
-    def _save_to_disk(self, l_idx: int, q_pair: list) -> None:
-        """Persist one layer's compressed K/V (int8 or paper codec) to disk as .pt files.
+    def _evict_to_disk(self) -> None:
+        """Spill oldest RAM chunks to disk when RAM holds more than warm_size."""
+        limit = max(self._warm_size, 1)
+        while len(self._ram) > limit:
+            key, pair = self._ram.popitem(last=False)
+            self._save_to_disk(key[0], key[1], pair)
+            self._disk.add(key)
+
+    def _save_to_disk(self, l_idx: int, chunk_idx: int, q_pair: list) -> None:
+        """Persist one immutable chunk's compressed K/V to disk as .pt files.
 
         The codec type rides inside the stored NamedTuple (_Int8KV / _PaperKV),
         so dtype and bit-width are recovered on load with no side files.
         """
         k_c, v_c = q_pair
-        k_path = str(self._disk_dir / f"layer_{l_idx}_k.pt")
-        v_path = str(self._disk_dir / f"layer_{l_idx}_v.pt")
+        k_path = str(self._disk_dir / f"layer_{l_idx}_c{chunk_idx}_k.pt")
+        v_path = str(self._disk_dir / f"layer_{l_idx}_c{chunk_idx}_v.pt")
         torch.save(k_c, k_path)
         torch.save(v_c, v_path)
-        if k_path not in self._disk_files:
-            self._disk_files.extend([k_path, v_path])
+        for p in (k_path, v_path):
+            if p not in self._disk_files:
+                self._disk_files.append(p)
 
-    def _load_from_disk(self, l_idx: int) -> list:
-        """Load one layer's compressed K/V from disk."""
-        k_path = str(self._disk_dir / f"layer_{l_idx}_k.pt")
-        v_path = str(self._disk_dir / f"layer_{l_idx}_v.pt")
+    def _load_from_disk(self, l_idx: int, chunk_idx: int) -> list:
+        """Load one immutable chunk's compressed K/V from disk."""
+        k_path = str(self._disk_dir / f"layer_{l_idx}_c{chunk_idx}_k.pt")
+        v_path = str(self._disk_dir / f"layer_{l_idx}_c{chunk_idx}_v.pt")
         k_c = torch.load(k_path, map_location="cpu", weights_only=False)
         v_c = torch.load(v_path, map_location="cpu", weights_only=False)
         return [k_c, v_c]
@@ -592,17 +633,26 @@ class KVCacheDiskOffload:
     # ------------------------------------------------------------------
 
     def memory_summary(self) -> dict:
-        """Return a dict with current tier occupancy."""
+        """Return a dict with current tier occupancy.
+
+        Counts are per-layer (chunks collapsed to layers) so the numbers stay
+        comparable to the pre-chunk API: 'warm_layers' = layers with >=1 chunk in
+        RAM, 'disk_layers' = layers with all chunks spilled to disk.
+        """
         with self._lock:
-            warm_count = len(self._warm_cache)
-            vram_count = len(self._vram_layers)
-        disk_count = len(self._disk_files) // 2
-        return {
-            "vram_layers": vram_count,
-            "warm_layers": warm_count,
-            "disk_layers": disk_count,
-            "disk_dir": str(self._disk_dir),
-        }
+            warm_layers = {k[0] for k in self._ram}
+            disk_layers = {k[0] for k in self._disk}
+            # A layer counts as "disk" only if none of its chunks are in RAM.
+            disk_only = disk_layers - warm_layers
+            return {
+                "vram_layers": 0,   # nothing is held dequantized between calls
+                "warm_layers": len(warm_layers),
+                "disk_layers": len(disk_only),
+                "ram_chunks": len(self._ram),
+                "disk_chunks": len(self._disk),
+                "stored_len": self._stored_len,
+                "disk_dir": str(self._disk_dir),
+            }
 
     def _cleanup(self) -> None:
         """Delete all disk spill files."""
@@ -613,9 +663,12 @@ class KVCacheDiskOffload:
             # Interpreter shutdown can null out imports before the finalizer
             # runs; nothing we can do then, and the OS reclaims the temp dir.
             pass
-        self._warm_cache.clear()
+        # Guarded: __del__ may fire before __init__ finished (bad codec).
+        if hasattr(self, "_ram"):
+            self._ram.clear()
+        if hasattr(self, "_disk"):
+            self._disk.clear()
         self._disk_files.clear()
-        self._vram_layers.clear()
 
     def __del__(self):
         # getattr guard: if __init__ raised before setting attributes (e.g. a

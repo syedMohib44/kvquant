@@ -652,12 +652,40 @@ class TestKVCacheDiskOffload:
 
     def test_default_codec_is_paper(self):
         """Default codec follows the paper (rotate + Lloyd-Max)."""
-        off = KVCacheDiskOffload(warm_size=0)
+        off = KVCacheDiskOffload(warm_size=8)
         try:
             off.store(_fake_cache(n_layers=2))
-            # the warm entries are the paper representation
-            entry = next(iter(off._warm_cache.values()))
+            # the stored chunks are the paper representation
+            entry = next(iter(off._ram.values()))
             assert isinstance(entry[0], _PaperKV)
+        finally:
+            off.close()
+
+    def test_append_only_no_requantize_drift(self):
+        """
+        The bug this fixes: re-store()-ing a growing cache must NOT re-quantize
+        already-frozen tokens.  With the lossy paper codec, re-quantizing drifts
+        badly; append-only keeps the prefill block bit-identical across steps.
+        """
+        torch.manual_seed(SEED)
+        B, H, d = 1, 2, D
+        # Simulate autoregressive growth: prefill of 8, then append 1 token x5.
+        k = torch.randn(B, H, 8, d)
+        v = torch.randn(B, H, 8, d)
+        off = KVCacheDiskOffload(warm_size=64, codec="paper", bits=3)
+        try:
+            off.store(((k, v),))
+            first = _staged_pairs(off.stage_for_forward())[0][0][..., :8, :].cpu().clone()
+            for _ in range(5):
+                k = torch.cat([k, torch.randn(B, H, 1, d)], dim=-2)
+                v = torch.cat([v, torch.randn(B, H, 1, d)], dim=-2)
+                off.store(((k, v),))
+            # The first 8 positions must be byte-identical to their first staging
+            # (they were compressed once and frozen — never re-quantized).
+            later = _staged_pairs(off.stage_for_forward())[0][0][..., :8, :].cpu()
+            assert torch.equal(first, later), "prefill block drifted — tokens were re-quantized"
+            # And the full length must have grown to 13.
+            assert off.memory_summary()["stored_len"] == 13
         finally:
             off.close()
 

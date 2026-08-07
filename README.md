@@ -466,6 +466,19 @@ Two codecs are available via `offload_codec`:
   2-4 bit, but output is **identical** to the non-offloaded run. Use it when fidelity
   matters more than footprint.
 
+**Append-only (why generation stays coherent).** Each token's K/V is compressed
+**exactly once** and then frozen the offloader appends the newly generated token
+each step and never re-touches earlier ones. This mirrors the paper (which quantizes
+each vector once) and is essential for the lossy `"paper"` codec: re-quantizing an
+already-quantized token every step makes Lloyd-Max drift and, over a long generation,
+degrades into gibberish. `int8` is immune (it is idempotent), but append-only is the
+correct model for both.
+
+**Bit-width guidance for the `"paper"` codec:** use **`bits=4`** (closest to lossless)
+or **`bits=3`** (paper's sweet spot). **`bits=2` is very lossy** 4 Lloyd-Max levels
+per coordinate is at the edge of usable and can visibly hurt quality; prefer `"int8"`
+if you need small *and* faithful.
+
 ```python
 from kvquant import generate
 
