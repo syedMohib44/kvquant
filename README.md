@@ -313,7 +313,7 @@ All the memory levers on `generate()` / `stream()`:
 | `weights_disk_dir` | where SSD weight shards go | `"D:/kv_weights"` |
 | `device_map="auto"` | spreads weights across GPUs / CPU | multi-GPU |
 | `bits` (2/3/4) | KV **cache** precision | `bits=2` = most compression |
-| `offload_to_disk=True` | KV **cache** → CPU RAM → **SSD** | fits any context, slow |
+| `offload_to_disk=True` | KV **cache** → CPU RAM → **SSD** (paper Lloyd-Max codec, or `offload_codec="int8"`) | fits any context, slow |
 | `prefill_chunk_size` | peak prefill VRAM | `256` = safest |
 
 ---
@@ -451,10 +451,18 @@ whose per-token K/V no longer fits in VRAM. The cache is spilled across three ti
 **VRAM → CPU RAM → SSD**, so only the layers needed for the next forward pass stay
 resident.
 
-It is stored with faithful per-vector **int8** (uint8 + min + scale) the same
-scalar quantization the in-memory path uses (logit correlation ~0.996 vs float16), so
-generated text is **identical** to the non-offloaded run. It deliberately does *not*
-use the research KVQuant-IP estimator, which cannot reconstruct a usable cache.
+Two codecs are available via `offload_codec`:
+
+- **`"paper"` (default)** the paper's own scheme: rotate → **Lloyd-Max** quantize,
+  with the indices **bit-packed** to `bits` (2-4). This is the smallest SSD
+  footprint (~`bits`/coordinate) and follows `kvquant.pdf`. It uses the MSE-optimal
+  path for **both** K and V it deliberately does *not* use the research KVQuant-**IP**
+  estimator, which preserves attention *scores* but cannot reconstruct usable K
+  vectors (feeding it back produces garbled text).
+- **`"int8"` (fallback)** faithful per-vector uint8 (min + scale), the same scalar
+  scheme the in-memory path uses (logit correlation ~0.999). Larger on disk than
+  2-4 bit, but output is **identical** to the non-offloaded run. Use it when fidelity
+  matters more than footprint.
 
 ```python
 from kvquant import generate
@@ -464,6 +472,8 @@ out = generate(
     doc + "\n\nSummarise the key points.",
     model="Qwen/Qwen2.5-7B-Instruct",
     offload_to_disk=True,          # spill KV cache VRAM → RAM → SSD
+    offload_codec="paper",         # paper Lloyd-Max (default); or "int8" for near-lossless
+    bits=3,                        # pack width for the paper codec (2-4)
     max_vram_tokens=512,           # token positions kept dequantized in VRAM
     warm_size=16,                  # layer entries kept in CPU RAM before disk spill
     disk_dir="D:/kv_cache",        # SSD folder for spilled cache (auto-cleaned)
@@ -475,8 +485,10 @@ print(out.text)
 | Lever | Effect | Default |
 |---|---|---|
 | `offload_to_disk=True` | enable the VRAM → RAM → SSD KV-cache spill | `False` |
+| `offload_codec` | `"paper"` (Lloyd-Max, bit-packed, smallest) or `"int8"` (near-lossless, larger) | `"paper"` |
+| `bits` | pack width for the paper codec (2-4); also the in-memory KV precision | `3` |
 | `max_vram_tokens` | token positions kept dequantized (hot) in VRAM | `512` |
-| `warm_size` | full-layer int8 entries kept in CPU RAM before spilling to SSD | `16` |
+| `warm_size` | compressed layer entries kept in CPU RAM before spilling to SSD | `16` |
 | `disk_dir` | SSD folder for spilled cache files (temp dir if unset, auto-cleaned) | `None` |
 
 Both `offload_to_disk=` and `weights=` can be combined the KV-cache path is
