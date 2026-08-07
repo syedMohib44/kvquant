@@ -380,6 +380,8 @@ python -c "import inspect, kvquant; print('weights' in inspect.signature(kvquant
 Run the real thing from the CLI (watch VRAM in a second terminal with `nvidia-smi`):
 
 ```bash
+python run_offload.py --model Qwen/Qwen3-30B-A3B --hf-home D:/huggingface-models --weights offload --max-gpu-mem 6GiB --weights-disk-dir D:/kv_weights --disk-dir D:/kv_cache --prompt "What is machine learning?"
+
 # 4-bit  should complete without OOM; nvidia-smi shows ~5 GB VRAM
 python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --weights 4bit \
     --prompt "What is machine learning?" --max-new-tokens 40
