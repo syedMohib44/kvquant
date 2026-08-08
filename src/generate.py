@@ -395,14 +395,17 @@ def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank, prefill_c
     return past, avg_bits, T_p, ids
 
 
-def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper", bits=3):
+def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-outlier", bits=3):
     """
     Build a KVCacheDiskOffload for tiered VRAM->RAM->SSD storage of the KV cache.
 
-    Two codecs, both parameter-free at the call site:
-      - "paper" (default): the paper's rotate + Lloyd-Max (MSE) scheme, indices
-        bit-packed to `bits` (2-4) -> smallest SSD footprint, follows kvquant.pdf.
-      - "int8": per-vector min-max uint8 -> near-lossless (cosine ~1.0), larger.
+    Codecs:
+      - "paper-outlier" (default): the paper's Section 5 outlier-aware Lloyd-Max,
+        calibrated once on the prefill.  Best fidelity on real KV tensors
+        (cosine ~0.999) because a few high-magnitude channels get extra bits.
+      - "paper": plain rotate + Lloyd-Max, indices bit-packed to `bits` (2-4).
+        Smallest SSD footprint but degrades on outlier-heavy KV.
+      - "int8": per-vector min-max uint8 -> near-lossless (cosine ~1.0), largest.
 
     Returns a manager that has NOT yet stored anything (caller decides when).
     """
@@ -467,7 +470,7 @@ def generate(
     max_vram_tokens: int = 512,
     warm_size: int = 16,
     disk_dir: Optional[str] = None,
-    offload_codec: str = "paper",
+    offload_codec: str = "paper-outlier",
 ) -> GenerateResult:
     """
     Generate text from a prompt using a quantized KV cache.
@@ -538,11 +541,12 @@ def generate(
         max_vram_tokens:    Token positions kept dequantized (hot) in VRAM.
         warm_size:          Compressed layer entries kept in CPU RAM before disk.
         disk_dir:           SSD folder for spilled cache (auto-cleaned temp if None).
-        offload_codec:      Compression for spilled cache.  "paper" (default) uses
-                            the paper's rotate + Lloyd-Max scheme, indices bit-packed
-                            to `bits` (2-4) -> smallest SSD footprint.  "int8" uses
-                            near-lossless per-vector uint8 (larger, output identical
-                            to non-offloaded).
+        offload_codec:      Compression for spilled cache.
+                            "paper-outlier" (default): paper Section 5 outlier-aware
+                            Lloyd-Max, calibrated on the prefill — best fidelity on
+                            real KV.  "paper": plain Lloyd-Max, bit-packed (smallest,
+                            degrades on outlier-heavy KV).  "int8": near-lossless
+                            per-vector uint8 (largest, output identical to non-offloaded).
 
     Returns:
         GenerateResult with .text, .bits, .avg_bits_per_dim, .compression_ratio.
@@ -698,7 +702,7 @@ def stream(
     max_vram_tokens: int = 512,
     warm_size: int = 16,
     disk_dir: Optional[str] = None,
-    offload_codec: str = "paper",
+    offload_codec: str = "paper-outlier",
 ) -> Generator[str, None, None]:
     """
     Stream generated text token-by-token from a quantized KV cache.

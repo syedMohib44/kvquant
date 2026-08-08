@@ -597,7 +597,7 @@ class TestInt8KV:
 class TestKVCacheDiskOffload:
     """Tiered VRAM->RAM->disk offload, exercised on both codecs."""
 
-    @pytest.mark.parametrize("codec", ["int8", "paper"])
+    @pytest.mark.parametrize("codec", ["int8", "paper", "paper-outlier"])
     def test_store_stage_roundtrip(self, codec):
         """stage_for_forward reconstructs every layer; shapes and dtype preserved."""
         cache = _fake_cache()
@@ -617,11 +617,42 @@ class TestKVCacheDiskOffload:
                 else:
                     # paper Lloyd-Max: lossy but directionally faithful
                     rel = (k - k_hat.cpu()).norm() / k.norm()
-                    assert rel < 0.5, f"paper K rel_err too high: {rel:.3f}"
+                    assert rel < 0.5, f"{codec} K rel_err too high: {rel:.3f}"
         finally:
             off.close()
 
-    @pytest.mark.parametrize("codec", ["int8", "paper"])
+    def test_outlier_codec_beats_plain_on_outlier_channels(self):
+        """
+        The paper's Section 5 point: on data with a few huge-magnitude channels,
+        outlier-aware Lloyd-Max reconstructs K far better than plain Lloyd-Max at
+        the same bits.  (Plain spends equal precision everywhere; outliers dominate.)
+        """
+        torch.manual_seed(SEED)
+        B, H, T, d = 1, 2, 32, D
+        def mk():
+            x = torch.randn(B, H, T, d)
+            for c in (3, 17, 42, 88):
+                x[..., c] *= 25.0
+            return x
+        cache = tuple((mk(), mk()) for _ in range(2))
+
+        def kcos(codec):
+            off = KVCacheDiskOffload(codec=codec, bits=4, warm_size=8)
+            try:
+                off.store(cache)
+                kh = _staged_pairs(off.stage_for_forward())[0][0].cpu()
+                k = cache[0][0]
+                a, b = k.flatten(), kh.flatten()
+                return (a @ b / (a.norm() * b.norm())).item()
+            finally:
+                off.close()
+
+        plain = kcos("paper")
+        outlier = kcos("paper-outlier")
+        assert outlier > plain, f"outlier {outlier:.4f} should beat plain {plain:.4f}"
+        assert outlier > 0.99, f"outlier codec should be near-lossless, got {outlier:.4f}"
+
+    @pytest.mark.parametrize("codec", ["int8", "paper", "paper-outlier"])
     def test_disk_spill_fires(self, codec):
         """warm_size smaller than n_layers must push the remainder to disk."""
         n_layers, warm = 6, 2

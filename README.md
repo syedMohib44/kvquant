@@ -354,13 +354,19 @@ print(out.text)
 
 **Offload weights to SSD when even 4-bit will not fit (any size, slower):**
 
+> ⚠️ **`weights="offload"` is the last resort, not the default fix.** It streams the
+> model's weights from SSD **every token**, so it is *extremely* slow (often <0.2
+> tok/s — a 40-token reply can take minutes to hours). On an **8 GB GPU a 7B fits
+> entirely in 4-bit (~5 GB) and runs fast** use `weights="4bit"` above. Reach for
+> `"offload"` only for models too big even for 4-bit (14B/32B+ on a small GPU).
+
 ```python
 from kvquant import generate
 
 out = generate(
     "Explain quantum computing in detail",
     model="Qwen/Qwen2.5-7B-Instruct",
-    weights="offload",              # GPU → CPU RAM → SSD
+    weights="offload",              # GPU → CPU RAM → SSD  (slow — see warning above)
     max_gpu_mem="6GiB",             # cap VRAM (default: ~90% of free VRAM)
     max_cpu_mem="12GiB",            # cap CPU RAM
     weights_disk_dir="D:/kv_weights",  # SSD folder for weight shards
@@ -453,18 +459,22 @@ whose per-token K/V no longer fits in VRAM. The cache is spilled across three ti
 **VRAM → CPU RAM → SSD**, so only the layers needed for the next forward pass stay
 resident.
 
-Two codecs are available via `offload_codec`:
+Three codecs are available via `offload_codec`:
 
-- **`"paper"` (default)** the paper's own scheme: rotate → **Lloyd-Max** quantize,
-  with the indices **bit-packed** to `bits` (2-4). This is the smallest SSD
-  footprint (~`bits`/coordinate) and follows `kvquant.pdf`. It uses the MSE-optimal
-  path for **both** K and V it deliberately does *not* use the research KVQuant-**IP**
-  estimator, which preserves attention *scores* but cannot reconstruct usable K
-  vectors (feeding it back produces garbled text).
-- **`"int8"` (fallback)** faithful per-vector uint8 (min + scale), the same scalar
-  scheme the in-memory path uses (logit correlation ~0.999). Larger on disk than
-  2-4 bit, but output is **identical** to the non-offloaded run. Use it when fidelity
-  matters more than footprint.
+- **`"paper-outlier"` (default)** the paper's **Section 5** outlier-aware
+  Lloyd-Max, calibrated once on the prefill KVs. Real attention K/V tensors have a
+  few high-magnitude "outlier" channels; this codec gives them extra bits and
+  quantizes the rest at `bits`, reaching near-lossless fidelity (cosine ~0.999) at
+  3-4 bits/dim. **This is the recommended paper-faithful codec** plain Lloyd-Max
+  wastes precision on the outliers and degrades real-model output.
+- **`"paper"`** plain rotate → **Lloyd-Max**, indices **bit-packed** to `bits`
+  (2-4). Smallest SSD footprint (~`bits`/coordinate), but on outlier-heavy KV it
+  loses coherence — use only when footprint matters more than quality. Uses the
+  MSE path for both K and V (not the KVQuant-**IP** estimator, which cannot
+  reconstruct a usable cache).
+- **`"int8"`** faithful per-vector uint8 (min + scale), the same scalar scheme the
+  in-memory path uses (logit correlation ~0.999). Largest of the three on disk, but
+  output is **identical** to the non-offloaded run and needs no calibration.
 
 **Append-only (why generation stays coherent).** Each token's K/V is compressed
 **exactly once** and then frozen the offloader appends the newly generated token
@@ -474,7 +484,7 @@ already-quantized token every step makes Lloyd-Max drift and, over a long genera
 degrades into gibberish. `int8` is immune (it is idempotent), but append-only is the
 correct model for both.
 
-**Bit-width guidance for the `"paper"` codec:** use **`bits=4`** (closest to lossless)
+**Bit-width guidance for the paper codecs:** use **`bits=4`** (closest to lossless)
 or **`bits=3`** (paper's sweet spot). **`bits=2` is very lossy** 4 Lloyd-Max levels
 per coordinate is at the edge of usable and can visibly hurt quality; prefer `"int8"`
 if you need small *and* faithful.
@@ -487,8 +497,8 @@ out = generate(
     doc + "\n\nSummarise the key points.",
     model="Qwen/Qwen2.5-7B-Instruct",
     offload_to_disk=True,          # spill KV cache VRAM → RAM → SSD
-    offload_codec="paper",         # paper Lloyd-Max (default); or "int8" for near-lossless
-    bits=3,                        # pack width for the paper codec (2-4)
+    offload_codec="paper-outlier", # paper Section 5 (default); "paper" or "int8" also valid
+    bits=3,                        # pack width for the paper codecs (2-4)
     max_vram_tokens=512,           # token positions kept dequantized in VRAM
     warm_size=16,                  # layer entries kept in CPU RAM before disk spill
     disk_dir="D:/kv_cache",        # SSD folder for spilled cache (auto-cleaned)

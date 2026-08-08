@@ -331,6 +331,75 @@ def _paper_dequantize(q: _PaperKV, get_mse, device=None) -> Tensor:
     return out if device is None else out.to(device)
 
 
+# ---------------------------------------------------------------------------
+# Outlier-aware paper codec (the paper's Section 5 extension).
+#
+# Real attention K/V tensors have a few "outlier" channels with much larger
+# magnitude than the rest.  Plain Lloyd-Max spends equal precision on every
+# channel, so the big channels dominate the error and generation degrades.
+# The paper's fix (OutlierKVQuant) splits channels into outlier vs regular and
+# quantizes each group at its own bit-width.  This reaches int8-level fidelity
+# (cosine ~0.998-1.000) at 3-4 bits/dim on outlier-heavy data.
+#
+# Unlike the plain paper codec, this one is NOT parameter-free: it must be
+# calibrated once on the prefill KVs to identify the outlier channels.  The
+# calibrated OutlierKVQuant is supplied by the caller (KVCacheDiskOffload keeps
+# one per (layer, is_value)).  We store the packed MSE indices for both the
+# outlier and regular sub-quantizers plus their norms; codebooks live in the
+# calibrated module, not on disk.
+# ---------------------------------------------------------------------------
+
+class _PaperOutlierKV(NamedTuple):
+    """Outlier-aware Lloyd-Max representation of one K or V tensor."""
+    out_packed: Tensor   # uint8  bit-packed outlier-channel indices
+    out_norms: Tensor    # float32 per-vector norms for the outlier sub-quantizer
+    out_bits: int
+    out_dim: int         # n_outlier (channels in the outlier group)
+    reg_packed: Tensor   # uint8  bit-packed regular-channel indices
+    reg_norms: Tensor    # float32 per-vector norms for the regular sub-quantizer
+    reg_bits: int
+    reg_dim: int         # n_regular
+    shape: tuple         # original tensor shape (B, H, T, d)
+    dtype: torch.dtype
+
+
+def _paper_outlier_compress(t: Tensor, oq: "OutlierKVQuant") -> _PaperOutlierKV:
+    """Quantize `t` with a calibrated OutlierKVQuant, bit-packing both groups."""
+    dt = t.dtype
+    q = oq.quantize(t.float().cpu())          # OutlierQuantized(outlier_q, regular_q, shape)
+    oqn, rqn = q.outlier_q, q.regular_q       # each a QuantizedMSE
+    return _PaperOutlierKV(
+        out_packed=_pack_indices(oqn.indices, oq.outlier_bits),
+        out_norms=oqn.norms.float(),
+        out_bits=oq.outlier_bits,
+        out_dim=oq.n_outlier,
+        reg_packed=_pack_indices(rqn.indices, oq.regular_bits),
+        reg_norms=rqn.norms.float(),
+        reg_bits=oq.regular_bits,
+        reg_dim=oq.n_regular,
+        shape=tuple(t.shape),
+        dtype=dt,
+    )
+
+
+def _paper_outlier_dequantize(q: _PaperOutlierKV, oq: "OutlierKVQuant", device=None) -> Tensor:
+    """Reconstruct a float tensor from its _PaperOutlierKV representation."""
+    N = 1
+    for s in q.shape[:-1]:
+        N *= s
+    out_idx = _unpack_indices(q.out_packed, q.out_bits, N * q.out_dim).reshape(N, q.out_dim)
+    reg_idx = _unpack_indices(q.reg_packed, q.reg_bits, N * q.reg_dim).reshape(N, q.reg_dim)
+    rebuilt = OutlierQuantized(
+        outlier_q=QuantizedMSE(indices=out_idx, norms=q.out_norms.reshape(N, 1),
+                               shape=(N, q.out_dim)),
+        regular_q=QuantizedMSE(indices=reg_idx, norms=q.reg_norms.reshape(N, 1),
+                               shape=(N, q.reg_dim)),
+        shape=q.shape,
+    )
+    out = oq.dequantize(rebuilt).to(q.dtype)
+    return out if device is None else out.to(device)
+
+
 class _DiskEntry(NamedTuple):
     """One token-position's K/V data persisted to disk."""
     k_path: str
@@ -393,10 +462,15 @@ class KVCacheDiskOffload:
         codec: str = "paper",
         bits: int = 3,
     ):
-        # quantizer is accepted but ignored — both codecs are parameter-free
-        # (the paper codec builds its own rotation/codebook from `bits`).
-        if codec not in ("paper", "int8"):
-            raise ValueError(f"codec must be 'paper' or 'int8', got {codec!r}")
+        # Codecs:
+        #   "int8"          near-lossless per-vector uint8 (parameter-free)
+        #   "paper"         plain rotate + Lloyd-Max, bit-packed (parameter-free)
+        #   "paper-outlier" paper Section 5: outlier-aware Lloyd-Max — calibrated
+        #                   once on the prefill; best fidelity on real KV tensors.
+        if codec not in ("paper", "paper-outlier", "int8"):
+            raise ValueError(
+                f"codec must be 'paper', 'paper-outlier' or 'int8', got {codec!r}"
+            )
         self._codec = codec
         self._bits = bits
         self._max_vram_tokens = max_vram_tokens
@@ -433,6 +507,9 @@ class KVCacheDiskOffload:
         # Cache of KVQuantMSE modules by (dim, bits) so the paper codec doesn't
         # rebuild the rotation matrix + Lloyd-Max codebook on every K/V tensor.
         self._mse_cache: dict[tuple[int, int], KVQuantMSE] = {}
+        # For "paper-outlier": one calibrated OutlierKVQuant per (l_idx, is_value),
+        # trained once on the prefill and reused for every appended token.
+        self._outlier_q: dict[tuple[int, bool], "OutlierKVQuant"] = {}
 
         # Register cleanup
         if cleanup_on_del:
@@ -447,15 +524,46 @@ class KVCacheDiskOffload:
             self._mse_cache[key] = mse
         return mse
 
-    def _compress_one(self, t: Tensor):
+    def _get_outlier_q(self, l_idx: int, is_value: bool, calib: Tensor) -> "OutlierKVQuant":
+        """Return a calibrated OutlierKVQuant for one (layer, K/V), building it once.
+
+        Calibrated on the prefill slice `calib` (the first store() call for this
+        layer); reused unchanged for every appended token so the codebook and
+        outlier-channel choice stay fixed (append-only).
+        """
+        key = (l_idx, is_value)
+        oq = self._outlier_q.get(key)
+        if oq is None:
+            dim = calib.shape[-1]
+            b = self._bits
+            n_outlier = max(4, dim // 16)          # ~8 of 128 — a few big channels
+            oq = OutlierKVQuant(
+                dim=dim,
+                n_outlier=n_outlier,
+                outlier_bits=min(b + 2, 8),        # spend more precision on outliers
+                regular_bits=b,
+                seed=0,
+                quantizer_cls=KVQuantMSE,          # MSE path reconstructs faithfully
+            )
+            oq.calibrate(calib.float().cpu())
+            self._outlier_q[key] = oq
+        return oq
+
+    def _compress_one(self, t: Tensor, l_idx: int = 0, is_value: bool = False):
         """Compress one K or V tensor with the selected codec (on CPU)."""
         t = t.cpu() if t.is_cuda else t
         if self._codec == "paper":
             return _paper_compress(t, self._bits, self._get_mse)
+        if self._codec == "paper-outlier":
+            oq = self._get_outlier_q(l_idx, is_value, t)
+            return _paper_outlier_compress(t, oq)
         return _int8_compress(t)
 
-    def _dequantize_one(self, q, device) -> Tensor:
+    def _dequantize_one(self, q, device, l_idx: int = 0, is_value: bool = False) -> Tensor:
         """Reconstruct one K or V tensor, dispatching on the stored codec type."""
+        if isinstance(q, _PaperOutlierKV):
+            oq = self._outlier_q[(l_idx, is_value)]
+            return _paper_outlier_dequantize(q, oq, device=device)
         if isinstance(q, _PaperKV):
             return _paper_dequantize(q, self._get_mse, device=device)
         return _int8_dequantize(q, device=device)
@@ -494,8 +602,8 @@ class KVCacheDiskOffload:
             for l_idx, (k, v) in enumerate(kvs):
                 k_new = k[..., new_from:total_len, :]
                 v_new = v[..., new_from:total_len, :]
-                k_c = self._compress_one(k_new)
-                v_c = self._compress_one(v_new)
+                k_c = self._compress_one(k_new, l_idx=l_idx, is_value=False)
+                v_c = self._compress_one(v_new, l_idx=l_idx, is_value=True)
                 chunk_idx = self._num_chunks.get(l_idx, 0)
                 self._ram[(l_idx, chunk_idx)] = [k_c, v_c]
                 self._ram.move_to_end((l_idx, chunk_idx))
@@ -530,8 +638,10 @@ class KVCacheDiskOffload:
                 k_parts, v_parts = [], []
                 for chunk_idx in range(self._num_chunks.get(l_idx, 0)):
                     k_c, v_c = self._get_chunk(l_idx, chunk_idx)
-                    k_parts.append(self._dequantize_one(k_c, device=device))
-                    v_parts.append(self._dequantize_one(v_c, device=device))
+                    k_parts.append(self._dequantize_one(k_c, device=device,
+                                                        l_idx=l_idx, is_value=False))
+                    v_parts.append(self._dequantize_one(v_c, device=device,
+                                                        l_idx=l_idx, is_value=True))
                 # Concatenate chunks along the sequence dimension (dim=-2).
                 k_hat = torch.cat(k_parts, dim=-2) if len(k_parts) > 1 else k_parts[0]
                 v_hat = torch.cat(v_parts, dim=-2) if len(v_parts) > 1 else v_parts[0]
@@ -668,6 +778,8 @@ class KVCacheDiskOffload:
             self._ram.clear()
         if hasattr(self, "_disk"):
             self._disk.clear()
+        if hasattr(self, "_outlier_q"):
+            self._outlier_q.clear()
         self._disk_files.clear()
 
     def __del__(self):

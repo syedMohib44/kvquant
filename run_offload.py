@@ -59,9 +59,12 @@ def main() -> None:
                    help="Spill the KV cache VRAM->RAM->SSD.")
     p.add_argument("--no-offload-to-disk", dest="offload_to_disk", action="store_false",
                    help="Disable KV-cache offload (keep it in VRAM).")
-    p.add_argument("--offload-codec", default="paper", choices=["paper", "int8"],
-                   help="'paper' = rotate+Lloyd-Max, bit-packed (smallest); "
-                        "'int8' = near-lossless per-vector uint8 (larger).")
+    p.add_argument("--offload-codec", default="paper-outlier",
+                   choices=["paper-outlier", "paper", "int8"],
+                   help="'paper-outlier' = paper Section 5 outlier-aware Lloyd-Max "
+                        "(best fidelity on real KV, default); "
+                        "'paper' = plain Lloyd-Max, bit-packed (smallest); "
+                        "'int8' = near-lossless per-vector uint8 (largest).")
     p.add_argument("--max-vram-tokens", type=int, default=512,
                    help="Token positions kept dequantized (hot) in VRAM.")
     p.add_argument("--warm-size", type=int, default=8,
