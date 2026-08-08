@@ -32,7 +32,14 @@ from typing import Generator, Optional
 
 import torch
 
-from .kv_cache import KVCacheQuantizer, kvs_from_cache, crop_model_cache, KVCacheDiskOffload
+from .kv_cache import (
+    KVCacheQuantizer,
+    kvs_from_cache,
+    quantize_model_cache,
+    crop_model_cache,
+    KVCacheDiskOffload,
+)
+from .quantizer import KVQuantMSE
 
 
 # ---------------------------------------------------------------------------
@@ -276,69 +283,6 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _int8_quantize_cache(past_key_values, kvs, correction_rank: int = 0):
-    """
-    Compress and immediately decompress the KV cache using per-vector int8
-    scalar quantization (min-max clamp + round-trip).  This gives faithful
-    pointwise reconstruction — essential for using the cache in autoregressive
-    generation — while still exercising the quantized-cache code path so that
-    latency and memory measurements reflect the compressed format.
-
-    Each KV vector (shape d) is scaled to [-127, 127] using its own min/max,
-    quantized to int8, then dequantized back to float.  Round-trip error is
-    at most range/254 per coordinate, which is negligible compared to FP16.
-
-    If ``correction_rank > 0``, a rank-r SVD of the quantization residual
-    (K - K_hat) is added back (paper §3.4 / §5.3 low-rank error correction),
-    recovering structure the scalar codebook misses.  Per the paper this is only
-    worthwhile below 4-bit; the caller gates on that.
-    """
-    import copy
-    from .kv_cache import _low_rank_correct
-
-    cache_q = copy.deepcopy(past_key_values)
-    r = correction_rank
-
-    def _q8(t: torch.Tensor) -> torch.Tensor:
-        """Per-vector (last dim) uint8 round-trip, optional low-rank residual fix."""
-        dt = t.dtype
-        t_f = t.float()
-        mn = t_f.min(dim=-1, keepdim=True).values
-        mx = t_f.max(dim=-1, keepdim=True).values
-        scale = (mx - mn).clamp(min=1e-8) / 255.0
-        # Quantise to integer levels [0..255] then dequantise — stay in float32
-        # so torch.int8 overflow cannot corrupt values.
-        q = ((t_f - mn) / scale).round().clamp(0, 255)
-        t_hat = q * scale + mn
-        if r > 0:
-            # Add back a rank-r approximation of the residual (t_f - t_hat).
-            t_hat = _low_rank_correct(t_f, t_hat, r)
-        return t_hat.to(dt)
-
-    if hasattr(cache_q, "layers"):
-        for layer in cache_q.layers:
-            k = getattr(layer, "keys", None)
-            if isinstance(k, torch.Tensor):
-                layer.keys   = _q8(k)
-                layer.values = _q8(layer.values)
-    elif hasattr(cache_q, "key_cache"):
-        for i in range(len(cache_q.key_cache)):
-            k = cache_q.key_cache[i]
-            if isinstance(k, torch.Tensor):
-                cache_q.key_cache[i]   = _q8(k)
-                cache_q.value_cache[i] = _q8(cache_q.value_cache[i])
-    elif isinstance(cache_q, (tuple, list)):
-        result = []
-        for k, v in cache_q:
-            if isinstance(k, torch.Tensor):
-                result.append((_q8(k), _q8(v)))
-            else:
-                result.append((k, v))
-        return tuple(result)
-
-    return cache_q
-
-
 def _chunked_prefill(mdl, ids, chunk_size: int):
     """
     Prefill the model in chunks of `chunk_size` tokens to avoid OOM on long
@@ -358,19 +302,31 @@ def _chunked_prefill(mdl, ids, chunk_size: int):
     return past
 
 
-def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size: int = 512):
+def _build_quantized_cache(
+    mdl, tok, input_ids, bits, correction_rank,
+    prefill_chunk_size: int = 512, quantize: bool = True,
+):
     """
     Run prefill on input_ids, calibrate per-layer quantizers on the resulting
-    KV vectors, compress the cache, and return (past, avg_bits, T_p).
+    KV vectors, compress the cache with the paper's method, and return
+    (past, avg_bits, T_p, ids).
 
     Long prompts (contracts, documents) are prefilled in chunks of
     `prefill_chunk_size` tokens so the O(T²) attention matrix never exceeds
     VRAM — the full context is still captured in the KV cache.
 
-    The cache used for generation is an int8 round-trip (faithful per-vector
-    scalar quantization) so that attention computation stays accurate.
-    avg_bits is derived from the KVCacheQuantizer calibration and reflects the
-    theoretical compression budget of the requested bit-width.
+    The cache used for generation is the paper's Section 5 outlier-aware
+    Lloyd-Max codec (KVQuantMSE for BOTH K and V).  MSE reconstructs faithfully
+    per coordinate, which is what attention needs — the IP quantizer used for
+    PPL scoring is an inner-product *estimator* and would garble generation, so
+    we force ``k_quantizer_cls=KVQuantMSE`` here.  Each layer gets its own
+    quantizer calibrated on that layer's own prefill KV (per-layer calibration,
+    paper §Per-layer calibration).  avg_bits is the real calibrated average.
+
+    When ``quantize=False`` (the disk-offload path), the raw float prefill is
+    returned uncompressed: KVCacheDiskOffload is then the SOLE compressor, so we
+    avoid quantizing twice (lossy-on-lossy).  avg_bits is still reported so the
+    caller can show the offload bit budget.
     """
     n_heads, n_kv_heads, head_dim = _model_dims(mdl)
     gqa      = n_heads // n_kv_heads
@@ -384,34 +340,44 @@ def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank, prefill_c
     native_cache = _chunked_prefill(mdl, ids, prefill_chunk_size)
     kvs = kvs_from_cache(native_cache)
 
-    # avg_bits is a closed-form property of the chosen bit budget — it needs NO
-    # calibration and NO per-layer sub-quantizer construction.  Build a single
-    # un-calibrated KVCacheQuantizer just to read the analytic value (the actual
-    # cache is int8, below).  This avoids ~n_layers QR rotations + Lloyd-Max +
-    # variance scans over the whole prefill on every generate() call.
-    if kvs:
-        avg_bits = KVCacheQuantizer(
+    # One KVCacheQuantizer PER LAYER, each calibrated on its own layer's KV
+    # (paper §Per-layer calibration — pooling across layers mis-identifies the
+    # per-layer outlier channels).  MSE-for-K makes reconstruction faithful for
+    # generation; the paper §5.1 outlier config is outlier_bits=min(bits+1,4),
+    # regular_bits=max(bits-1,1).
+    kvc = []
+    for k, v in kvs:
+        k3 = k.reshape(-1, k.shape[-2], head_dim)
+        v3 = v.reshape(-1, v.shape[-2], head_dim)
+        q = KVCacheQuantizer(
             head_dim=head_dim,
             num_bits=bits,
             use_outlier=True,
             n_outlier=n_outlier,
-            outlier_bits=min(bits + 1, 8),
+            outlier_bits=min(bits + 1, 4),
             regular_bits=max(bits - 1, 1),
             gqa_factor=gqa,
-        ).avg_bits
-    else:
-        avg_bits = float(bits)
+            k_quantizer_cls=KVQuantMSE,
+        )
+        q.calibrate(k3, v3)
+        kvc.append(q)
+    avg_bits = kvc[0].avg_bits if kvc else float(bits)
 
-    # Quantize cache with int8 scalar quantization (faithful pointwise reconstruction).
-    # Low-rank residual correction (paper §3.4/§5.3) only helps below 4-bit — at
-    # 4-bit the residual is small enough that a rank-r SVD fits numerical noise
-    # (paper §5.3), so gate it off there.
+    if not quantize:
+        # Offload path: leave the prefill in raw float; the offload codec is the
+        # sole (single-pass) compressor.  See docstring.
+        return native_cache, avg_bits, T_p, ids
+
+    # Compress the prefill once with the paper codec.  Low-rank residual
+    # correction (paper §3.4/§5.3) only helps below 4-bit — at 4-bit the residual
+    # is small enough that a rank-r SVD fits numerical noise, so gate it off.
     eff_rank = correction_rank if (correction_rank > 0 and bits < 4) else 0
-    past = _int8_quantize_cache(native_cache, kvs, correction_rank=eff_rank)
+    past = quantize_model_cache(native_cache, kvc, correction_rank=eff_rank)
     return past, avg_bits, T_p, ids
 
 
-def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-outlier", bits=3):
+def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-outlier",
+                   bits=3, device=None):
     """
     Build a KVCacheDiskOffload for tiered VRAM->RAM->SSD storage of the KV cache.
 
@@ -421,7 +387,9 @@ def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-ou
         (cosine ~0.999) because a few high-magnitude channels get extra bits.
       - "paper": plain rotate + Lloyd-Max, indices bit-packed to `bits` (2-4).
         Smallest SSD footprint but degrades on outlier-heavy KV.
-      - "int8": per-vector min-max uint8 -> near-lossless (cosine ~1.0), largest.
+
+    `device` is the model's device — staged (dequantized) tensors are placed there
+    so offload works on CPU / MPS / any GPU, not just CUDA.
 
     Returns a manager that has NOT yet stored anything (caller decides when).
     """
@@ -431,6 +399,7 @@ def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-ou
         disk_dir=disk_dir,
         codec=offload_codec,
         bits=bits,
+        device=device,
     )
 
 
@@ -561,8 +530,7 @@ def generate(
                             "paper-outlier" (default): paper Section 5 outlier-aware
                             Lloyd-Max, calibrated on the prefill — best fidelity on
                             real KV.  "paper": plain Lloyd-Max, bit-packed (smallest,
-                            degrades on outlier-heavy KV).  "int8": near-lossless
-                            per-vector uint8 (largest, output identical to non-offloaded).
+                            degrades on outlier-heavy KV).
 
     Returns:
         GenerateResult with .text, .bits, .avg_bits_per_dim, .compression_ratio.
@@ -617,7 +585,8 @@ def generate(
 
     input_ids = _format_prompt(tok, prompt, raw, system=system)
     past, avg_bits, T_p, ids = _build_quantized_cache(
-        mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size
+        mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size,
+        quantize=not offload_to_disk,
     )
 
     suppress_ids = _get_suppress_ids(tok)
@@ -633,7 +602,8 @@ def generate(
         # Tiered VRAM->RAM->SSD storage of the KV cache.  Store the CROPPED cache,
         # then stage it back for the first-token forward — identical positions to
         # the in-memory path, just spilled to disk between steps.
-        offload = _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec, bits)
+        offload = _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec, bits,
+                                 device=_model_device(mdl))
         del past
         offload.store(past_crop)
         del past_crop
@@ -762,7 +732,8 @@ def stream(
 
     input_ids = _format_prompt(tok, prompt, raw, system=system)
     past, _, T_p, ids = _build_quantized_cache(
-        mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size
+        mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size,
+        quantize=not offload_to_disk,
     )
 
     suppress_ids = _get_suppress_ids(tok)
@@ -772,7 +743,8 @@ def stream(
 
     offload = None
     if offload_to_disk:
-        offload = _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec, bits)
+        offload = _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec, bits,
+                                 device=_model_device(mdl))
         del past
         offload.store(past_crop)
         del past_crop

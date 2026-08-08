@@ -313,7 +313,7 @@ All the memory levers on `generate()` / `stream()`:
 | `weights_disk_dir` | where SSD weight shards go | `"D:/kv_weights"` |
 | `device_map="auto"` | spreads weights across GPUs / CPU | multi-GPU |
 | `bits` (2/3/4) | KV **cache** precision | `bits=2` = most compression |
-| `offload_to_disk=True` | KV **cache** → CPU RAM → **SSD** (paper Lloyd-Max codec, or `offload_codec="int8"`) | fits any context, slow |
+| `offload_to_disk=True` | KV **cache** → CPU RAM → **SSD** (paper Lloyd-Max codec) | fits any context, slow |
 | `prefill_chunk_size` | peak prefill VRAM | `256` = safest |
 
 ---
@@ -459,7 +459,7 @@ whose per-token K/V no longer fits in VRAM. The cache is spilled across three ti
 **VRAM → CPU RAM → SSD**, so only the layers needed for the next forward pass stay
 resident.
 
-Three codecs are available via `offload_codec`:
+Two codecs are available via `offload_codec` — both are the paper's method:
 
 - **`"paper-outlier"` (default)** the paper's **Section 5** outlier-aware
   Lloyd-Max, calibrated once on the prefill KVs. Real attention K/V tensors have a
@@ -472,22 +472,19 @@ Three codecs are available via `offload_codec`:
   loses coherence — use only when footprint matters more than quality. Uses the
   MSE path for both K and V (not the KVQuant-**IP** estimator, which cannot
   reconstruct a usable cache).
-- **`"int8"`** faithful per-vector uint8 (min + scale), the same scalar scheme the
-  in-memory path uses (logit correlation ~0.999). Largest of the three on disk, but
-  output is **identical** to the non-offloaded run and needs no calibration.
 
 **Append-only (why generation stays coherent).** Each token's K/V is compressed
 **exactly once** and then frozen the offloader appends the newly generated token
 each step and never re-touches earlier ones. This mirrors the paper (which quantizes
-each vector once) and is essential for the lossy `"paper"` codec: re-quantizing an
-already-quantized token every step makes Lloyd-Max drift and, over a long generation,
-degrades into gibberish. `int8` is immune (it is idempotent), but append-only is the
-correct model for both.
+each vector once) and is essential for the lossy Lloyd-Max codec: re-quantizing an
+already-quantized token every step makes it drift and, over a long generation,
+degrades into gibberish. Compressing each token once and freezing it keeps the paper
+codec faithful over long generations.
 
 **Bit-width guidance for the paper codecs:** use **`bits=4`** (closest to lossless)
 or **`bits=3`** (paper's sweet spot). **`bits=2` is very lossy** 4 Lloyd-Max levels
-per coordinate is at the edge of usable and can visibly hurt quality; prefer `"int8"`
-if you need small *and* faithful.
+per coordinate is at the edge of usable and can visibly hurt quality; raise `bits`
+if output degrades — there is no non-paper fallback.
 
 ```python
 from kvquant import generate
@@ -497,7 +494,7 @@ out = generate(
     doc + "\n\nSummarise the key points.",
     model="Qwen/Qwen2.5-7B-Instruct",
     offload_to_disk=True,          # spill KV cache VRAM → RAM → SSD
-    offload_codec="paper-outlier", # paper Section 5 (default); "paper" or "int8" also valid
+    offload_codec="paper-outlier", # paper Section 5 (default); "paper" also valid
     bits=3,                        # pack width for the paper codecs (2-4)
     max_vram_tokens=512,           # token positions kept dequantized in VRAM
     warm_size=16,                  # layer entries kept in CPU RAM before disk spill
@@ -510,7 +507,7 @@ print(out.text)
 | Lever | Effect | Default |
 |---|---|---|
 | `offload_to_disk=True` | enable the VRAM → RAM → SSD KV-cache spill | `False` |
-| `offload_codec` | `"paper"` (Lloyd-Max, bit-packed, smallest) or `"int8"` (near-lossless, larger) | `"paper"` |
+| `offload_codec` | `"paper-outlier"` (Section 5 outlier-aware, best fidelity) or `"paper"` (Lloyd-Max, bit-packed, smallest) | `"paper-outlier"` |
 | `bits` | pack width for the paper codec (2-4); also the in-memory KV precision | `3` |
 | `max_vram_tokens` | token positions kept dequantized (hot) in VRAM | `512` |
 | `warm_size` | compressed layer entries kept in CPU RAM before spilling to SSD | `16` |

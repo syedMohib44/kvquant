@@ -526,15 +526,12 @@ class TestDeltaKVCache:
 
 
 # ===========================================================================
-# kv_cache.py — int8 tiered disk offload (KVCacheDiskOffload)
+# kv_cache.py — paper-codec tiered disk offload (KVCacheDiskOffload)
 # ===========================================================================
 
 from src.kv_cache import (  # noqa: E402
     KVCacheDiskOffload,
-    _Int8KV,
     _PaperKV,
-    _int8_compress,
-    _int8_dequantize,
     _paper_compress,
     _paper_dequantize,
     _pack_indices,
@@ -563,41 +560,52 @@ def _staged_pairs(staged):
     return [(l.keys, l.values) for l in staged.layers]
 
 
-class TestInt8KV:
-    """The faithful per-vector int8 representation used by the offloader."""
+def test_mse_key_reconstructs_far_better_than_ip():
+    """The generation cache uses KVQuantMSE for BOTH K and V so reconstruction
+    is faithful per coordinate.  This is the whole reason int8 was removable.
 
-    def test_roundtrip_within_step(self):
-        """int8 reconstruction error never exceeds one quant step (max-min)/255."""
-        torch.manual_seed(SEED)
-        t = torch.randn(4, 8, D)
-        q = _int8_compress(t)
-        t_hat = _int8_dequantize(q)
-        step = (t.amax(dim=-1, keepdim=True) - t.amin(dim=-1, keepdim=True)) / 255.0
-        err = (t - t_hat).abs()
-        # every element within half a step (min-max rounding), allow tiny fp slack
-        assert (err <= step.expand_as(err) + 1e-5).all()
+    The default KVCacheQuantizer uses KVQuant-IP for K — an inner-product
+    *estimator* whose per-coordinate output is wrong (fine for PPL scoring,
+    unusable as a real cache).  Passing k_quantizer_cls=KVQuantMSE swaps K to the
+    MSE-optimal quantizer.  This test proves the contrast: MSE-for-K reconstructs
+    K with high per-coordinate cosine, while IP-for-K does not."""
+    from src.kv_cache import KVCacheQuantizer
 
-    def test_preserves_dtype(self):
-        """Original dtype is restored on dequantize."""
-        t = torch.randn(3, D, dtype=torch.float16)
-        assert _int8_dequantize(_int8_compress(t)).dtype == torch.float16
+    torch.manual_seed(SEED)
+    B, H, T, d = 1, 2, 64, D
+    k = torch.randn(B, H, T, d)
+    v = torch.randn(B, H, T, d)
 
-    def test_codes_are_uint8(self):
-        q = _int8_compress(torch.randn(2, D))
-        assert q.codes.dtype == torch.uint8
-        assert isinstance(q, _Int8KV)
+    def cos(a, b):
+        return (a.flatten() @ b.flatten() / (a.norm() * b.norm())).item()
 
-    def test_constant_vector_no_nan(self):
-        """A constant vector has zero range; clamped scale must not produce NaN."""
-        t = torch.full((2, D), 3.14)
-        t_hat = _int8_dequantize(_int8_compress(t))
-        assert torch.isfinite(t_hat).all()
+    def k_cosine(k_cls):
+        q = KVCacheQuantizer(
+            head_dim=d, num_bits=4, use_outlier=True,
+            n_outlier=max(4, d // 4), outlier_bits=4, regular_bits=3,
+            k_quantizer_cls=k_cls,
+        )
+        q.calibrate(k, v)
+        k_hat = q.decompress(q.compress(k, is_value=False), is_value=False)
+        return cos(k, k_hat)
+
+    mse_cos = k_cosine(KVQuantMSE)   # the generation path
+    ip_cos = k_cosine(None)          # the PPL-scoring default (IP for K)
+
+    # MSE reconstructs K faithfully per coordinate (worst-case random Gaussian
+    # still clears 0.95); IP is an inner-product estimator and reconstructs K
+    # worse.  On real structured KV during generation the gap is far larger — the
+    # IP path drifts into gibberish — but even on random data MSE must beat it.
+    assert mse_cos > 0.95, f"MSE-for-K cosine too low: {mse_cos:.4f}"
+    assert mse_cos > ip_cos + 0.03, (
+        f"MSE-for-K ({mse_cos:.4f}) should exceed IP-for-K ({ip_cos:.4f})"
+    )
 
 
 class TestKVCacheDiskOffload:
     """Tiered VRAM->RAM->disk offload, exercised on both codecs."""
 
-    @pytest.mark.parametrize("codec", ["int8", "paper", "paper-outlier"])
+    @pytest.mark.parametrize("codec", ["paper", "paper-outlier"])
     def test_store_stage_roundtrip(self, codec):
         """stage_for_forward reconstructs every layer; shapes and dtype preserved."""
         cache = _fake_cache()
@@ -610,14 +618,9 @@ class TestKVCacheDiskOffload:
             assert len(pairs) == len(cache)
             for (k, v), (k_hat, v_hat) in zip(cache, pairs):
                 assert k_hat.shape == k.shape and v_hat.shape == v.shape
-                if codec == "int8":
-                    # near-lossless: within one int8 step
-                    kstep = (k.amax(-1, keepdim=True) - k.amin(-1, keepdim=True)) / 255.0
-                    assert (k - k_hat.cpu()).abs().max() <= kstep.max() + 1e-4
-                else:
-                    # paper Lloyd-Max: lossy but directionally faithful
-                    rel = (k - k_hat.cpu()).norm() / k.norm()
-                    assert rel < 0.5, f"{codec} K rel_err too high: {rel:.3f}"
+                # paper Lloyd-Max: lossy but directionally faithful
+                rel = (k - k_hat.cpu()).norm() / k.norm()
+                assert rel < 0.5, f"{codec} K rel_err too high: {rel:.3f}"
         finally:
             off.close()
 
@@ -656,7 +659,7 @@ class TestKVCacheDiskOffload:
         # Faithful enough for generation, at a LOWER average bit budget than plain.
         assert outlier > 0.99, f"outlier codec should be near-lossless, got {outlier:.4f}"
 
-    @pytest.mark.parametrize("codec", ["int8", "paper", "paper-outlier"])
+    @pytest.mark.parametrize("codec", ["paper", "paper-outlier"])
     def test_disk_spill_fires(self, codec):
         """warm_size smaller than n_layers must push the remainder to disk."""
         n_layers, warm = 6, 2
@@ -737,24 +740,25 @@ class TestKVCacheDiskOffload:
         finally:
             off.close()
 
-    def test_paper_file_smaller_than_int8(self):
-        """Paper codec (bit-packed 3-bit indices) spills smaller files than int8."""
+    def test_paper_file_smaller_than_float16(self):
+        """Paper codec (bit-packed 3-bit indices) spills far smaller than the
+        raw float16 cache it replaces."""
         import os
         cache = _fake_cache(n_layers=4, T=64)
 
-        def spill_bytes(codec, bits):
-            off = KVCacheDiskOffload(warm_size=0, disk_dir=None, codec=codec, bits=bits)
-            off.store(cache)  # warm_size=0 forces everything to disk
-            d = off.memory_summary()["disk_dir"]
-            total = sum(
-                os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)
-            )
-            off.close()
-            return total
+        off = KVCacheDiskOffload(warm_size=0, disk_dir=None, codec="paper", bits=3)
+        off.store(cache)  # warm_size=0 forces everything to disk
+        d = off.memory_summary()["disk_dir"]
+        paper = sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d))
+        off.close()
 
-        paper = spill_bytes("paper", 3)
-        int8 = spill_bytes("int8", 3)
-        assert paper < int8, f"paper {paper} should be < int8 {int8}"
+        # float16 baseline: 2 bytes/coord across all K and V entries.
+        float16_bytes = sum(
+            (k.numel() + v.numel()) * 2 for k, v in cache
+        )
+        assert paper < float16_bytes, (
+            f"paper {paper} should be < float16 {float16_bytes}"
+        )
 
 
 class TestPaperCodec:

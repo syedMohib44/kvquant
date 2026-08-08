@@ -332,7 +332,7 @@ class KVQuantIP(nn.Module):
         # replaced by a structured sign-flip + FWHT (SRHT) for O(d log d) compute
         # and O(d) storage while preserving the QJL variance bound.  Deferred
         # deliberately: KVQuantIP is not on the generation hot path (the runtime
-        # cache uses int8 / MSE-based codecs, not the IP estimator), so the win
+        # cache uses the MSE-based paper codecs, not the IP estimator), so the win
         # would not affect real inference.  Revisit if IP is ever used at runtime.
         gen = torch.Generator()
         gen.manual_seed(qjl_seed)

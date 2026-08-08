@@ -60,11 +60,10 @@ def main() -> None:
     p.add_argument("--no-offload-to-disk", dest="offload_to_disk", action="store_false",
                    help="Disable KV-cache offload (keep it in VRAM).")
     p.add_argument("--offload-codec", default="paper-outlier",
-                   choices=["paper-outlier", "paper", "int8"],
+                   choices=["paper-outlier", "paper"],
                    help="'paper-outlier' = paper Section 5 outlier-aware Lloyd-Max "
                         "(best fidelity on real KV, default); "
-                        "'paper' = plain Lloyd-Max, bit-packed (smallest); "
-                        "'int8' = near-lossless per-vector uint8 (largest).")
+                        "'paper' = plain Lloyd-Max, bit-packed (smallest).")
     p.add_argument("--max-vram-tokens", type=int, default=512,
                    help="Token positions kept dequantized (hot) in VRAM.")
     p.add_argument("--warm-size", type=int, default=8,
@@ -78,6 +77,14 @@ def main() -> None:
     p.add_argument("--max-gpu-mem", default=None, help='VRAM cap for weights=offload, e.g. "6GiB".')
     p.add_argument("--max-cpu-mem", default=None, help='RAM cap for weights=offload, e.g. "12GiB".')
     p.add_argument("--weights-disk-dir", default=None, help="SSD folder for offloaded weight shards.")
+
+    # ---- device ----
+    p.add_argument("--device", default=None, choices=[None, "cuda", "cpu", "mps"],
+                   help="Compute device for the model and the staged (dequantized) "
+                        "KV cache.  Default: auto-detect (cuda if available, else cpu). "
+                        "Offload works on any device — the staged tensors follow the "
+                        "model.  Ignored when --weights is 4bit/8bit/offload "
+                        "(those place the model themselves).")
 
     # ---- environment convenience ----
     p.add_argument("--hf-home", default=None,
@@ -106,6 +113,7 @@ def main() -> None:
         prompt = args.prompt
 
     print(f"Model      : {args.model}")
+    print(f"Device     : {args.device or 'auto'}")
     print(f"Weights    : {args.weights or 'full'}")
     print(f"KV offload : {args.offload_to_disk} "
           f"(codec={args.offload_codec}, bits={args.bits}, "
@@ -120,6 +128,7 @@ def main() -> None:
         bits=args.bits,
         max_new_tokens=args.max_new_tokens,
         prefill_chunk_size=args.prefill_chunk_size,
+        device=args.device,
         # KV-cache offload
         offload_to_disk=args.offload_to_disk,
         offload_codec=args.offload_codec,

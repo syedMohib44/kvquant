@@ -218,43 +218,6 @@ def _low_rank_correct(x: Tensor, x_hat: Tensor, rank: int) -> Tensor:
 # Tiered memory offload: VRAM  ->  CPU-RAM  ->  disk (memmap / pickle)
 # ---------------------------------------------------------------------------
 
-class _Int8KV(NamedTuple):
-    """
-    Faithful per-vector int8 (uint8) representation of one K or V tensor.
-
-    This is the SAME scalar quantization generate() uses for the in-memory cache
-    (per-vector min-max round-trip, logit correlation ~0.996 vs float16), NOT the
-    research KVQuant-IP quantizer — whose output is an inner-product *estimator*
-    and produces garbage when fed back as an actual KV cache.
-
-    Storage: uint8 codes (1/4 the bytes of float32, 1/2 of float16) + per-vector
-    min and scale (float32).  Reconstruct with:  codes * scale + mn.
-    """
-    codes: Tensor   # uint8   (..., d)  quantized levels 0..255
-    mn: Tensor      # float32 (..., 1)  per-vector minimum
-    scale: Tensor   # float32 (..., 1)  per-vector (max-min)/255
-    dtype: torch.dtype   # original tensor dtype (bf16/fp16/fp32) to restore on dequant
-
-
-def _int8_compress(t: Tensor) -> _Int8KV:
-    """Per-vector (last-dim) uint8 min-max quantization. Faithful, cheap, CPU-friendly."""
-    dt = t.dtype
-    t_f = t.float()
-    mn = t_f.min(dim=-1, keepdim=True).values
-    mx = t_f.max(dim=-1, keepdim=True).values
-    scale = (mx - mn).clamp(min=1e-8) / 255.0
-    codes = ((t_f - mn) / scale).round().clamp(0, 255).to(torch.uint8)
-    return _Int8KV(codes=codes, mn=mn, scale=scale, dtype=dt)
-
-
-def _int8_dequantize(q: _Int8KV, device=None) -> Tensor:
-    """Reconstruct a float tensor from its _Int8KV representation."""
-    codes = q.codes if device is None else q.codes.to(device)
-    mn = q.mn if device is None else q.mn.to(device)
-    scale = q.scale if device is None else q.scale.to(device)
-    return (codes.float() * scale + mn).to(q.dtype)
-
-
 # ---------------------------------------------------------------------------
 # Paper codec: rotate + Lloyd-Max (the paper's core algorithm), stored at the
 # true 2–4 bit width via bit-packing.
@@ -422,22 +385,23 @@ class KVCacheDiskOffload:
 
     Reconstruction fidelity
     ------------------------
-    The cache is stored with faithful per-vector int8 (uint8) min-max
-    quantization — the SAME scheme generate() uses for its in-memory cache
-    (logit correlation ~0.996 vs float16).  It deliberately does NOT use the
+    The cache is stored with the paper's rotate + Lloyd-Max codec ("paper", or
+    the Section 5 outlier-aware "paper-outlier"), which uses KVQuantMSE for both
+    K and V.  MSE reconstructs faithfully per coordinate, so the dequantized
+    cache drives real generation correctly.  It deliberately does NOT use the
     research KVQuant-IP quantizer: that returns an inner-product *estimator*
     whose per-coordinate values are wrong, so feeding it back as an actual KV
-    cache produces garbled output.  int8 keeps generation correct while still
-    cutting cache bytes to 1/4 of float32 (1/2 of float16) and enabling the
-    RAM -> SSD spill for very long contexts.
+    cache produces garbled output.  The paper codec cuts cache bytes to the true
+    2-4 bits/coord (bit-packed) and enables the RAM -> SSD spill for very long
+    contexts.
 
     Usage
     -----
         offload = KVCacheDiskOffload(max_vram_tokens=512, disk_dir="./kv_tmp")
-        offload.store(native_cache)           # int8-compress + offload
+        offload.store(native_cache)           # paper-compress + offload
         past = offload.stage_for_forward()    # dequantize to VRAM (LRU-aware)
         out = model(ids, past_key_values=past, use_cache=True)
-        offload.replace(out.past_key_values)  # re-compress and offload again
+        offload.replace(out.past_key_values)  # freeze new token(s), offload again
 
     Args:
         max_vram_tokens: Max number of token positions to keep dequantized in VRAM
@@ -448,7 +412,8 @@ class KVCacheDiskOffload:
         pin_memory:      Pin CPU tensors for faster host->device transfer.
         cleanup_on_del:  Delete disk files when this object is garbage-collected.
         quantizer:       Deprecated/ignored — kept for backwards-compatible call
-                         sites.  int8 offload needs no calibrated quantizer.
+                         sites.  The paper-outlier codec calibrates its own
+                         quantizer from the prefill; "paper" needs none.
     """
 
     def __init__(
@@ -461,21 +426,29 @@ class KVCacheDiskOffload:
         cleanup_on_del: bool = True,
         codec: str = "paper",
         bits: int = 3,
+        device: "str | torch.device | None" = None,
     ):
-        # Codecs:
-        #   "int8"          near-lossless per-vector uint8 (parameter-free)
+        # Codecs (both are the paper's method — no non-paper fallback):
         #   "paper"         plain rotate + Lloyd-Max, bit-packed (parameter-free)
         #   "paper-outlier" paper Section 5: outlier-aware Lloyd-Max — calibrated
         #                   once on the prefill; best fidelity on real KV tensors.
-        if codec not in ("paper", "paper-outlier", "int8"):
+        if codec not in ("paper", "paper-outlier"):
             raise ValueError(
-                f"codec must be 'paper', 'paper-outlier' or 'int8', got {codec!r}"
+                f"codec must be 'paper' or 'paper-outlier', got {codec!r}"
             )
         self._codec = codec
         self._bits = bits
         self._max_vram_tokens = max_vram_tokens
         self._warm_size = warm_size
-        self._pin_memory = pin_memory and torch.cuda.is_available()
+        # Target device for staged (dequantized) tensors.  Defaults to CUDA when
+        # available, else CPU — but the caller should pass the model's actual
+        # device so offload works on CPU / MPS / a specific GPU, not just CUDA.
+        if device is None:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self._device = torch.device(device)
+        # Pinning host memory only helps (and is only valid) for CUDA transfers.
+        self._pin_memory = pin_memory and self._device.type == "cuda"
 
         self._disk_dir = Path(disk_dir) if disk_dir else Path(tempfile.mkdtemp(prefix="kv_offload_"))
         self._disk_dir.mkdir(parents=True, exist_ok=True)
@@ -485,11 +458,11 @@ class KVCacheDiskOffload:
         # ------------------------------------------------------------------
         # APPEND-ONLY storage.  Each token position is compressed exactly ONCE
         # (as the paper does) and then frozen — never re-quantized.  This is
-        # essential for the lossy 'paper' codec: re-compressing an already-
-        # quantized token every generation step makes Lloyd-Max drift (cosine
-        # 0.91 -> 0.60 over 40 steps) and produces gibberish.  int8 happens to be
-        # idempotent so the old design only broke the paper codec, but append-only
-        # is the correct model for both.
+        # essential for the lossy Lloyd-Max codec: re-compressing an already-
+        # quantized token every generation step makes it drift (cosine
+        # 0.91 -> 0.60 over 40 steps) and produces gibberish.  Compressing each
+        # token once and freezing it keeps the paper codec faithful over long
+        # generations.
         #
         # A "chunk" is one contiguous block of already-compressed tokens for one
         # layer: chunk 0 = the prefill block, chunks 1.. = one per generation step.
@@ -567,7 +540,7 @@ class KVCacheDiskOffload:
         if self._codec == "paper-outlier":
             oq = self._get_outlier_q(l_idx, is_value, t)
             return _paper_outlier_compress(t, oq)
-        return _int8_compress(t)
+        raise ValueError(f"unknown codec {self._codec!r}")
 
     def _dequantize_one(self, q, device, l_idx: int = 0, is_value: bool = False) -> Tensor:
         """Reconstruct one K or V tensor, dispatching on the stored codec type."""
@@ -576,7 +549,7 @@ class KVCacheDiskOffload:
             return _paper_outlier_dequantize(q, oq, device=device)
         if isinstance(q, _PaperKV):
             return _paper_dequantize(q, self._get_mse, device=device)
-        return _int8_dequantize(q, device=device)
+        raise TypeError(f"unknown compressed type {type(q).__name__}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -649,7 +622,7 @@ class KVCacheDiskOffload:
         if layers is None:
             layers = list(range(self._n_layers))
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = self._device
         result: list[tuple[Tensor, Tensor]] = []
 
         with self._lock:
@@ -722,8 +695,9 @@ class KVCacheDiskOffload:
     def _save_to_disk(self, l_idx: int, chunk_idx: int, q_pair: list) -> None:
         """Persist one immutable chunk's compressed K/V to disk as .pt files.
 
-        The codec type rides inside the stored NamedTuple (_Int8KV / _PaperKV),
-        so dtype and bit-width are recovered on load with no side files.
+        The codec type rides inside the stored NamedTuple (_PaperKV /
+        _PaperOutlierKV), so dtype and bit-width are recovered on load with no
+        side files.
         """
         k_c, v_c = q_pair
         k_path = str(self._disk_dir / f"layer_{l_idx}_c{chunk_idx}_k.pt")
@@ -850,6 +824,14 @@ class KVCacheQuantizer(nn.Module):
     -------------
     K uses KVQuantIP (inner-product optimal) - minimises attention score error.
     V uses KVQuantMSE (MSE optimal)          - minimises output reconstruction error.
+
+    This IP-for-K choice is optimal for PPL *scoring* (the paper's evaluation
+    setting) but KVQuantIP is an inner-product *estimator* — its per-coordinate
+    reconstruction is wrong, so a cache built with it is unusable for real
+    autoregressive generation.  Pass ``k_quantizer_cls=KVQuantMSE`` to make K use
+    the MSE-optimal quantizer instead: reconstruction is then faithful per
+    coordinate (at a small inner-product cost), which is what generation needs.
+    The default (None -> KVQuantIP) preserves the scoring behaviour unchanged.
     """
 
     def __init__(
@@ -863,6 +845,7 @@ class KVCacheQuantizer(nn.Module):
         use_hadamard: bool = False,
         seed: int = 0,
         gqa_factor: int = 1,
+        k_quantizer_cls: type | None = None,
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
@@ -887,10 +870,13 @@ class KVCacheQuantizer(nn.Module):
             rb_base = regular_bits if regular_bits is not None else num_bits - 1
             ob = min(ob_base + gqa_extra, _MAX_BITS)
             rb = min(max(rb_base + gqa_extra, 1), _MAX_BITS)
-            # K: KVQuantIP  inner-product optimal (attention scores use Q @ K^T)
+            # K: KVQuantIP inner-product optimal (attention scores use Q @ K^T)
+            # for PPL scoring; caller may pass k_quantizer_cls=KVQuantMSE for a
+            # faithfully-reconstructing cache (required for generation).
             self.k_quant = OutlierKVQuant(
                 head_dim, n_outlier, ob, rb, seed=seed,
-                quantizer_cls=KVQuantIP, use_hadamard=use_hadamard,
+                quantizer_cls=(k_quantizer_cls or KVQuantIP),
+                use_hadamard=use_hadamard,
             )
             # V: KVQuantMSE MSE optimal (output is weighted sum of V)
             self.v_quant = OutlierKVQuant(
