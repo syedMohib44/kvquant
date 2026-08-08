@@ -396,7 +396,19 @@ python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --weights 4bit \
 python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --weights offload \
     --max-gpu-mem 6GiB --weights-disk-dir D:/kv_weights \
     --prompt "What is machine learning?" --max-new-tokens 40
+
+# 4-bit weights + KV-cache offload on an 8 GB GPU (paper-outlier codec, bits=4).
+# The GQA bump is applied automatically for Qwen2.5-7B (g=7 → effective 5.25 bits).
+python run_offload.py --model Qwen/Qwen2.5-7B-Instruct --weights 4bit \
+    --offload-to-disk --offload-codec paper-outlier --bits 4 --device cuda \
+    --prompt "Explain machine learning"
 ```
+
+> **Tip.** KV-cache offload round-trips to SSD every token (slow — ~0.3 tok/s). On a
+> 4-bit 7B the cache usually fits in VRAM, so drop `--offload-to-disk` for a large
+> speed-up and only enable it when the *context* is long enough that the cache itself
+> won't fit. `--weights 8bit` needs ~8 GB and won't fit an 8 GB card alongside
+> activations — use `--weights 4bit` there.
 
 Or from Python:
 
@@ -486,6 +498,20 @@ or **`bits=3`** (paper's sweet spot). **`bits=2` is very lossy** 4 Lloyd-Max lev
 per coordinate is at the edge of usable and can visibly hurt quality; raise `bits`
 if output degrades — there is no non-paper fallback.
 
+**GQA models are handled automatically (paper §GQA compensation).** Grouped-query
+models — Qwen2.5-7B, Llama-3, most modern 7B+ checkpoints — share each KV head
+across `g = n_heads / n_kv_heads` query heads, which amplifies quantization error by
+~`g`×. To hold quality constant the codec adds `ceil(log4(g))` bits per coordinate to
+**both** the outlier and regular channels (Qwen2.5-7B has `g=7` → +2 bits, so
+`bits=4` is stored at an *effective* 5.25 bits/dim). This matches the in-memory path
+and is applied for you — you still pass `bits=4`; the bump happens internally and is
+reflected in the reported `avg_bits_per_dim`. Without it, a GQA model under-quantizes
+and generates gibberish, so **don't try to hand-tune around it** — just pick 3 or 4.
+
+**Runs on any device.** The staged (dequantized) cache follows the model's device, so
+offload works on CPU, MPS, or any GPU — not just CUDA. It is placed automatically from
+the model; nothing extra to configure.
+
 ```python
 from kvquant import generate
 
@@ -495,7 +521,8 @@ out = generate(
     model="Qwen/Qwen2.5-7B-Instruct",
     offload_to_disk=True,          # spill KV cache VRAM → RAM → SSD
     offload_codec="paper-outlier", # paper Section 5 (default); "paper" also valid
-    bits=3,                        # pack width for the paper codecs (2-4)
+    bits=4,                        # pack width (2-4); GQA bump raises effective bits
+    device="cuda",                 # model + staged cache device (auto if omitted)
     max_vram_tokens=512,           # token positions kept dequantized in VRAM
     warm_size=16,                  # layer entries kept in CPU RAM before disk spill
     disk_dir="D:/kv_cache",        # SSD folder for spilled cache (auto-cleaned)
@@ -508,7 +535,8 @@ print(out.text)
 |---|---|---|
 | `offload_to_disk=True` | enable the VRAM → RAM → SSD KV-cache spill | `False` |
 | `offload_codec` | `"paper-outlier"` (Section 5 outlier-aware, best fidelity) or `"paper"` (Lloyd-Max, bit-packed, smallest) | `"paper-outlier"` |
-| `bits` | pack width for the paper codec (2-4); also the in-memory KV precision | `3` |
+| `bits` | pack width for the paper codec (2-4); also the in-memory KV precision. GQA models get an automatic effective-bit bump | `3` |
+| `device` | compute + staged-cache device (`"cuda"`, `"cpu"`, `"mps"`); follows the model when omitted | auto |
 | `max_vram_tokens` | token positions kept dequantized (hot) in VRAM | `512` |
 | `warm_size` | compressed layer entries kept in CPU RAM before spilling to SSD | `16` |
 | `disk_dir` | SSD folder for spilled cache files (temp dir if unset, auto-cleaned) | `None` |
