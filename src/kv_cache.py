@@ -502,6 +502,10 @@ class KVCacheDiskOffload:
         self._ram: "OrderedDict[tuple[int, int], list]" = OrderedDict()
         # Tier 2 (cold): set of (l_idx, chunk_idx) currently on disk
         self._disk: set[tuple[int, int]] = set()
+        # Tier 0 (hot): resident dequantized float cache per layer for incremental
+        # staging: l_idx -> (k_hat, v_hat, n_chunks_included).  Each chunk is
+        # decoded once and appended; see stage_for_forward().
+        self._staged: dict[int, tuple] = {}
         self._lock = threading.Lock()
 
         # Cache of KVQuantMSE modules by (dim, bits) so the paper codec doesn't
@@ -536,12 +540,18 @@ class KVCacheDiskOffload:
         if oq is None:
             dim = calib.shape[-1]
             b = self._bits
-            n_outlier = max(4, dim // 16)          # ~8 of 128 — a few big channels
+            # Paper §5.1 experimental config, verbatim:
+            #   n_outlier    = head_dim / 4        (32 of 128)
+            #   outlier_bits = min(bits + 1, 4)
+            #   regular_bits = max(bits - 1, 1)
+            # e.g. b=2 -> "2.5-bit" (32@3 + 96@1), b=3 -> "3.5-bit" (32@4 + 96@2).
+            # clamp n_outlier to leave >=1 regular channel on odd head dims.
+            n_outlier = min(max(dim // 4, 1), dim - 1)
             oq = OutlierKVQuant(
                 dim=dim,
                 n_outlier=n_outlier,
-                outlier_bits=min(b + 2, 8),        # spend more precision on outliers
-                regular_bits=b,
+                outlier_bits=min(b + 1, 4),        # paper §5.1: cap at 4, not 8
+                regular_bits=max(b - 1, 1),        # paper §5.1: bits-1, not bits
                 seed=0,
                 quantizer_cls=KVQuantMSE,          # MSE path reconstructs faithfully
             )
@@ -616,9 +626,18 @@ class KVCacheDiskOffload:
 
     def stage_for_forward(self, past_key_values=None, layers: list[int] | None = None) -> object:
         """
-        Dequantize all stored chunks for the requested layers, concatenate them
-        along the sequence axis, and return a HuggingFace-compatible cache on the
-        current device.
+        Return a HuggingFace-compatible cache with the full dequantized K/V for the
+        requested layers on the current device.
+
+        INCREMENTAL: each frozen chunk is dequantized exactly ONCE and its float
+        result kept resident; subsequent calls only decode the newly-appended
+        chunk and concatenate it onto the resident tensor.  This turns a T-token
+        generation from O(T^2) decode work (re-inflating the whole cache every
+        step) into O(T).  Correctness is unchanged because chunks are immutable
+        (append-only), so a decoded chunk can never go stale.
+
+        Peak VRAM is unchanged: the full float cache was already materialized here
+        every step and handed to the model; we just stop rebuilding it from scratch.
 
         Args:
             past_key_values: Optional original cache used for structure reference.
@@ -635,16 +654,29 @@ class KVCacheDiskOffload:
 
         with self._lock:
             for l_idx in layers:
-                k_parts, v_parts = [], []
-                for chunk_idx in range(self._num_chunks.get(l_idx, 0)):
+                total = self._num_chunks.get(l_idx, 0)
+                cached = self._staged.get(l_idx)
+                # Resident float cache for this layer: (k_hat, v_hat, n_included).
+                if cached is None or cached[2] > total:
+                    k_hat = v_hat = None
+                    done = 0
+                else:
+                    k_hat, v_hat, done = cached
+
+                # Decode only the chunks not yet folded into the resident tensor.
+                for chunk_idx in range(done, total):
                     k_c, v_c = self._get_chunk(l_idx, chunk_idx)
-                    k_parts.append(self._dequantize_one(k_c, device=device,
-                                                        l_idx=l_idx, is_value=False))
-                    v_parts.append(self._dequantize_one(v_c, device=device,
-                                                        l_idx=l_idx, is_value=True))
-                # Concatenate chunks along the sequence dimension (dim=-2).
-                k_hat = torch.cat(k_parts, dim=-2) if len(k_parts) > 1 else k_parts[0]
-                v_hat = torch.cat(v_parts, dim=-2) if len(v_parts) > 1 else v_parts[0]
+                    k_new = self._dequantize_one(k_c, device=device,
+                                                 l_idx=l_idx, is_value=False)
+                    v_new = self._dequantize_one(v_c, device=device,
+                                                 l_idx=l_idx, is_value=True)
+                    if k_hat is None:
+                        k_hat, v_hat = k_new, v_new
+                    else:
+                        k_hat = torch.cat([k_hat, k_new], dim=-2)
+                        v_hat = torch.cat([v_hat, v_new], dim=-2)
+
+                self._staged[l_idx] = (k_hat, v_hat, total)
                 result.append((k_hat, v_hat))
 
         return self._rebuild_cache(result, past_key_values)
@@ -778,6 +810,8 @@ class KVCacheDiskOffload:
             self._ram.clear()
         if hasattr(self, "_disk"):
             self._disk.clear()
+        if hasattr(self, "_staged"):
+            self._staged.clear()
         if hasattr(self, "_outlier_q"):
             self._outlier_q.clear()
         self._disk_files.clear()

@@ -119,6 +119,68 @@ def _kmeans(
 
 
 # ---------------------------------------------------------------------------
+# Batched k-means over M subspaces at once (paper §7/§414: the M sequential
+# cdist calls were the PQ bottleneck; batching folds them into single kernels).
+# ---------------------------------------------------------------------------
+
+
+def _kmeans_plusplus_init_batched(x: Tensor, K: int) -> Tensor:
+    """k-means++ seeding for all M subspaces simultaneously.
+
+    x: (M, N, d) -> returns (M, K, d).  Same D^2-weighted scheme as the 1-subspace
+    version, but the running min-distance is maintained per subspace (no growing
+    cdist), so cost is O(K*M*N) instead of O(K^2*M*N).
+    """
+    M, N, d = x.shape
+    m_idx = torch.arange(M, device=x.device)
+    first = torch.randint(N, (M,), device=x.device)
+    centroids = torch.empty(M, K, d, device=x.device, dtype=x.dtype)
+    centroids[:, 0, :] = x[m_idx, first]
+    min_sq = ((x - centroids[:, 0:1, :]) ** 2).sum(-1)  # (M, N)
+    for c in range(1, K):
+        probs = min_sq / min_sq.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+        nxt = torch.multinomial(probs, 1).squeeze(1)  # (M,)
+        chosen = x[m_idx, nxt]  # (M, d)
+        centroids[:, c, :] = chosen
+        new_sq = ((x - chosen.unsqueeze(1)) ** 2).sum(-1)  # (M, N)
+        min_sq = torch.minimum(min_sq, new_sq)
+    return centroids
+
+
+def _kmeans_batched(x: Tensor, K: int, num_iters: int = 25, tol: float = 1e-4) -> Tensor:
+    """k-means on (M, N, d) data, all M subspaces in parallel. Returns (M, K, d).
+
+    Identical algorithm to _kmeans (k-means++ init, squared-L2 assignment, mean
+    update, empty-cluster carry-over, early stop) but every step is a single
+    batched kernel over the M leading dimension instead of an M-length Python loop.
+    """
+    M, N, d = x.shape
+    x = x.float()
+    centroids = _kmeans_plusplus_init_batched(x, K)  # (M, K, d)
+
+    prev_obj = float("inf")
+    for _ in range(num_iters):
+        sq = torch.cdist(x, centroids) ** 2                 # (M, N, K)
+        assign = sq.argmin(dim=-1)                          # (M, N)
+        obj = sq.gather(2, assign.unsqueeze(2)).mean().item()
+        if abs(prev_obj - obj) / max(prev_obj, 1e-10) < tol:
+            break
+        prev_obj = obj
+
+        new_c = torch.zeros_like(centroids)                 # (M, K, d)
+        counts = torch.zeros(M, K, device=x.device)         # (M, K)
+        new_c.scatter_add_(1, assign.unsqueeze(2).expand(-1, -1, d), x)
+        counts.scatter_add_(1, assign, torch.ones(M, N, device=x.device))
+        mask = counts > 0                                   # (M, K)
+        safe = counts.clamp(min=1.0).unsqueeze(2)
+        new_c = new_c / safe
+        new_c = torch.where(mask.unsqueeze(2), new_c, centroids)  # empty -> keep old
+        centroids = new_c
+
+    return centroids
+
+
+# ---------------------------------------------------------------------------
 # ProductQuantizer
 # ---------------------------------------------------------------------------
 
@@ -182,12 +244,11 @@ class ProductQuantizer(nn.Module):
         y = self.rotation(flat / norms)  # (N, dim)
         y_split = y.reshape(-1, self.M, self.sub_dim)  # (N, M, sub_dim)
 
-        books = []
-        for m in range(self.M):
-            sub = y_split[:, m, :].contiguous()  # (N, sub_dim)
-            books.append(_kmeans(sub, self.K))  # (K, sub_dim)
-
-        self.codebooks = torch.stack(books)  # (M, K, sub_dim)
+        # Train all M subspace codebooks in one batched k-means (paper §7/§414),
+        # instead of an M-length Python loop of separate _kmeans calls.
+        # (N, M, sub_dim) -> (M, N, sub_dim) so M is the batch dim.
+        x_batched = y_split.transpose(0, 1).contiguous()  # (M, N, sub_dim)
+        self.codebooks = _kmeans_batched(x_batched, self.K)  # (M, K, sub_dim)
 
     # ------------------------------------------------------------------
     # Encode / decode

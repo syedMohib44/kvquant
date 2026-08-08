@@ -344,8 +344,13 @@ def main():
         cal_out = model(cal_ids, use_cache=True)
     cal_kvs = kvs_from_cache(cal_out.past_key_values)
     T_cal = cal_ids.shape[1]
-    all_k = torch.cat([kv[0].reshape(-1, T_cal, head_dim) for kv in cal_kvs])
-    all_v = torch.cat([kv[1].reshape(-1, T_cal, head_dim) for kv in cal_kvs])
+    # Per-layer calibration data (paper §Per-layer calibration): keep each layer's
+    # K/V separate.  Pooling across layers averages out the layer-specific outlier
+    # channels and mis-identifies them for every individual layer.
+    per_layer_kv = [
+        (kv[0].reshape(-1, T_cal, head_dim), kv[1].reshape(-1, T_cal, head_dim))
+        for kv in cal_kvs
+    ]
 
     # -----------------------------------------------------------------------
     sep("Results")
@@ -357,15 +362,21 @@ def main():
     print(f"  {'Float32 (unquant)':<{W}} {ppl_fp32:>8.2f}  {'-':>10}")
 
     for bits in BITS_LIST:
-        kvc = KVCacheQuantizer(
-            head_dim=head_dim,
-            num_bits=bits,
-            use_outlier=True,
-            n_outlier=n_outlier,
-            outlier_bits=min(bits + 1, 4),
-            regular_bits=max(bits - 1, 1),
-        )
-        kvc.calibrate(all_k, all_v)
+        # One KVCacheQuantizer PER LAYER, each calibrated on its own layer's KV
+        # (paper §Per-layer calibration).  quantize_model_cache() accepts this
+        # list and applies the matching quantizer to each attention layer in order.
+        kvc = []
+        for lk, lv in per_layer_kv:
+            q = KVCacheQuantizer(
+                head_dim=head_dim,
+                num_bits=bits,
+                use_outlier=True,
+                n_outlier=n_outlier,
+                outlier_bits=min(bits + 1, 4),
+                regular_bits=max(bits - 1, 1),
+            )
+            q.calibrate(lk, lv)
+            kvc.append(q)
 
         # Without correction
         ppl_q = compute_ppl(
@@ -373,7 +384,7 @@ def main():
         )
         d = ppl_q - ppl_fp32
         print(
-            f"  {f'{bits}-bit  (avg {kvc.avg_bits:.2f} bpw)':<{W}} "
+            f"  {f'{bits}-bit  (avg {kvc[0].avg_bits:.2f} bpw)':<{W}} "
             f"{ppl_q:>8.2f}  {d:>+10.2f}"
         )
 

@@ -48,6 +48,17 @@ from .codebook import build_codebook
 from .rotation import RandomRotation, HadamardRotation
 
 
+def _default_use_hadamard(dim: int) -> bool:
+    """Prefer the paper's O(d log d) Hadamard rotation when dim is a power of 2.
+
+    Real KV head dims (64/128/256) are powers of 2, so this makes the fast,
+    low-memory structured transform the default there while falling back to dense
+    QR for odd dims.  The FWHT has a torch.compile-fused CUDA path, so the old
+    Python-loop performance concern that kept QR the default no longer applies.
+    """
+    return dim > 0 and (dim & (dim - 1)) == 0
+
+
 # ---------------------------------------------------------------------------
 # Compiled QJL projection  (fuses matmul + comparison into one CUDA kernel)
 # ---------------------------------------------------------------------------
@@ -146,11 +157,13 @@ class KVQuantMSE(nn.Module):
         self.dim = dim
         self.num_bits = num_bits
 
-        # Hadamard is O(d log d) vs O(d²) for QR in theory, but the FWHT uses
-        # a Python loop that loses to a single BLAS matmul on CPU for d<=256.
-        # Default stays QR; pass use_hadamard=True explicitly for GPU workloads
-        # or larger d where the structured transform pays off.
-        self.use_hadamard = False if use_hadamard is None else use_hadamard
+        # Default: structured Hadamard rotation when dim is a power of 2 (the paper's
+        # preferred O(d log d) SO(d) transform — d²->d storage, d²->d log d compute,
+        # same randomisation guarantee as QR per Ailon & Chazelle 2006).  The FWHT
+        # has a torch.compile-fused CUDA path (rotation.py), so the old "Python loop
+        # loses to BLAS" concern no longer holds on GPU.  Falls back to dense QR for
+        # non-power-of-2 dims.  Pass use_hadamard explicitly to override.
+        self.use_hadamard = _default_use_hadamard(dim) if use_hadamard is None else use_hadamard
 
         if self.use_hadamard:
             assert (
@@ -305,16 +318,22 @@ class KVQuantIP(nn.Module):
         self.num_bits = num_bits
         self.mse_bits = max(0, num_bits - 1)
 
-        self.use_hadamard = False if use_hadamard is None else use_hadamard
+        self.use_hadamard = _default_use_hadamard(dim) if use_hadamard is None else use_hadamard
 
         if self.mse_bits > 0:
             self.mse_quantizer: KVQuantMSE | None = KVQuantMSE(
-                dim, self.mse_bits, seed, use_hadamard=use_hadamard
+                dim, self.mse_bits, seed, use_hadamard=self.use_hadamard
             )
         else:
             self.mse_quantizer = None
 
-        # QJL random matrix S ~ N(0,1)^{d×d}
+        # QJL random matrix S ~ N(0,1)^{d×d}.
+        # NOTE (possible future optimization): this dense d×d Gaussian could be
+        # replaced by a structured sign-flip + FWHT (SRHT) for O(d log d) compute
+        # and O(d) storage while preserving the QJL variance bound.  Deferred
+        # deliberately: KVQuantIP is not on the generation hot path (the runtime
+        # cache uses int8 / MSE-based codecs, not the IP estimator), so the win
+        # would not affect real inference.  Revisit if IP is ever used at runtime.
         gen = torch.Generator()
         gen.manual_seed(qjl_seed)
         S = torch.randn(dim, dim, generator=gen)

@@ -276,7 +276,7 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _int8_quantize_cache(past_key_values, kvs):
+def _int8_quantize_cache(past_key_values, kvs, correction_rank: int = 0):
     """
     Compress and immediately decompress the KV cache using per-vector int8
     scalar quantization (min-max clamp + round-trip).  This gives faithful
@@ -287,13 +287,20 @@ def _int8_quantize_cache(past_key_values, kvs):
     Each KV vector (shape d) is scaled to [-127, 127] using its own min/max,
     quantized to int8, then dequantized back to float.  Round-trip error is
     at most range/254 per coordinate, which is negligible compared to FP16.
+
+    If ``correction_rank > 0``, a rank-r SVD of the quantization residual
+    (K - K_hat) is added back (paper §3.4 / §5.3 low-rank error correction),
+    recovering structure the scalar codebook misses.  Per the paper this is only
+    worthwhile below 4-bit; the caller gates on that.
     """
     import copy
+    from .kv_cache import _low_rank_correct
 
     cache_q = copy.deepcopy(past_key_values)
+    r = correction_rank
 
     def _q8(t: torch.Tensor) -> torch.Tensor:
-        """Per-vector (last dim) uint8 round-trip (stored as float, no dtype cast)."""
+        """Per-vector (last dim) uint8 round-trip, optional low-rank residual fix."""
         dt = t.dtype
         t_f = t.float()
         mn = t_f.min(dim=-1, keepdim=True).values
@@ -302,7 +309,11 @@ def _int8_quantize_cache(past_key_values, kvs):
         # Quantise to integer levels [0..255] then dequantise — stay in float32
         # so torch.int8 overflow cannot corrupt values.
         q = ((t_f - mn) / scale).round().clamp(0, 255)
-        return (q * scale + mn).to(dt)
+        t_hat = q * scale + mn
+        if r > 0:
+            # Add back a rank-r approximation of the residual (t_f - t_hat).
+            t_hat = _low_rank_correct(t_f, t_hat, r)
+        return t_hat.to(dt)
 
     if hasattr(cache_q, "layers"):
         for layer in cache_q.layers:
@@ -373,10 +384,13 @@ def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank, prefill_c
     native_cache = _chunked_prefill(mdl, ids, prefill_chunk_size)
     kvs = kvs_from_cache(native_cache)
 
-    # Per-layer calibration: compute avg_bits for the compression ratio stat
-    kvc_layers: list[KVCacheQuantizer] = []
-    for lk, lv in kvs:
-        kvc = KVCacheQuantizer(
+    # avg_bits is a closed-form property of the chosen bit budget — it needs NO
+    # calibration and NO per-layer sub-quantizer construction.  Build a single
+    # un-calibrated KVCacheQuantizer just to read the analytic value (the actual
+    # cache is int8, below).  This avoids ~n_layers QR rotations + Lloyd-Max +
+    # variance scans over the whole prefill on every generate() call.
+    if kvs:
+        avg_bits = KVCacheQuantizer(
             head_dim=head_dim,
             num_bits=bits,
             use_outlier=True,
@@ -384,14 +398,16 @@ def _build_quantized_cache(mdl, tok, input_ids, bits, correction_rank, prefill_c
             outlier_bits=min(bits + 1, 8),
             regular_bits=max(bits - 1, 1),
             gqa_factor=gqa,
-        )
-        kvc.calibrate(lk, lv)
-        kvc_layers.append(kvc)
+        ).avg_bits
+    else:
+        avg_bits = float(bits)
 
-    avg_bits = kvc_layers[0].avg_bits if kvc_layers else float(bits)
-
-    # Quantize cache with int8 scalar quantization (faithful pointwise reconstruction)
-    past = _int8_quantize_cache(native_cache, kvs)
+    # Quantize cache with int8 scalar quantization (faithful pointwise reconstruction).
+    # Low-rank residual correction (paper §3.4/§5.3) only helps below 4-bit — at
+    # 4-bit the residual is small enough that a rank-r SVD fits numerical noise
+    # (paper §5.3), so gate it off there.
+    eff_rank = correction_rank if (correction_rank > 0 and bits < 4) else 0
+    past = _int8_quantize_cache(native_cache, kvs, correction_rank=eff_rank)
     return past, avg_bits, T_p, ids
 
 
@@ -643,14 +659,18 @@ def generate(
     generated = [_sample_next(first_logits, temperature, top_p)]
     seen_ids  = ids[0].tolist()
 
-    for _ in range(max_new_tokens - 1):
+    for step_i in range(max_new_tokens - 1):
         if offload is not None:
             past_step = offload.stage_for_forward()
             with torch.no_grad():
                 step = mdl(generated[-1], past_key_values=past_step, use_cache=True)
             offload.replace(step.past_key_values)
             del past_step
-            _gpu_gc()
+            # empty_cache()/gc.collect() are expensive (CUDA sync + heap walk);
+            # calling them every token dominates step time.  Throttle to every
+            # 32 tokens — the append-only offload already frees floats via `del`.
+            if step_i % 32 == 31:
+                _gpu_gc()
         else:
             with torch.no_grad():
                 step = mdl(generated[-1], past_key_values=past, use_cache=True)
@@ -659,9 +679,10 @@ def generate(
         logits = _suppress(logits, suppress_ids)
         logits = _apply_repetition_penalty(logits, seen_ids, repetition_penalty)
         next_tok = _sample_next(logits, temperature, top_p)
-        seen_ids.append(next_tok.item())
+        tok_id = next_tok.item()          # one D2H sync, reused below
+        seen_ids.append(tok_id)
         generated.append(next_tok)
-        if next_tok.item() == tok.eos_token_id:
+        if tok_id == tok.eos_token_id:
             break
 
     if offload is not None:
