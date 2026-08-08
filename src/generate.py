@@ -377,7 +377,7 @@ def _build_quantized_cache(
 
 
 def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-outlier",
-                   bits=3, device=None):
+                   bits=3, device=None, gqa_factor=1):
     """
     Build a KVCacheDiskOffload for tiered VRAM->RAM->SSD storage of the KV cache.
 
@@ -391,6 +391,10 @@ def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-ou
     `device` is the model's device — staged (dequantized) tensors are placed there
     so offload works on CPU / MPS / any GPU, not just CUDA.
 
+    `gqa_factor` (n_heads / n_kv_heads) bumps the codec's effective bit-width to
+    offset GQA error amplification — without it a grouped-query model (Qwen2.5-7B,
+    g=7) under-quantizes and generates gibberish.
+
     Returns a manager that has NOT yet stored anything (caller decides when).
     """
     return KVCacheDiskOffload(
@@ -400,6 +404,7 @@ def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-ou
         codec=offload_codec,
         bits=bits,
         device=device,
+        gqa_factor=gqa_factor,
     )
 
 
@@ -602,8 +607,9 @@ def generate(
         # Tiered VRAM->RAM->SSD storage of the KV cache.  Store the CROPPED cache,
         # then stage it back for the first-token forward — identical positions to
         # the in-memory path, just spilled to disk between steps.
+        _nh, _nkv, _ = _model_dims(mdl)
         offload = _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec, bits,
-                                 device=_model_device(mdl))
+                                 device=_model_device(mdl), gqa_factor=_nh // _nkv)
         del past
         offload.store(past_crop)
         del past_crop
@@ -743,8 +749,9 @@ def stream(
 
     offload = None
     if offload_to_disk:
+        _nh, _nkv, _ = _model_dims(mdl)
         offload = _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec, bits,
-                                 device=_model_device(mdl))
+                                 device=_model_device(mdl), gqa_factor=_nh // _nkv)
         del past
         offload.store(past_crop)
         del past_crop

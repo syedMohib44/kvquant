@@ -699,6 +699,29 @@ class TestKVCacheDiskOffload:
         finally:
             off.close()
 
+    def test_gqa_bumps_effective_bits(self):
+        """GQA models must store more effective bits than MHA to offset error
+        amplification (each KV head shared by g query heads).  Without this bump
+        a grouped-query model (Qwen2.5-7B, g=7) under-quantizes -> gibberish."""
+        cache = _fake_cache(n_layers=1, T=16)
+
+        def stored_avg_bits(g):
+            off = KVCacheDiskOffload(codec="paper-outlier", bits=4, gqa_factor=g,
+                                     warm_size=8)
+            try:
+                off.store(cache)
+                return off._outlier_q[(0, False)].avg_bits, off._gqa_extra
+            finally:
+                off.close()
+
+        mha_bits, mha_extra = stored_avg_bits(1)    # no amplification
+        gqa_bits, gqa_extra = stored_avg_bits(7)    # Qwen2.5-7B style
+        assert mha_extra == 0
+        assert gqa_extra == 2, f"expected ceil(log4(7))=2, got {gqa_extra}"
+        assert gqa_bits > mha_bits + 1.5, (
+            f"GQA avg bits ({gqa_bits}) should exceed MHA ({mha_bits}) by the bump"
+        )
+
     def test_append_only_no_requantize_drift(self):
         """
         The bug this fixes: re-store()-ing a growing cache must NOT re-quantize

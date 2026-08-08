@@ -427,6 +427,7 @@ class KVCacheDiskOffload:
         codec: str = "paper",
         bits: int = 3,
         device: "str | torch.device | None" = None,
+        gqa_factor: int = 1,
     ):
         # Codecs (both are the paper's method — no non-paper fallback):
         #   "paper"         plain rotate + Lloyd-Max, bit-packed (parameter-free)
@@ -438,6 +439,7 @@ class KVCacheDiskOffload:
             )
         self._codec = codec
         self._bits = bits
+        self._gqa_factor = max(int(gqa_factor), 1)
         self._max_vram_tokens = max_vram_tokens
         self._warm_size = warm_size
         # Target device for staged (dequantized) tensors.  Defaults to CUDA when
@@ -492,6 +494,25 @@ class KVCacheDiskOffload:
         if cleanup_on_del:
             weakref.finalize(self, self._cleanup)
 
+    @property
+    def _gqa_extra(self) -> int:
+        """Extra bits/coordinate to offset GQA error amplification.
+
+        Each KV head is shared by g = n_heads / n_kv_heads query heads, so the
+        attention-weighted distortion is ~g x the per-vector MSE.  To hold quality
+        constant: g * 4^{-b_eff} = 4^{-b_req} -> b_eff = b_req + log4(g).  This is
+        the SAME compensation KVCacheQuantizer applies in-memory (see its __init__);
+        the offload codec must match it or a GQA model (e.g. Qwen2.5-7B, g=7)
+        stores far too few effective bits and generates gibberish.
+        """
+        g = self._gqa_factor
+        return math.ceil(math.log(g, 4)) if g > 1 else 0
+
+    @property
+    def _effective_bits(self) -> int:
+        """Plain-codec pack width after GQA compensation (capped at 8-bit)."""
+        return min(self._bits + self._gqa_extra, 8)
+
     def _get_mse(self, dim: int, num_bits: int) -> KVQuantMSE:
         """Return a cached KVQuantMSE for (dim, num_bits) — seed fixed for determinism."""
         key = (dim, num_bits)
@@ -513,18 +534,26 @@ class KVCacheDiskOffload:
         if oq is None:
             dim = calib.shape[-1]
             b = self._bits
-            # Paper §5.1 experimental config, verbatim:
+            # Paper §5.1 experimental config:
             #   n_outlier    = head_dim / 4        (32 of 128)
             #   outlier_bits = min(bits + 1, 4)
             #   regular_bits = max(bits - 1, 1)
             # e.g. b=2 -> "2.5-bit" (32@3 + 96@1), b=3 -> "3.5-bit" (32@4 + 96@2).
+            # GQA compensation: bump BOTH groups by gqa_extra so a grouped-query
+            # model (Qwen2.5-7B, g=7 -> +2) stores enough effective bits.  The base
+            # config is capped at min(b+1,4)/max(b-1,1) FIRST, then gqa_extra is
+            # added (capped at 8-bit) — the exact same order KVCacheQuantizer uses
+            # in-memory, so the reported avg_bits matches what is actually stored.
+            ge = self._gqa_extra
+            ob = min(min(b + 1, 4) + ge, 8)
+            rb = min(max(max(b - 1, 1) + ge, 1), 8)
             # clamp n_outlier to leave >=1 regular channel on odd head dims.
             n_outlier = min(max(dim // 4, 1), dim - 1)
             oq = OutlierKVQuant(
                 dim=dim,
                 n_outlier=n_outlier,
-                outlier_bits=min(b + 1, 4),        # paper §5.1: cap at 4, not 8
-                regular_bits=max(b - 1, 1),        # paper §5.1: bits-1, not bits
+                outlier_bits=ob,
+                regular_bits=rb,
                 seed=0,
                 quantizer_cls=KVQuantMSE,          # MSE path reconstructs faithfully
             )
@@ -536,7 +565,9 @@ class KVCacheDiskOffload:
         """Compress one K or V tensor with the selected codec (on CPU)."""
         t = t.cpu() if t.is_cuda else t
         if self._codec == "paper":
-            return _paper_compress(t, self._bits, self._get_mse)
+            # GQA-compensated pack width (see _effective_bits) so grouped-query
+            # models don't under-quantize.
+            return _paper_compress(t, self._effective_bits, self._get_mse)
         if self._codec == "paper-outlier":
             oq = self._get_outlier_q(l_idx, is_value, t)
             return _paper_outlier_compress(t, oq)
