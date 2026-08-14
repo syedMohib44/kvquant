@@ -35,10 +35,6 @@ from collections import defaultdict
 from .quantizer import KVQuantMSE, QuantizedMSE
 
 
-# Bit-width tiers
-_TIERS = [4, 3, 2, 1]  # hi -> lo
-
-
 class _CacheEntry(NamedTuple):
     q: QuantizedMSE  # compressed KV
     bits: int  # current bit-width

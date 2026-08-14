@@ -508,8 +508,21 @@ print(out.text)
 `weights=` moves the **model**; `offload_to_disk=` moves the **KV cache**. Use this
 when the model itself fits but the *cache* is what overflows a very long context
 whose per-token K/V no longer fits in VRAM. The cache is spilled across three tiers
-**VRAM → CPU RAM → SSD**, so only the layers needed for the next forward pass stay
-resident.
+**VRAM → CPU RAM → SSD**.
+
+Decoded floats are kept between calls on purpose — that is what makes the
+incremental decode O(T) rather than O(T²) — and `max_vram_tokens` bounds how many
+token positions stay resident, evicting least-recently-staged layers past the
+budget. Eviction is lossless: it drops decoded floats only, never codes, so a
+re-staged layer decodes bit-identical. Layers the current forward pass is about to
+read are exempt, so a budget below one pass's worth bounds nothing; check
+`memory_summary()["vram_tokens"]` for what is actually resident.
+
+**This path is for when the cache does not fit in RAM at all.** It does not
+reduce peak VRAM within a forward pass — the model still receives full float
+tensors. For real VRAM savings, use the default in-memory compact cache
+(`compact_cache=True`), which never materialises them: measured 265 MiB vs
+1225 MiB on a ~300-token prompt.
 
 Two codecs are available via `offload_codec` — both are the paper's method:
 
@@ -578,7 +591,7 @@ print(out.text)
 | `offload_codec` | `"paper-outlier"` (outlier-aware, best fidelity) or `"paper"` (Lloyd-Max, bit-packed, smallest) | `"paper-outlier"` |
 | `bits` | pack width for the paper codec (2-4); also the in-memory KV precision. GQA models get an automatic effective-bit bump | `3` |
 | `device` | compute + staged-cache device (`"cuda"`, `"cpu"`, `"mps"`); follows the model when omitted | auto |
-| `max_vram_tokens` | token positions kept dequantized (hot) in VRAM | `512` |
+| `max_vram_tokens` | token positions kept dequantized between forward passes; excess layers are evicted least-recently-staged first (lossless — codes are untouched). `0` = unbounded | `512` |
 | `warm_size` | compressed layer entries kept in CPU RAM before spilling to SSD | `16` |
 | `disk_dir` | SSD folder for spilled cache files (temp dir if unset, auto-cleaned) | `None` |
 

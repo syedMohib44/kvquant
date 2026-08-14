@@ -23,6 +23,7 @@ production system would add entropy coding on top.
 from __future__ import annotations
 
 import copy
+import itertools
 import math
 import shutil as _shutil
 import tempfile
@@ -410,15 +411,6 @@ def _paper_outlier_dequantize(q: _PaperOutlierKV, oq: "OutlierKVQuant", device=N
     return out if device is None else out.to(device)
 
 
-class _DiskEntry(NamedTuple):
-    """One token-position's K/V data persisted to disk."""
-    k_path: str
-    v_path: str
-    shape: tuple
-    dtype: str
-    layer_idx: int
-
-
 class KVCacheDiskOffload:
     """
     Memory-efficient KV cache manager that keeps quantized cache across three tiers:
@@ -427,8 +419,20 @@ class KVCacheDiskOffload:
         Tier 1 (warm):  CPU-RAM – quantized representations as Python / numpy objects
         Tier 2 (cold):  Disk – numpy memmap files (.npy) for very long contexts
 
-    Only the layers needed for the next forward pass are staged to VRAM; all
-    other layers remain in Tier 1 or Tier 2 until their layer is accessed again.
+    Tier 0 residency is bounded by ``max_vram_tokens``.  Decoded floats are kept
+    between calls on purpose — that is what makes the incremental decode O(T)
+    rather than O(T^2) — and are evicted least-recently-staged first once the
+    resident token count exceeds the budget.  Eviction is lossless: it discards
+    only decoded floats, never codes, so a re-staged layer decodes bit-identical.
+
+    Note this bounds *resident* floats, not peak.  A forward pass still asks for
+    every layer it is about to read, so the peak within one pass is set by the
+    model, not by this budget.  ``memory_summary()`` reports the true resident
+    figures (``vram_layers``, ``vram_tokens``, ``vram_float_bytes``) so the
+    distinction is measurable rather than a matter of trust.  For a cache that
+    genuinely never materializes the full float tensors, see
+    ``compact_cache.CompactKVCache``, which is what ``generate()`` uses by
+    default.
 
     Reconstruction fidelity
     ------------------------
@@ -451,8 +455,11 @@ class KVCacheDiskOffload:
         offload.replace(out.past_key_values)  # freeze new token(s), offload again
 
     Args:
-        max_vram_tokens: Max number of token positions to keep dequantized in VRAM
-                         simultaneously (0 = unlimited, but you'll OOM).
+        max_vram_tokens: Max token positions kept dequantized in VRAM between
+                         forward passes (0 = unlimited, but you'll OOM).  Layers
+                         staged by the current pass are exempt, so a budget below
+                         one pass's worth bounds nothing; check
+                         ``memory_summary()["vram_tokens"]`` if in doubt.
         disk_dir:        Directory for spill files (auto-cleaned on close).
         warm_size:       Max number of full-layer entries to keep in CPU
                          RAM before spilling to disk (0 = unlimited).
@@ -528,6 +535,12 @@ class KVCacheDiskOffload:
         # staging: l_idx -> (k_hat, v_hat, n_chunks_included).  Each chunk is
         # decoded once and appended; see stage_for_forward().
         self._staged: dict[int, tuple] = {}
+        # Least-recently-staged eviction order for _staged, bounded by
+        # max_vram_tokens.  A monotonic counter rather than a wall clock: two
+        # stagings inside one forward pass can land in the same clock tick, and
+        # ties would make eviction order depend on dict iteration.
+        self._stage_order: dict[int, int] = {}
+        self._stage_clock = itertools.count()
         self._lock = threading.Lock()
 
         # Cache of KVQuantMSE modules by (dim, bits) so the paper codec doesn't
@@ -712,8 +725,21 @@ class KVCacheDiskOffload:
         step) into O(T).  Correctness is unchanged because chunks are immutable
         (append-only), so a decoded chunk can never go stale.
 
-        Peak VRAM is unchanged: the full float cache was already materialized here
-        every step and handed to the model; we just stop rebuilding it from scratch.
+        Residency is bounded by ``max_vram_tokens``.  Keeping every layer's float
+        cache resident is what makes the incremental path fast, but on a long
+        context it is also the largest single VRAM consumer here — and it used to
+        be unbounded, which is why the constructor argument existed while nothing
+        read it.  After each call, layers are evicted least-recently-staged first
+        until the resident token-position count fits the budget.  Eviction drops
+        only decoded floats; the codes are untouched, so a re-staged layer decodes
+        to bit-identical values (``test_eviction_is_bit_identical``).  The cost is
+        recomputation, not fidelity.
+
+        The layers staged by *this* call are never evicted by it, even if they
+        alone exceed the budget: they are about to be read by the caller.  A
+        budget smaller than one forward pass therefore bounds nothing, and
+        ``memory_summary()`` reports what is actually resident so that case is
+        visible rather than silent.
 
         Args:
             past_key_values: Optional original cache used for structure reference.
@@ -753,9 +779,58 @@ class KVCacheDiskOffload:
                         v_hat = torch.cat([v_hat, v_new], dim=-2)
 
                 self._staged[l_idx] = (k_hat, v_hat, total)
+                self._stage_order[l_idx] = next(self._stage_clock)
                 result.append((k_hat, v_hat))
 
+            self._evict_staged(keep=set(layers))
+
         return self._rebuild_cache(result, past_key_values)
+
+    # ------------------------------------------------------------------
+
+    def _staged_tokens(self, entry: tuple) -> int:
+        """Token positions held by one ``_staged`` entry, 0 if it holds nothing."""
+        k_hat = entry[0]
+        return 0 if k_hat is None else int(k_hat.shape[-2])
+
+    def vram_float_bytes(self) -> int:
+        """Bytes of dequantized float K/V currently resident on the device."""
+        total = 0
+        for k_hat, v_hat, _ in self._staged.values():
+            for t in (k_hat, v_hat):
+                if t is not None:
+                    total += t.numel() * t.element_size()
+        return total
+
+    def _evict_staged(self, keep: set[int]) -> None:
+        """
+        Drop resident float caches, least-recently-staged first, until the total
+        resident token-position count fits ``max_vram_tokens``.
+
+        Called with the lock held.  ``keep`` is the set of layers the current
+        forward pass is about to read; evicting one of those would hand the model
+        a tensor it needs and immediately free it.  A budget of 0 disables the
+        bound entirely (the documented "unlimited, but you'll OOM" setting).
+        """
+        budget = self._max_vram_tokens
+        if budget <= 0:
+            return
+
+        resident = sum(self._staged_tokens(e) for e in self._staged.values())
+        if resident <= budget:
+            return
+
+        # Least-recently-staged first; `keep` layers are not candidates.
+        candidates = sorted(
+            (l for l in self._staged if l not in keep),
+            key=lambda l: self._stage_order.get(l, 0),
+        )
+        for l_idx in candidates:
+            if resident <= budget:
+                break
+            resident -= self._staged_tokens(self._staged[l_idx])
+            del self._staged[l_idx]
+            self._stage_order.pop(l_idx, None)
 
     def replace(self, past_key_values) -> None:
         """
@@ -857,6 +932,13 @@ class KVCacheDiskOffload:
         Counts are per-layer (chunks collapsed to layers) so the numbers stay
         comparable to the pre-chunk API: 'warm_layers' = layers with >=1 chunk in
         RAM, 'disk_layers' = layers with all chunks spilled to disk.
+
+        'vram_layers' and 'vram_float_bytes' report what ``stage_for_forward``
+        is actually holding dequantized right now.  This used to be hard-coded
+        to 0 with a comment claiming "nothing is held dequantized between
+        calls", which was false: staged floats persist between calls by design,
+        and that is the whole point of the incremental decode.  Reporting it
+        honestly is what makes ``max_vram_tokens`` verifiable.
         """
         with self._lock:
             warm_layers = {k[0] for k in self._ram}
@@ -864,7 +946,12 @@ class KVCacheDiskOffload:
             # A layer counts as "disk" only if none of its chunks are in RAM.
             disk_only = disk_layers - warm_layers
             return {
-                "vram_layers": 0,   # nothing is held dequantized between calls
+                "vram_layers": len(self._staged),
+                "vram_tokens": sum(
+                    self._staged_tokens(e) for e in self._staged.values()
+                ),
+                "vram_float_bytes": self.vram_float_bytes(),
+                "max_vram_tokens": self._max_vram_tokens,
                 "warm_layers": len(warm_layers),
                 "disk_layers": len(disk_only),
                 "ram_chunks": len(self._ram),
@@ -889,6 +976,8 @@ class KVCacheDiskOffload:
             self._disk.clear()
         if hasattr(self, "_staged"):
             self._staged.clear()
+        if hasattr(self, "_stage_order"):
+            self._stage_order.clear()
         if hasattr(self, "_outlier_q"):
             self._outlier_q.clear()
         self._disk_files.clear()

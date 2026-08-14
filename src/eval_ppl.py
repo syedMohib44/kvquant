@@ -256,6 +256,18 @@ def compute_ppl(
         # Score target tokens against the (possibly quantized) cache.
         # prefill.logits[:, -1, :] predicts tgt[:, 0]  (first generated token).
         # out.logits[:, i, :]      predicts tgt[:, i+1] so we shift by -1.
+        #
+        # use_cache=False here means "don't return the grown cache", NOT
+        # "ignore it": the prefill context must still be attended to, or every
+        # score below is computed against a truncated context and the reported
+        # PPL is silently wrong — with quantization taking the blame.  That is a
+        # transformers contract we do not control, so
+        # test_use_cache_false_still_attends_to_past pins it.
+        #
+        # It also does NOT stop `cache` from being mutated in place: this call
+        # grows it to ctx+tgt.  Harmless only because the prefill above is inside
+        # the loop, so each chunk gets a fresh cache.  Do not hoist it out — see
+        # test_use_cache_false_still_mutates_the_cache_in_place.
         with torch.no_grad():
             out = model(tgt, past_key_values=cache, use_cache=False)
 

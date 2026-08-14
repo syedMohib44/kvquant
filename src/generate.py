@@ -914,8 +914,12 @@ def generate(
         _gpu_gc()
     else:
         # In-memory path: keep the updated cache (use_cache=True) for the loop.
-        # Older transformers honoured past_key_values with use_cache=False;
-        # transformers 5.x ignores it, so we always use use_cache=True here.
+        # This loop needs the returned cache to append to, so use_cache=True is
+        # required here regardless of how any version treats use_cache=False.
+        # (Verified on transformers 4.57.6: past_key_values IS still attended to
+        # with use_cache=False — eval_ppl.py relies on that, and
+        # test_use_cache_false_still_attends_to_past pins it so an upgrade that
+        # changes the behaviour fails loudly instead of silently scoring garbage.)
         with torch.no_grad():
             first_out = mdl(ids[:, -1:], past_key_values=past_crop, use_cache=True)
         first_logits = first_out.logits[:, -1, :]
