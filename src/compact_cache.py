@@ -98,6 +98,26 @@ def _make_outlier_quantizer(
     cap-then-bump order: ``outlier_bits`` is capped at 4 *first*, then the GQA
     allowance is added.  Doing it the other way round reports a bit-width that
     differs from what is actually stored.
+
+    On the cap order specifically
+    -----------------------------
+    Cap-then-bump makes ``bits=3`` and ``bits=4`` share an outlier width: both
+    cap to 4, then bump to 4+ge.  Only ``regular_bits`` separates them.  That
+    reads like a saturation bug, and bump-then-cap is the obvious "fix", so it is
+    worth recording why it was measured and rejected.
+
+    Measured on Qwen2.5-0.5B (d=64, g=7, ge=2), 24 layers of real prefill KV,
+    relative reconstruction error against payload bytes:
+
+        b=4 cap-then-bump   ob=6 rb=5   avg 5.25   1032192 B   0.001370
+        b=4 bump-then-cap   ob=7 rb=5   avg 5.50   1081344 B   0.001150
+
+    Bump-then-cap is better, but only by spending 4.8% more bytes for 16% less
+    error — it is not a free win, it is a different point on the same curve, and
+    a 5-bit-wide sweep at fixed byte budget shows both sit on it.  Changing the
+    order would shift every stored bit-width and invalidate the measured figures
+    in PAPER.md and the README for no clear gain.  Someone who wants more
+    fidelity should raise ``bits``, which is the knob that exists for it.
     """
     gqa_extra = math.ceil(math.log(gqa_factor, 4)) if gqa_factor > 1 else 0
     outlier_bits = min(min(bits + 1, 4) + gqa_extra, 8)

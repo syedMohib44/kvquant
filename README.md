@@ -872,6 +872,15 @@ pool is sticky and would mask the win); and float and compact runs happen
 allocator state. A self-test allocates a known 64 MiB and asserts the harness
 reports it within 10% — a broken ruler otherwise "proves" whatever you like.
 
+**Warm the codec before measuring.** The first compact-cache forward on a device
+costs roughly 9 MB more than every later one: Lloyd-Max codebooks are solved and
+cached per `(dim, num_bits)` in a process-global dict, rotation buffers migrate to
+the device, and cuBLAS picks its workspace. Attribute that to the cache and the
+compact path can read as *worse* than float — measuring `bits ∈ {2,3,4}` in one
+process without warming reported 1225 MiB for whichever ran first and 265 MiB for
+the rest, which looks exactly like a bit-width regression and is not one. The
+session-scoped `warm_cuda_codec` fixture in `tests/conftest.py` pays this once.
+
 **Quality** is judged on logits and perplexity, never on generated text.
 Sampling makes text a bad instrument: with `repetition_penalty=1.3`, a ~4e-4
 cosine difference in reconstruction flips one greedy argmax and the whole

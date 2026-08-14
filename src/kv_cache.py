@@ -627,7 +627,14 @@ class KVCacheDiskOffload:
                 seed=0,
                 quantizer_cls=KVQuantMSE,          # MSE path reconstructs faithfully
             )
-            oq.calibrate(calib.float().cpu())
+            # Calibrate on the tensor's own device, NOT on CPU.  OutlierKVQuant
+            # builds its sub-quantizers with .to(x.device), so calibrating on CPU
+            # pins their rotation buffers there permanently — and every later
+            # quantize of a GPU tensor then pays a D2H->H2D round trip for the
+            # rotation matrix, on every call.  This is the disk-offload tier, so
+            # `calib` is usually already on CPU and this is a no-op; it matters
+            # when a caller compresses in place on the GPU (target_device=None).
+            oq.calibrate(calib.float())
             self._outlier_q[key] = oq
         return oq
 

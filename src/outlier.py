@@ -75,7 +75,36 @@ class OutlierKVQuant(nn.Module):
                         (MSE optimal).  Use KVQuantIP for K tensors and KVQuantMSE
                         for V tensors to match each tensor's role in attention.
         use_hadamard:   Use structured Hadamard rotation instead of dense QR.
-                        Requires dim to be a power of 2.  Faster for large d.
+                        Requires BOTH sub-dimensions to be powers of 2, which
+                        the outlier split almost never gives — see below.
+                        Defaults to False, deliberately.
+
+    Why ``use_hadamard`` defaults to False here
+    -------------------------------------------
+    ``KVQuantMSE`` takes ``use_hadamard: bool | None = None`` and auto-selects
+    Hadamard when its dim is a power of 2.  This class takes a plain ``False``
+    instead, so that auto-detection is bypassed for both sub-quantizers.  That
+    looks like an oversight and is not.
+
+    Splitting a power-of-2 head_dim at ``dim//4`` leaves a regular group of
+    ``3*dim/4``, which is never a power of 2:
+
+        head_dim  64 -> outlier 16 (ok), regular  48 (not a power of 2)
+        head_dim 128 -> outlier 32 (ok), regular  96 (not a power of 2)
+        head_dim 256 -> outlier 64 (ok), regular 192 (not a power of 2)
+
+    ``KVQuantMSE`` asserts on a non-power-of-2 dim when Hadamard is requested,
+    so passing ``use_hadamard=True`` here raises for every real head dim.
+    Letting each sub-quantizer auto-detect would be worse than that: the outlier
+    group would silently use Hadamard while the regular group used QR, giving
+    two different rotation families inside one codec for no stated reason.
+
+    Dense QR is the correct choice here and costs no fidelity — it is
+    Haar-uniform, which is the only property the paper's analysis uses.  It is
+    slower (O(d^2) instead of O(d log d)) and stores a d x d matrix, but at
+    sub-dims of 16 and 48 that is negligible.  Recovering the fast transform
+    would require padding the regular group to the next power of 2, which is a
+    real change with its own trade-offs, not a default flip.
     """
 
     def __init__(
