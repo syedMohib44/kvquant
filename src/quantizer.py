@@ -16,14 +16,21 @@ Normalisation note
 ------------------
 TurboQuant is designed for vectors on the unit sphere S^{d-1}.  After a random
 rotation, a coordinate's exact marginal is the sphere marginal
-f(t) = C_d (1 - t^2)^{(d-3)/2}, which only converges to N(0, 1/d) for large d
-(paper §2.2.1).  The Lloyd-Max codebook is therefore fitted directly to that
-sphere marginal (see codebook.py::_sample_sphere_coord), so the centroids come
-out already at sphere scale (e.g. +-0.187/+-0.056 at b=2, d=64, vs 1/sqrt(64)
-= 0.125) and NO 1/sqrt(d) rescaling is applied at quantize time.
+f(t) = C_d (1 - t^2)^{(d-3)/2} (paper Lemma 1), which only converges to
+N(0, 1/d) for large d.  The Lloyd-Max codebook is therefore fitted directly to
+that sphere marginal (see codebook.py::_sample_sphere_coord), so the centroids
+come out already at sphere scale (e.g. +-0.187/+-0.056 at b=2, d=64, vs
+1/sqrt(64) = 0.125) and NO 1/sqrt(d) rescaling is applied at quantize time.
 
 For general (non-unit) vectors we first save the per-vector norm, project
-onto S^{d-1}, quantize, then restore the norm at dequantize time.
+onto S^{d-1}, quantize, then restore the norm at dequantize time.  The paper
+sanctions this (§1.3: "we can compute and store the L2 norms in floating-point
+precision and rescale the dequantized points using these stored norms") but
+never counts those norms in a bit-width figure — its quoted bits/coordinate are
+payload-only.  KV vectors are never unit-norm, so the cost is always paid.  We
+count it: see ``cache_bytes.py``, which reports norms as ``sidecar_bytes``
+separately from ``code_bytes``, and note that it is why our measured
+compression ratios come out well below the nominal 16/bits.
 
 Quantized representation
 ------------------------
@@ -137,7 +144,7 @@ class QuantizedIP(NamedTuple):
 
 class KVQuantMSE(nn.Module):
     """
-    MSE-optimal KVQuant (Section 3 of the paper).
+    MSE-optimal KVQuant (paper §3.1, Algorithm 1, Theorem 1).
 
     Vectors are projected onto the unit sphere before quantization and the
     original norm is stored separately.
@@ -292,7 +299,7 @@ class KVQuantMSE(nn.Module):
 
 class KVQuantIP(nn.Module):
     """
-    Inner-product-optimal KVQuant (Section 4 of the paper).
+    Inner-product-optimal KVQuant (paper §3.2, Algorithm 2, Theorem 2).
 
     Uses (b-1) bits for MSE quantization of the normalised vector, then
     1-bit QJL on the residual, giving an unbiased estimator of inner products.

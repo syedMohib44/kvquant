@@ -58,7 +58,14 @@ class RandomRotation(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Structured Hadamard rotation  (paper Section 3, practical variant)
+# Structured Hadamard rotation  (our optimisation; not in the paper)
+#
+# The paper only ever says "a random rotation matrix Pi in R^{d x d}" (§3.1,
+# Algorithm 1 line 2) and never discusses structured or fast transforms.  The
+# single property its analysis uses is that Pi @ x is uniform on S^{d-1}, which
+# a randomised Walsh-Hadamard transform also gives (Ailon & Chazelle 2006) at
+# O(d log d) compute and O(d) storage instead of O(d^2) for both.  Substituting
+# it is therefore sound but is our engineering choice, not a paper prescription.
 # ---------------------------------------------------------------------------
 
 
@@ -81,7 +88,11 @@ class HadamardRotation(nn.Module):
 
     SO(d) guarantee
     ---------------
-    Paper §2.2.2 requires a proper rotation (det = +1), not a reflection.  For
+    This codebase requires a proper rotation (det = +1), not a reflection.  The
+    paper does not: it says only "a random rotation matrix Pi" and never
+    discusses the determinant, and its uniform-on-the-sphere argument holds for
+    reflections too.  We pin det = +1 so the QR and Hadamard backends are
+    interchangeable under one definition of "rotation".  For
     this construction det(H_d/sqrt(d) . D) = det(H_d/sqrt(d)) * prod(D_ii), and
     det(H_d/sqrt(d)) is +1 for every d >= 4 (it is -1 only at d=2).  A random
     sign vector therefore yields a reflection whenever prod(D_ii) disagrees with
@@ -106,9 +117,15 @@ class HadamardRotation(nn.Module):
         gen.manual_seed(seed)
         # Random (+/-)1 diagonal signs
         signs = (torch.randint(0, 2, (dim,), generator=gen) * 2 - 1).float()
-        # Enforce det = +1 so the transform is a proper rotation in SO(d)
-        # (paper §2.2.2) rather than a reflection.  det(H_d/sqrt(d)) = -1 at d=2
-        # and +1 for d >= 4; multiply by prod(signs) to get the total.
+        # Enforce det = +1 so the transform is a proper rotation in SO(d) rather
+        # than a reflection.  det(H_d/sqrt(d)) = -1 at d=2 and +1 for d >= 4;
+        # multiply by prod(signs) to get the total.
+        #
+        # The paper does not require this — it never discusses the determinant,
+        # and its uniform-on-the-sphere argument holds for any Haar-random
+        # orthogonal matrix, reflections included.  We pin det = +1 anyway so
+        # "rotation" in this codebase means SO(d) consistently across the QR and
+        # Hadamard backends, which keeps the two interchangeable in tests.
         h_det = -1.0 if dim == 2 else 1.0
         if h_det * float(signs.prod()) < 0:
             signs[0] = -signs[0]

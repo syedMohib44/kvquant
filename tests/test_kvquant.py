@@ -117,14 +117,18 @@ class TestRotation:
         assert not torch.allclose(r1.Pi, r2.Pi)
 
     def test_qr_rotation_is_proper_so_d(self):
-        """paper §2.2.2: det(Pi) must be +1 (rotation), never -1 (reflection)."""
+        """Our SO(d) convention: det(Pi) must be +1, never -1 (a reflection).
+
+        Not a paper requirement — see rotation.py.  Pinned so the QR and
+        Hadamard backends stay interchangeable.
+        """
         for seed in range(8):
             det = torch.linalg.det(RandomRotation(D, seed=seed).Pi).item()
             assert det > 0, f"seed {seed}: det={det:+.3f} is a reflection"
 
     @pytest.mark.parametrize("dim", [2, 4, 64, 128])
     def test_hadamard_rotation_is_proper_so_d(self, dim):
-        """paper §2.2.2 applies to the DEFAULT rotation too.  HadamardRotation is
+        """The SO(d) convention applies to the DEFAULT rotation too.  HadamardRotation is
         the default for power-of-2 dims (all real KV head dims), so it must also
         be a proper rotation — a random sign vector alone gives a reflection about
         half the time."""
@@ -649,11 +653,11 @@ class TestKVCacheDiskOffload:
 
     def test_outlier_codec_faithful_on_outlier_channels(self):
         """
-        Paper Section 5: on realistic KV (elevated variance spread across ~dim/4
-        channels — the case the paper's 32-outlier config targets), the outlier
+        On realistic KV (elevated variance spread across ~dim/4 channels — the
+        case the paper's 32-of-128 outlier split in §4.3 targets), the outlier
         codec reconstructs K faithfully AND spends fewer average bits than plain
-        paper at the same nominal ``bits`` (paper §5.1: outlier=min(b+1,4),
-        regular=max(b-1,1), so avg = 3.25 bpw at b=4 vs plain's 4.0).
+        paper at the same nominal ``bits``.  Our schedule is outlier=min(b+1,4),
+        regular=max(b-1,1), so avg = 3.25 bpw at b=4 vs plain's 4.0.
         """
         torch.manual_seed(SEED)
         B, H, T, d = 1, 2, 48, D

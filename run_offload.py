@@ -61,7 +61,7 @@ def main() -> None:
                    help="Disable KV-cache offload (keep it in VRAM).")
     p.add_argument("--offload-codec", default="paper-outlier",
                    choices=["paper-outlier", "paper"],
-                   help="'paper-outlier' = paper Section 5 outlier-aware Lloyd-Max "
+                   help="'paper-outlier' = outlier-aware Lloyd-Max (paper 3.1 + 4.3) "
                         "(best fidelity on real KV, default); "
                         "'paper' = plain Lloyd-Max, bit-packed (smallest).")
     p.add_argument("--max-vram-tokens", type=int, default=512,

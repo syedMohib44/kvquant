@@ -28,6 +28,30 @@ The paper is organized around these five extensions, preceded by a description o
 
 ### 2.1 KVQuant
 
+Throughout, "KVQuant" refers to the TurboQuant construction of Zandieh et al.
+(arXiv:2504.19874). Section references of the form §N.M below point at *that*
+paper; references to sections of *this* document are written "Section N".
+
+**What is inherited and what is ours.** TurboQuant contributes the MSE-optimal
+quantizer (its §3.1, Algorithm 1, Theorem 1), the inner-product-optimal
+two-stage quantizer (its §3.2, Algorithm 2, Theorem 2), and the distortion
+bounds quoted below. It does **not** contribute the outlier-channel selection
+criterion (its §4.3 introduces the split in three sentences and names no
+criterion), per-layer calibration (it is data-oblivious by design, its §1.2),
+the K-versus-V quantizer assignment (it never distinguishes keys from values),
+the GQA bit allowance (it never mentions grouped-query attention), Hadamard
+rotations, or any of the five extensions in Section 3 of this document. Those
+are contributions of this work and are justified here by measurement, not by
+citation. The README carries the same table in tabular form.
+
+**Two errata in the source, noted for reproducibility.** TurboQuant's §4.3
+gives its worked example as "(32×3+96×2)/128 = 2.5"; that sum is 2.25. And its
+bits-per-channel figures are payload-only — its §1.3 concedes that non-unit
+vectors require stored floating-point L2 norms, but no bit-width figure
+accounts for them. All byte counts in Section 5 of this document include those
+norms as sidecar overhead, which is why they sit well below the nominal
+$16/b$.
+
 Given a vector $\mathbf{x} \in \mathbb{R}^d$ on the unit sphere, KVQuant applies two steps:
 
 **Rotation.** Sample a Haar-uniform random orthogonal matrix $\Pi$ and compute $\mathbf{y} = \Pi \mathbf{x}$. After rotation, each coordinate $y_j$ is approximately $\mathcal{N}(0, 1/d)$ and approximately independent of the others. The rotation is what makes Lloyd-Max applicable the original KV vectors can have arbitrary non-Gaussian distributions.
@@ -429,7 +453,7 @@ Attention-weighted quantization aligns the bit budget with what the model actual
 
 None of these require modifying the model or changing the training procedure. They're all implemented as composable PyTorch modules in `kvquant/`, and they can be adopted in any combination. Four further improvements strengthen the implementation: k-means++ seeding reduces Lloyd-Max initialisation MSE by up to 75% at low bit-widths; K-V asymmetric quantization cuts V reconstruction error by 61.5% at a lower bit budget; combining delta compression with outlier-aware quantization reduces V MSE by 95.4% versus same-budget scalar; and Hadamard rotation is now a configurable parameter throughout the stack.
 
-Two additional fixes address non-MHA architectures. GQA models amplify effective distortion by $g$ (query heads per KV head); compensating with $\lceil \log_4 g \rceil$ extra bits per coordinate, capped at 8, restores generation quality on Qwen2.5-1.5B ($g=6$) and Qwen2.5-7B ($g=7$). Per-layer calibration of the outlier detector, rather than pooling KV data across all transformer layers, correctly identifies the layer-specific channels that carry anomalous variance. The full test suite (119 tests) passes cleanly.
+Two additional fixes address non-MHA architectures. GQA models amplify effective distortion by $g$ (query heads per KV head); compensating with $\lceil \log_4 g \rceil$ extra bits per coordinate, capped at 8, restores generation quality on Qwen2.5-1.5B ($g=6$) and Qwen2.5-7B ($g=7$). Per-layer calibration of the outlier detector, rather than pooling KV data across all transformer layers, correctly identifies the layer-specific channels that carry anomalous variance. The full test suite passes cleanly.
 
 ---
 
@@ -626,7 +650,7 @@ Three performance and correctness issues were identified and fixed in the delta 
 
 With no anchor beyond the initial one, MSE accumulates to 0.116. A fixed `anchor_every=32` uses a second anchor but places it at position 32 after the drift at position 15 so it barely helps (MSE 0.116, essentially the same). Adaptive anchoring with `anchor_threshold=0.4` uses the same two anchors but fires the second one at position 15 exactly where the drift happens, reducing MSE to 0.00126 a **98.9% reduction** at zero extra anchor cost.
 
-All three fixes are covered by 10 new tests in `TestDeltaKVCache`; the full suite of 119 tests passes.
+All three fixes are covered by new tests in `TestDeltaKVCache`; the full suite passes.
 
 ---
 

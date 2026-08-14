@@ -119,8 +119,16 @@ def _kmeans(
 
 
 # ---------------------------------------------------------------------------
-# Batched k-means over M subspaces at once (paper §7/§414: the M sequential
-# cdist calls were the PQ bottleneck; batching folds them into single kernels).
+# Batched k-means over M subspaces at once: the M sequential cdist calls were
+# the PQ bottleneck, and batching folds them into single kernels.
+#
+# Note this whole module is a BASELINE, not a TurboQuant component.  The paper
+# proposes no product quantizer; PQ appears only as related work (§1.2) and as
+# something to beat (§4.4), on the grounds that its codebooks "require separate
+# storage" and its k-means indexing makes it "ill-suited for online settings".
+# The paper's own k-means is one-dimensional (§3.1) — a scalar Lloyd-Max
+# codebook over a known density, solved once — not vector quantization over
+# subspaces.  Avoiding subspace VQ is in fact the paper's central claim.
 # ---------------------------------------------------------------------------
 
 
@@ -244,8 +252,8 @@ class ProductQuantizer(nn.Module):
         y = self.rotation(flat / norms)  # (N, dim)
         y_split = y.reshape(-1, self.M, self.sub_dim)  # (N, M, sub_dim)
 
-        # Train all M subspace codebooks in one batched k-means (paper §7/§414),
-        # instead of an M-length Python loop of separate _kmeans calls.
+        # Train all M subspace codebooks in one batched k-means, instead of an
+        # M-length Python loop of separate _kmeans calls.
         # (N, M, sub_dim) -> (M, N, sub_dim) so M is the batch dim.
         x_batched = y_split.transpose(0, 1).contiguous()  # (M, N, sub_dim)
         self.codebooks = _kmeans_batched(x_batched, self.K)  # (M, K, sub_dim)

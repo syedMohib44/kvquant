@@ -344,9 +344,16 @@ def main():
         cal_out = model(cal_ids, use_cache=True)
     cal_kvs = kvs_from_cache(cal_out.past_key_values)
     T_cal = cal_ids.shape[1]
-    # Per-layer calibration data (paper §Per-layer calibration): keep each layer's
-    # K/V separate.  Pooling across layers averages out the layer-specific outlier
-    # channels and mis-identifies them for every individual layer.
+    # Per-layer calibration data: keep each layer's K/V separate.  Pooling across
+    # layers averages out the layer-specific outlier channels and mis-identifies
+    # them for every individual layer.
+    #
+    # This is OUR design decision, not the paper's.  TurboQuant is explicitly
+    # data-oblivious ("apply instantly without needing data-specific tuning or
+    # calibrations", §1.2) and says nothing about layers.  Calibration is forced
+    # on us by the outlier split, which the paper introduces in a §4.3 aside
+    # without giving any selection criterion; once you must choose outlier
+    # channels from data, doing it per layer is what the measurements support.
     per_layer_kv = [
         (kv[0].reshape(-1, T_cal, head_dim), kv[1].reshape(-1, T_cal, head_dim))
         for kv in cal_kvs
@@ -363,8 +370,9 @@ def main():
 
     for bits in BITS_LIST:
         # One KVCacheQuantizer PER LAYER, each calibrated on its own layer's KV
-        # (paper §Per-layer calibration).  quantize_model_cache() accepts this
-        # list and applies the matching quantizer to each attention layer in order.
+        # (see the note above — our choice, not the paper's).  quantize_model_cache()
+        # accepts this list and applies the matching quantizer to each attention
+        # layer in order.
         kvc = []
         for lk, lv in per_layer_kv:
             q = KVCacheQuantizer(

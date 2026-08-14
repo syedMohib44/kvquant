@@ -12,11 +12,49 @@ Every token an LLM generates requires storing its Key and Value vectors across a
 
 Naïve quantization (uniform grid) fails because KV vectors have heavy-tailed outliers a few large-magnitude coordinates dominate the distribution. Rounding those aggressively collapses attention scores.
 
-KVQUANT compresses the KV cache from 16-bit floats down to 2–4 bits while preserving attention accuracy. It isolates outlier dimensions at higher precision, fits per-layer non-uniform codebooks to the actual KV distribution, and minimises distortion directly on the `<Q,K>` dot products rather than pointwise values. The result is a 4–8× reduction in KV cache memory with less than 0.5 perplexity degradation enough to run long-context inference on hardware that would otherwise run out of memory.
+KVQUANT compresses the KV cache from 16-bit floats down to 2–4 bits while preserving attention accuracy. It isolates outlier dimensions at higher precision, fits per-layer non-uniform codebooks to the actual KV distribution, and minimises distortion directly on the `<Q,K>` dot products rather than pointwise values.
+
+**Measured end-to-end**, on Qwen2.5-0.5B-Instruct with a ~300-token prompt and 64 generated tokens, `generate()` holds **2.6–3.6× fewer cache bytes** than fp16 and cuts **peak VRAM from 1225 MiB to 265 MiB (4.6×)** at equal throughput. Those numbers are counted from bytes actually resident, sidecars included — see [What is measured, and how](#what-is-measured-and-how). The nominal `16/bits` figure (4–8×) is roughly double the truth, because it ignores the per-vector norms the codec must store.
 
 ---
 
 KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) with five novel extensions and several implementation improvements. It achieves near-optimal KV cache compression by combining information-theoretically grounded vector quantization with transformer-specific structure exploitation.
+
+---
+
+## Relationship to the TurboQuant paper
+
+TurboQuant is a 25-page theory paper: three theorems, two algorithms, and four
+experiment subsections. It ends at §4.4 — there is no §5, §6, §7, and no
+appendix. What we take from it, and what is ours, is worth stating plainly.
+
+**From the paper.** The MSE-optimal quantizer — random rotation, then a
+per-coordinate Lloyd-Max codebook fitted to the sphere marginal of Lemma 1
+(§3.1, Algorithm 1, Theorem 1). The inner-product-optimal two-stage quantizer,
+`(b-1)`-bit MSE plus 1-bit QJL on the residual (§3.2, Algorithm 2, Theorem 2).
+The distortion bounds we test against.
+
+**Ours, not the paper's.** These are engineering decisions the paper does not
+make, and they need to stand on their own measurements:
+
+| Decision | What the paper says |
+|---|---|
+| `KVQuantMSE` for **both** K and V | Nothing. The paper never distinguishes keys from values, and never says which of its two quantizers to use for either. Our choice is pinned by `test_mse_key_reconstructs_far_better_than_ip`. |
+| Outlier channels chosen by **empirical per-channel variance** | The outlier split is a three-sentence aside in §4.3 with **no selection criterion** — no threshold, no statistic, no mention of whether the choice is static or calibrated. |
+| **Per-layer calibration** on real prefill KVs | Nothing. TurboQuant is explicitly *data-oblivious* ("apply instantly without needing data-specific tuning or calibrations", §1.2), so calibrating at all is a departure — one the outlier split forces on us. |
+| Bit schedule `outlier=min(b+1,4)`, `regular=max(b-1,1)` | The paper gives one configuration and no formula to generalise it. |
+| **GQA bump** `+ceil(log4(g))` | Nothing. Grouped-query attention is never mentioned outside a bibliography entry. |
+| **Hadamard** rotation for power-of-2 dims | Nothing. The paper says only "a random rotation matrix"; fast/structured transforms are never discussed. Sound (Ailon & Chazelle 2006), but ours. |
+| **det(Π) = +1** (SO(d), not O(d)) | Nothing. The determinant is never discussed, and the paper's argument holds for reflections too. We pin it so the QR and Hadamard backends stay interchangeable. |
+| **Low-rank correction**, delta, adaptive, PQ, Huffman | Not in the paper. PQ appears only as a baseline to beat (§4.4); the ~5% entropy-coding gain is noted in §3.1 and explicitly declined. |
+
+**Two errata in the source.** §4.3 states its worked example as
+"(32×3+96×2)/128 = 2.5" — that sum is **2.25**. And the paper's bits-per-channel
+figures are payload-only: §1.3 concedes that non-unit vectors need their L2
+norms stored "in floating-point precision", but no bit-width figure anywhere
+accounts for them. At head_dim 64 that omission is substantial, and it is the
+main reason our measured ratios land near half the nominal ones. We count the
+norms as `sidecar_bytes` and report them separately.
 
 ---
 
@@ -28,7 +66,9 @@ KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 
 | Delta compression MSE improvement | **1.1--2.2x** on correlated streams |
 | Low-rank correction MSE reduction | **~11%** at rank-4, ~19% at rank-8 |
 | Codebook lookup speedup vs argmin | **14--22x** (bucketize) |
-| Test suite | **119/119 passing** |
+| Measured cache-byte reduction, end to end | **2.6--3.6x** (sidecars included) |
+| Measured peak-VRAM reduction, end to end | **4.6x** (1225 -> 265 MiB) |
+| Test suite | full suite green; counts change every commit, so run `pytest tests/` |
 
 ---
 
@@ -473,8 +513,9 @@ resident.
 
 Two codecs are available via `offload_codec` — both are the paper's method:
 
-- **`"paper-outlier"` (default)** the paper's **Section 5** outlier-aware
-  Lloyd-Max, calibrated once on the prefill KVs. Real attention K/V tensors have a
+- **`"paper-outlier"` (default)** outlier-aware Lloyd-Max — the paper's §3.1
+  MSE quantizer applied separately to the outlier and regular channel groups it
+  sketches in §4.3 — calibrated once on the prefill KVs. Real attention K/V tensors have a
   few high-magnitude "outlier" channels; this codec gives them extra bits and
   quantizes the rest at `bits`, reaching near-lossless fidelity (cosine ~0.999) at
   3-4 bits/dim. **This is the recommended paper-faithful codec** plain Lloyd-Max
@@ -520,7 +561,7 @@ out = generate(
     doc + "\n\nSummarise the key points.",
     model="Qwen/Qwen2.5-7B-Instruct",
     offload_to_disk=True,          # spill KV cache VRAM → RAM → SSD
-    offload_codec="paper-outlier", # paper Section 5 (default); "paper" also valid
+    offload_codec="paper-outlier", # outlier-aware (default); "paper" also valid
     bits=4,                        # pack width (2-4); GQA bump raises effective bits
     device="cuda",                 # model + staged cache device (auto if omitted)
     max_vram_tokens=512,           # token positions kept dequantized in VRAM
@@ -534,7 +575,7 @@ print(out.text)
 | Lever | Effect | Default |
 |---|---|---|
 | `offload_to_disk=True` | enable the VRAM → RAM → SSD KV-cache spill | `False` |
-| `offload_codec` | `"paper-outlier"` (Section 5 outlier-aware, best fidelity) or `"paper"` (Lloyd-Max, bit-packed, smallest) | `"paper-outlier"` |
+| `offload_codec` | `"paper-outlier"` (outlier-aware, best fidelity) or `"paper"` (Lloyd-Max, bit-packed, smallest) | `"paper-outlier"` |
 | `bits` | pack width for the paper codec (2-4); also the in-memory KV precision. GQA models get an automatic effective-bit bump | `3` |
 | `device` | compute + staged-cache device (`"cuda"`, `"cpu"`, `"mps"`); follows the model when omitted | auto |
 | `max_vram_tokens` | token positions kept dequantized (hot) in VRAM | `512` |
@@ -777,8 +818,57 @@ python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "Explain 
 ## Running tests
 
 ```bash
-python -m pytest test_kvquant.py -v   # 119 tests, all pass
+python -m pytest tests/ -q
 ```
+
+Tests marked `cuda` skip automatically without a device. The suite is green on
+`main`; a hard-coded count in a README goes stale on the next commit, so run it
+rather than trusting a number here.
+
+---
+
+## What is measured, and how
+
+Every compression figure in this README is counted from bytes actually
+resident, not derived from the nominal bit-width. The two rulers:
+
+**Cache bytes** (`tests/cache_bytes.py::cache_nbytes`) walks the live cache
+object and classifies every tensor it holds:
+
+- `code_bytes` — the bit-packed Lloyd-Max indices, the payload.
+- `sidecar_bytes` — everything else the codec needs to reconstruct: the
+  **per-vector float32 L2 norms** (two per quantized vector, one for each of the
+  outlier and regular channel groups), channel permutations, and codebooks.
+  This is 16–22% of the total at head_dim 64, and it is what the paper's
+  bits-per-channel figures leave out.
+- `float_bytes` — the **pending window**. Tokens accumulate in float until they
+  fill a block, so up to `block_size - 1` positions are uncompressed at any
+  moment. `generate()` flushes at the end, but mid-stream this is real memory.
+
+`GenerateResult.compression_ratio` is `fp16_bytes / (code + sidecar + float)`,
+and `GenerateResult.measured` is `True` when it was counted rather than assumed.
+`test_reported_ratio_equals_measured` pins the two together.
+
+**Peak VRAM** (`tests/vram.py::measure_peak_vram`) uses
+`torch.cuda.max_memory_allocated`, minus a baseline captured after
+`gc.collect()` + `empty_cache()` + `reset_peak_memory_stats()`. Three choices
+worth naming: the baseline is **subtracted** (model weights would swamp the
+delta); it reads `memory_allocated`, **not** `memory_reserved` (the reserved
+pool is sticky and would mask the win); and float and compact runs happen
+**back-to-back in one process** with a cache flush between, so they see the same
+allocator state. A self-test allocates a known 64 MiB and asserts the harness
+reports it within 10% — a broken ruler otherwise "proves" whatever you like.
+
+**Quality** is judged on logits and perplexity, never on generated text.
+Sampling makes text a bad instrument: with `repetition_penalty=1.3`, a ~4e-4
+cosine difference in reconstruction flips one greedy argmax and the whole
+continuation diverges, which says nothing about codec quality. On a random-weight
+test fixture it is worse than useless — deleting the causal mask entirely leaves
+the output byte-identical while moving max logit error from 0.068 to 2.07.
+
+Perplexity on held-out text (Qwen2.5-0.5B-Instruct, 256-token context):
+fp32 baseline **22.90**; 4-bit **30.35**, 3-bit **38.93**, 2-bit **46.35**.
+Monotone in bits, as reconstruction error is at every level of the codec.
 
 ---
 

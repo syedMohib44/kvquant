@@ -329,7 +329,7 @@ def _paper_dequantize(q: _PaperKV, get_mse, device=None) -> Tensor:
     """Reconstruct a float tensor from its _PaperKV representation."""
     dim = q.shape[-1]
     mse = get_mse(dim, q.num_bits)
-    # paper §2.2.7: math.prod is a single C-level call (and clearer than a loop)
+    # math.prod is a single C-level call (and clearer than a loop)
     count = math.prod(q.shape)
     idx = _unpack_indices(q.packed, q.num_bits, count).reshape(q.shape)
     rebuilt = QuantizedMSE(indices=idx, norms=q.norms, shape=q.shape)
@@ -338,7 +338,8 @@ def _paper_dequantize(q: _PaperKV, get_mse, device=None) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Outlier-aware paper codec (the paper's Section 5 extension).
+# Outlier-aware codec: the paper's §3.1 MSE quantizer applied separately to the
+# outlier and regular channel groups described in its §4.3 experimental aside.
 #
 # Real attention K/V tensors have a few "outlier" channels with much larger
 # magnitude than the rest.  Plain Lloyd-Max spends equal precision on every
@@ -394,7 +395,7 @@ def _paper_outlier_compress(t: Tensor, oq: "OutlierKVQuant") -> _PaperOutlierKV:
 
 def _paper_outlier_dequantize(q: _PaperOutlierKV, oq: "OutlierKVQuant", device=None) -> Tensor:
     """Reconstruct a float tensor from its _PaperOutlierKV representation."""
-    # paper §2.2.7: math.prod is a single C-level call (and clearer than a loop)
+    # math.prod is a single C-level call (and clearer than a loop)
     N = math.prod(q.shape[:-1])
     out_idx = _unpack_indices(q.out_packed, q.out_bits, N * q.out_dim).reshape(N, q.out_dim)
     reg_idx = _unpack_indices(q.reg_packed, q.reg_bits, N * q.reg_dim).reshape(N, q.reg_dim)
@@ -432,7 +433,7 @@ class KVCacheDiskOffload:
     Reconstruction fidelity
     ------------------------
     The cache is stored with the paper's rotate + Lloyd-Max codec ("paper", or
-    the Section 5 outlier-aware "paper-outlier"), which uses KVQuantMSE for both
+    the outlier-aware "paper-outlier"), which uses KVQuantMSE for both
     K and V.  MSE reconstructs faithfully per coordinate, so the dequantized
     cache drives real generation correctly.  It deliberately does NOT use the
     research KVQuant-IP quantizer: that returns an inner-product *estimator*
@@ -477,7 +478,7 @@ class KVCacheDiskOffload:
     ):
         # Codecs (both are the paper's method — no non-paper fallback):
         #   "paper"         plain rotate + Lloyd-Max, bit-packed (parameter-free)
-        #   "paper-outlier" paper Section 5: outlier-aware Lloyd-Max — calibrated
+        #   "paper-outlier" outlier-aware Lloyd-Max (paper §3.1 + §4.3) — calibrated
         #                   once on the prefill; best fidelity on real KV tensors.
         if codec not in ("paper", "paper-outlier"):
             raise ValueError(
@@ -580,16 +581,26 @@ class KVCacheDiskOffload:
         if oq is None:
             dim = calib.shape[-1]
             b = self._bits
-            # Paper §5.1 experimental config:
-            #   n_outlier    = head_dim / 4        (32 of 128)
+            # Our generalisation of the paper's single §4.3 example (32 of 128
+            # channels at 3 bits, the remaining 96 at 2):
+            #   n_outlier    = head_dim / 4        (32 of 128 — the paper's fraction)
             #   outlier_bits = min(bits + 1, 4)
             #   regular_bits = max(bits - 1, 1)
-            # e.g. b=2 -> "2.5-bit" (32@3 + 96@1), b=3 -> "3.5-bit" (32@4 + 96@2).
+            # At d=128 that gives b=2 -> 32@3 + 96@1 = 1.50 bits/coord, and
+            # b=3 -> 32@4 + 96@2 = 2.50.  The paper supplies no formula, no
+            # outlier-selection criterion, and no second configuration, so the
+            # schedule above is ours.  Do not label these with the paper's
+            # "2.5-bit"/"3.5-bit" names: those refer to a different split, and
+            # the paper's own arithmetic for them does not check out (see
+            # outlier.py).
+            #
             # GQA compensation: bump BOTH groups by gqa_extra so a grouped-query
-            # model (Qwen2.5-7B, g=7 -> +2) stores enough effective bits.  The base
-            # config is capped at min(b+1,4)/max(b-1,1) FIRST, then gqa_extra is
-            # added (capped at 8-bit) — the exact same order KVCacheQuantizer uses
-            # in-memory, so the reported avg_bits matches what is actually stored.
+            # model (Qwen2.5-7B, g=7 -> +2) stores enough effective bits.  This is
+            # entirely ours — the paper never mentions grouped-query attention.
+            # The base config is capped at min(b+1,4)/max(b-1,1) FIRST, then
+            # gqa_extra is added (capped at 8-bit) — the exact same order
+            # KVCacheQuantizer uses in-memory, so the reported avg_bits matches
+            # what is actually stored.
             ge = self._gqa_extra
             ob = min(min(b + 1, 4) + ge, 8)
             rb = min(max(max(b - 1, 1) + ge, 1), 8)

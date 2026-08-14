@@ -316,13 +316,20 @@ def _build_quantized_cache(
     `prefill_chunk_size` tokens so the O(T²) attention matrix never exceeds
     VRAM — the full context is still captured in the KV cache.
 
-    The cache used for generation is the paper's Section 5 outlier-aware
-    Lloyd-Max codec (KVQuantMSE for BOTH K and V).  MSE reconstructs faithfully
-    per coordinate, which is what attention needs — the IP quantizer used for
-    PPL scoring is an inner-product *estimator* and would garble generation, so
-    we force ``k_quantizer_cls=KVQuantMSE`` here.  Each layer gets its own
-    quantizer calibrated on that layer's own prefill KV (per-layer calibration,
-    paper §Per-layer calibration).  avg_bits is the real calibrated average.
+    The cache used for generation is the outlier-aware Lloyd-Max codec (the
+    paper's §3.1 MSE quantizer, split across the outlier/regular channel groups
+    of its §4.3 aside), using KVQuantMSE for BOTH K and V.  MSE reconstructs
+    faithfully per coordinate, which is what attention needs — the IP quantizer
+    used for PPL scoring is an inner-product *estimator* (§3.2, Theorem 2:
+    unbiased in ``<y, x>``, not per-coordinate) and would garble generation, so
+    we force ``k_quantizer_cls=KVQuantMSE`` here.  The paper does not say which
+    of its two quantizers to use for K versus V; this choice is ours, and
+    ``test_mse_key_reconstructs_far_better_than_ip`` is what justifies it.
+
+    Each layer gets its own quantizer calibrated on that layer's own prefill KV.
+    That too is our decision — see the note in ``eval_ppl`` — since the paper is
+    data-oblivious by design and specifies no calibration at all.  avg_bits is
+    the real calibrated average.
 
     When ``quantize=False`` (the disk-offload path), the raw float prefill is
     returned uncompressed: KVCacheDiskOffload is then the SOLE compressor, so we
@@ -342,10 +349,12 @@ def _build_quantized_cache(
     kvs = kvs_from_cache(native_cache)
 
     # One KVCacheQuantizer PER LAYER, each calibrated on its own layer's KV
-    # (paper §Per-layer calibration — pooling across layers mis-identifies the
-    # per-layer outlier channels).  MSE-for-K makes reconstruction faithful for
-    # generation; the paper §5.1 outlier config is outlier_bits=min(bits+1,4),
-    # regular_bits=max(bits-1,1).
+    # (pooling across layers mis-identifies the per-layer outlier channels).
+    # MSE-for-K makes reconstruction faithful for generation.  The
+    # outlier_bits=min(bits+1,4) / regular_bits=max(bits-1,1) schedule is our
+    # generalisation of the single worked example in §4.3 — the paper gives one
+    # configuration and no formula.  (Its stated example, 32@3 + 96@2 = "2.5"
+    # bits, actually averages 2.25; see the note in outlier.py.)
     kvc = []
     for k, v in kvs:
         k3 = k.reshape(-1, k.shape[-2], head_dim)
@@ -369,9 +378,12 @@ def _build_quantized_cache(
         # sole (single-pass) compressor.  See docstring.
         return native_cache, avg_bits, T_p, ids
 
-    # Compress the prefill once with the paper codec.  Low-rank residual
-    # correction (paper §3.4/§5.3) only helps below 4-bit — at 4-bit the residual
-    # is small enough that a rank-r SVD fits numerical noise, so gate it off.
+    # Compress the prefill once with the paper codec.  The low-rank residual
+    # correction is ours — the paper has no low-rank or SVD step anywhere.  (Its
+    # only residual is the 1-bit QJL on r = x - Q_mse(x) in §3.2, which is a
+    # different construction entirely.)  It only helps below 4-bit: at 4-bit the
+    # residual is small enough that a rank-r SVD fits numerical noise, so gate
+    # it off.
     eff_rank = correction_rank if (correction_rank > 0 and bits < 4) else 0
     past = quantize_model_cache(native_cache, kvc, correction_rank=eff_rank)
     return past, avg_bits, T_p, ids
@@ -400,9 +412,9 @@ def _build_compact_cache(
        the float path, obtained here without a crop, since truncating inside an
        already-compressed block would mean re-encoding it and breaking
        compress-exactly-once.
-    2. Calibrate each layer on *that layer's own* prefill KV (paper §399-412).
-       Outlier channels are layer-specific; pooling across layers mis-identifies
-       them.
+    2. Calibrate each layer on *that layer's own* prefill KV.  Outlier channels
+       are layer-specific; pooling across layers mis-identifies them.  (Our
+       finding — the paper is data-oblivious and prescribes no calibration.)
     3. Ingest the float KV block by block, then drop the float cache.
 
     Calibration must precede ingest: a layer that compresses before it is
@@ -449,8 +461,9 @@ def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-ou
     Build a KVCacheDiskOffload for tiered VRAM->RAM->SSD storage of the KV cache.
 
     Codecs:
-      - "paper-outlier" (default): the paper's Section 5 outlier-aware Lloyd-Max,
-        calibrated once on the prefill.  Best fidelity on real KV tensors
+      - "paper-outlier" (default): outlier-aware Lloyd-Max (paper §3.1 quantizer,
+        §4.3 channel split), calibrated once on the prefill.  Best fidelity on
+        real KV tensors
         (cosine ~0.999) because a few high-magnitude channels get extra bits.
       - "paper": plain rotate + Lloyd-Max, indices bit-packed to `bits` (2-4).
         Smallest SSD footprint but degrades on outlier-heavy KV.
@@ -780,8 +793,8 @@ def generate(
         warm_size:          Compressed layer entries kept in CPU RAM before disk.
         disk_dir:           SSD folder for spilled cache (auto-cleaned temp if None).
         offload_codec:      Compression for spilled cache.
-                            "paper-outlier" (default): paper Section 5 outlier-aware
-                            Lloyd-Max, calibrated on the prefill — best fidelity on
+                            "paper-outlier" (default): outlier-aware Lloyd-Max
+                            (paper §3.1 + §4.3), calibrated on the prefill — best fidelity on
                             real KV.  "paper": plain Lloyd-Max, bit-packed (smallest,
                             degrades on outlier-heavy KV).
         compact_cache:      Keep the KV cache as compressed codes in memory

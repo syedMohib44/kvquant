@@ -1,5 +1,13 @@
 """
-Entropy coding for KVQuant codebook indices (paper Section 6).
+Entropy coding for KVQuant codebook indices.
+
+The paper raises this idea and then declines to use it (§3.1, unnumbered
+paragraph "Entropy Encoding Codebook Pointers"): it notes the indices are
+non-uniform and that entropy coding would save roughly 5% at b=4, but says
+that "given the limited gain, we have chosen not to incorporate this technique
+into TurboQuant to maintain simplicity and speed."  So this module is an
+analysis tool measuring a bound the paper leaves on the table, not an
+implementation of anything TurboQuant specifies.
 
 After Lloyd-Max quantization each coordinate is assigned an index in
 {0, ..., 2^b - 1}.  These indices are NOT uniformly distributed - the

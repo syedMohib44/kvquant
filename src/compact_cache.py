@@ -31,12 +31,18 @@ compressed exactly once and its block is frozen.
 
 Paper alignment
 ---------------
-Blocks use the paper's Section 5 outlier-aware Lloyd-Max codec via the same
-``_paper_compress`` / ``_paper_outlier_compress`` primitives the disk-offload
-tier uses — the codec is imported, never duplicated.  Keys use
-``KVQuantMSE``: ``KVQuantIP`` is an inner-product *estimator* whose
-per-coordinate reconstruction is wrong, so a cache built with it produces
-garbage (paper §193 sanctions the ``quantizer_cls`` hook for exactly this).
+Blocks use the outlier-aware Lloyd-Max codec — the paper's §3.1 MSE quantizer
+(Algorithm 1, Theorem 1) applied separately to the outlier and regular channel
+groups of its §4.3 aside — via the same ``_paper_compress`` /
+``_paper_outlier_compress`` primitives the disk-offload tier uses.  The codec is
+imported, never duplicated.
+
+Both K and V use ``KVQuantMSE``.  ``KVQuantIP`` (§3.2, Theorem 2) is an
+inner-product *estimator*: it is unbiased in ``<y, x>`` but its per-coordinate
+reconstruction is wrong, so a cache built from it produces garbage.  The paper
+never says which quantizer to use for keys versus values — it does not
+distinguish them anywhere — so this is our choice, pinned by
+``test_mse_key_reconstructs_far_better_than_ip``.
 """
 
 from __future__ import annotations
@@ -72,12 +78,26 @@ def _make_outlier_quantizer(
     dim: int, bits: int, gqa_factor: int = 1, seed: int = 0
 ) -> OutlierKVQuant:
     """
-    Build the paper's §5.1 outlier configuration, GQA-compensated.
+    Build the outlier configuration, GQA-compensated.
+
+    The bit schedule is ours.  The paper gives exactly one configuration — 32 of
+    128 channels at 3 bits, the rest at 2 (§4.3) — with no formula to generalise
+    it and no criterion for picking the outlier channels.  (Its stated average
+    for that split, "2.5", is also arithmetically wrong; the split gives 2.25.
+    See ``outlier.py``.)  We generalise to
+    ``outlier_bits = min(bits+1, 4)``, ``regular_bits = max(bits-1, 1)``,
+    ``n_outlier = dim//4``, which reproduces the paper's channel fraction and
+    its "outliers get more bits" intent.
+
+    The GQA allowance has no basis in the paper at all: TurboQuant never
+    mentions grouped-query attention.  It is our compensation for the fact that
+    g query heads share one KV head, so a quantization error in that head is
+    amplified across all g of them.
 
     Mirrors ``KVCacheDiskOffload._get_outlier_q`` exactly, including the
-    cap-then-bump order: the paper caps ``outlier_bits`` at 4 *first*, then
-    adds the GQA allowance.  Doing it the other way round reports a bit-width
-    that differs from what is actually stored.
+    cap-then-bump order: ``outlier_bits`` is capped at 4 *first*, then the GQA
+    allowance is added.  Doing it the other way round reports a bit-width that
+    differs from what is actually stored.
     """
     gqa_extra = math.ceil(math.log(gqa_factor, 4)) if gqa_factor > 1 else 0
     outlier_bits = min(min(bits + 1, 4) + gqa_extra, 8)
@@ -333,8 +353,13 @@ class CompactKVLayer:
         Fit this layer's outlier detector on this layer's own KV.
 
         Per-layer rather than pooled: outlier channels are layer-specific, and
-        pooling across layers mis-identifies them (paper §399-412).  Called
-        with real prefill activations, never a synthetic corpus.
+        pooling across layers mis-identifies them.  Called with real prefill
+        activations, never a synthetic corpus.
+
+        Calibrating at all is a departure from the paper, which advertises
+        itself as data-oblivious (§1.2) and specifies no calibration step.  The
+        outlier split of §4.3 forces the issue — it names no way to choose the
+        channels — and per-layer is what our measurements support.
         """
         if self.codec != "paper-outlier":
             return

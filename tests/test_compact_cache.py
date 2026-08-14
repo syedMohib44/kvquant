@@ -551,7 +551,7 @@ class TestLayerMechanics:
     def test_calibration_is_per_layer(self):
         """
         Outlier channels are layer-specific; pooling across layers
-        mis-identifies them (paper §399-412).
+        mis-identifies them.  Our finding — the paper prescribes no calibration.
         """
         cache = CompactKVCache(n_layers=2, bits=4, block_size=4)
         torch.manual_seed(0)

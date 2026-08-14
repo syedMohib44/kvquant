@@ -1,5 +1,5 @@
 """
-Outlier-channel-aware KV quantization using KVQuantIP (Section 5 of the paper).
+Outlier-channel-aware KV quantization (paper §4.3, "Generation on LongBench").
 
 Certain channels in attention K/V tensors have disproportionately large
 magnitudes ("outlier channels").  Quantizing them at the same bit-width as
@@ -7,14 +7,40 @@ regular channels wastes precision.  This module:
 
   1. Identifies outlier channels by their empirical variance (calibrated once).
   2. Partitions channels into outlier and regular groups.
-  3. Applies KVQuantIP independently to each group at different bit-widths.
+  3. Applies the chosen quantizer independently to each group at different
+     bit-widths.
 
-Typical configurations from the paper
---------------------------------------
-  "2.5-bit":  32 outlier channels @ 3 bits + 96 regular @ 2 bits  (d=128)
-  "3.5-bit":  32 outlier channels @ 4 bits + 96 regular @ 3 bits  (d=128)
+What the paper actually specifies
+---------------------------------
+Very little.  The whole treatment is two sentences in §4.3: channels are split
+into outlier and non-outlier sets with "two independent instances of
+TurboQuant" applied to each, "allocating higher bit precision to outliers".
+The paper gives **no selection criterion** — no threshold, no statistic, no
+statement of whether the choice is static, calibrated, or recomputed online.
+Selecting by empirical per-channel variance (step 1 above) is therefore *our*
+choice, not the paper's; it is a natural reading, but the paper does not
+sanction it and a different criterion would be equally faithful.
 
-The average bit-width across all channels is the weighted mean.
+The paper's one worked example does not add up
+-----------------------------------------------
+§4.3 states, verbatim:
+
+    "in our 2.5-bit setup, 32 outlier channels are quantized at 3 bits, while
+     the remaining 96 channels use 2 bits, leading to an effective bit
+     precision of (32x3+96x2)/128=2.5"
+
+That sum is (96 + 192)/128 = **2.25**, not 2.5.  Either the channel split or
+the stated average is wrong in the source, and there is no way to tell which
+from the text.  A split reaching a true 2.5 would be e.g. 64@3 + 64@2.  The
+"3.5-bit" configuration is never specified at all — §4.3 says only that "a
+different ratio of outliers and regular channels leads to a higher effective
+bit precision", so any concrete 3.5-bit split is an inference.
+
+This module therefore takes n_outlier, outlier_bits and regular_bits as
+explicit arguments and computes ``avg_bits`` from them rather than hard-coding
+a named configuration.  The callers that build a configuration from a nominal
+``bits`` (see ``compact_cache._make_outlier_quantizer``) document their own
+arithmetic, which is self-consistent whether or not the paper's is.
 """
 
 from __future__ import annotations
