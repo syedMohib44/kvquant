@@ -285,9 +285,8 @@ def _paper_dequantize(q: _PaperKV, get_mse, device=None) -> Tensor:
     """Reconstruct a float tensor from its _PaperKV representation."""
     dim = q.shape[-1]
     mse = get_mse(dim, q.num_bits)
-    count = 1
-    for s in q.shape:
-        count *= s
+    # paper §2.2.7: math.prod is a single C-level call (and clearer than a loop)
+    count = math.prod(q.shape)
     idx = _unpack_indices(q.packed, q.num_bits, count).reshape(q.shape)
     rebuilt = QuantizedMSE(indices=idx, norms=q.norms, shape=q.shape)
     out = mse.dequantize(rebuilt).to(q.dtype)
@@ -347,9 +346,8 @@ def _paper_outlier_compress(t: Tensor, oq: "OutlierKVQuant") -> _PaperOutlierKV:
 
 def _paper_outlier_dequantize(q: _PaperOutlierKV, oq: "OutlierKVQuant", device=None) -> Tensor:
     """Reconstruct a float tensor from its _PaperOutlierKV representation."""
-    N = 1
-    for s in q.shape[:-1]:
-        N *= s
+    # paper §2.2.7: math.prod is a single C-level call (and clearer than a loop)
+    N = math.prod(q.shape[:-1])
     out_idx = _unpack_indices(q.out_packed, q.out_bits, N * q.out_dim).reshape(N, q.out_dim)
     reg_idx = _unpack_indices(q.reg_packed, q.reg_bits, N * q.reg_dim).reshape(N, q.reg_dim)
     rebuilt = OutlierQuantized(

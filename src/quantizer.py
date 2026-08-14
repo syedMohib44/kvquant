@@ -14,10 +14,13 @@ Two classes are provided:
 
 Normalisation note
 ------------------
-TurboQuant is designed for vectors on the unit sphere S^{d-1}.  After a
-random rotation each coordinate has distribution ~ N(0, 1/d).  The
-Lloyd-Max codebook is therefore built for N(0, 1) and the centroids are
-rescaled by 1/sqrtd at quantize time.
+TurboQuant is designed for vectors on the unit sphere S^{d-1}.  After a random
+rotation, a coordinate's exact marginal is the sphere marginal
+f(t) = C_d (1 - t^2)^{(d-3)/2}, which only converges to N(0, 1/d) for large d
+(paper §2.2.1).  The Lloyd-Max codebook is therefore fitted directly to that
+sphere marginal (see codebook.py::_sample_sphere_coord), so the centroids come
+out already at sphere scale (e.g. +-0.187/+-0.056 at b=2, d=64, vs 1/sqrt(64)
+= 0.125) and NO 1/sqrt(d) rescaling is applied at quantize time.
 
 For general (non-unit) vectors we first save the per-vector norm, project
 onto S^{d-1}, quantize, then restore the norm at dequantize time.

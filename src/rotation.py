@@ -79,6 +79,16 @@ class HadamardRotation(nn.Module):
     expectation, giving the same theoretical guarantees as a Haar-random
     orthogonal matrix for the purposes of KVQuant (Ailon & Chazelle 2006).
 
+    SO(d) guarantee
+    ---------------
+    Paper §2.2.2 requires a proper rotation (det = +1), not a reflection.  For
+    this construction det(H_d/sqrt(d) . D) = det(H_d/sqrt(d)) * prod(D_ii), and
+    det(H_d/sqrt(d)) is +1 for every d >= 4 (it is -1 only at d=2).  A random
+    sign vector therefore yields a reflection whenever prod(D_ii) disagrees with
+    the target, i.e. about half the time.  We flip a single sign to force
+    det = +1.  This costs nothing, keeps every D_ii in {+1,-1} (so the
+    randomisation guarantee is unchanged), and needs no d x d determinant.
+
     Args:
         dim:  Dimensionality (must be a power of 2).
         seed: RNG seed.
@@ -96,6 +106,12 @@ class HadamardRotation(nn.Module):
         gen.manual_seed(seed)
         # Random (+/-)1 diagonal signs
         signs = (torch.randint(0, 2, (dim,), generator=gen) * 2 - 1).float()
+        # Enforce det = +1 so the transform is a proper rotation in SO(d)
+        # (paper §2.2.2) rather than a reflection.  det(H_d/sqrt(d)) = -1 at d=2
+        # and +1 for d >= 4; multiply by prod(signs) to get the total.
+        h_det = -1.0 if dim == 2 else 1.0
+        if h_det * float(signs.prod()) < 0:
+            signs[0] = -signs[0]
         self.register_buffer("signs", signs)  # (d,)
 
     # ------------------------------------------------------------------

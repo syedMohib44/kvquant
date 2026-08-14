@@ -116,6 +116,29 @@ class TestRotation:
         r2 = RandomRotation(D, seed=1)
         assert not torch.allclose(r1.Pi, r2.Pi)
 
+    def test_qr_rotation_is_proper_so_d(self):
+        """paper §2.2.2: det(Pi) must be +1 (rotation), never -1 (reflection)."""
+        for seed in range(8):
+            det = torch.linalg.det(RandomRotation(D, seed=seed).Pi).item()
+            assert det > 0, f"seed {seed}: det={det:+.3f} is a reflection"
+
+    @pytest.mark.parametrize("dim", [2, 4, 64, 128])
+    def test_hadamard_rotation_is_proper_so_d(self, dim):
+        """paper §2.2.2 applies to the DEFAULT rotation too.  HadamardRotation is
+        the default for power-of-2 dims (all real KV head dims), so it must also
+        be a proper rotation — a random sign vector alone gives a reflection about
+        half the time."""
+        from src.rotation import HadamardRotation
+        for seed in range(8):
+            rot = HadamardRotation(dim=dim, seed=seed)
+            M = rot(torch.eye(dim))          # rows = images of the basis
+            det = torch.linalg.det(M).item()
+            assert det > 0, f"dim={dim} seed={seed}: det={det:+.3f} is a reflection"
+            # the det fix must not break orthogonality or invertibility
+            assert torch.allclose(M @ M.T, torch.eye(dim), atol=1e-4)
+            x = torch.randn(4, dim)
+            assert torch.allclose(rot.inverse(rot(x)), x, atol=1e-4)
+
     def test_same_seed_reproducible(self):
         r1 = RandomRotation(D, seed=7)
         r2 = RandomRotation(D, seed=7)
