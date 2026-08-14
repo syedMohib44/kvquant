@@ -14,7 +14,16 @@ Naïve quantization (uniform grid) fails because KV vectors have heavy-tailed ou
 
 KVQUANT compresses the KV cache from 16-bit floats down to 2–4 bits while preserving attention accuracy. It isolates outlier dimensions at higher precision, fits per-layer non-uniform codebooks to the actual KV distribution, and minimises distortion directly on the `<Q,K>` dot products rather than pointwise values.
 
-**Measured end-to-end**, on Qwen2.5-0.5B-Instruct with a ~300-token prompt and 64 generated tokens, `generate()` holds **2.5–3.6× fewer cache bytes** than fp16 and cuts **peak VRAM from 1225 MiB to 265 MiB (4.6×)** at equal throughput. Those numbers are counted from bytes actually resident, sidecars included — see [What is measured, and how](#what-is-measured-and-how). The nominal `16/bits` figure (4–8×) is roughly double the truth, because it ignores the per-vector norms the codec must store.
+**Measured end-to-end** on Qwen2.5-0.5B-Instruct, `generate()` holds **2.5–3.6× fewer cache bytes** than fp16, counted from bytes actually resident with sidecars included. Peak VRAM savings depend on context length, because at short contexts the prefill chunk's attention matrix dominates the peak rather than the cache:
+
+| context | float peak | compact peak | ratio |
+|---|---|---|---|
+| ~840 tok | 85.2 MiB | 85.2 MiB | 1.00× |
+| ~6.3k tok | 225.9 MiB | 154.9 MiB | 1.46× |
+| ~9.8k tok | 356.4 MiB | 205.1 MiB | 1.74× |
+| ~14k tok | 488.5 MiB | 260.4 MiB | 1.88× |
+
+(`bits=3`, `prefill_chunk_size=128`, 32 generated tokens, both arms measured against the same post-load baseline.) The saving grows with context, which is the regime this exists for; below ~1k tokens there is nothing to win. See [What is measured, and how](#what-is-measured-and-how). The nominal `16/bits` figure (4–8×) is roughly double the cache-byte truth, because it ignores the per-vector norms the codec must store.
 
 ---
 
@@ -67,7 +76,7 @@ norms as `sidecar_bytes` and report them separately.
 | Low-rank correction MSE reduction | **~11%** at rank-4, ~19% at rank-8 |
 | Codebook lookup speedup vs argmin | **14--22x** (bucketize) |
 | Measured cache-byte reduction, end to end | **2.5--3.6x** (sidecars included) |
-| Measured peak-VRAM reduction, end to end | **4.6x** (1225 -> 265 MiB) |
+| Measured peak-VRAM reduction, end to end | **1.9x** at ~14k tokens (489 -> 260 MiB); ~1.0x below ~1k |
 | Test suite | full suite green; counts change every commit, so run `pytest tests/` |
 
 ---
@@ -521,8 +530,8 @@ read are exempt, so a budget below one pass's worth bounds nothing; check
 **This path is for when the cache does not fit in RAM at all.** It does not
 reduce peak VRAM within a forward pass — the model still receives full float
 tensors. For real VRAM savings, use the default in-memory compact cache
-(`compact_cache=True`), which never materialises them: measured 265 MiB vs
-1225 MiB on a ~300-token prompt.
+(`compact_cache=True`), which never materialises them — 1.9× lower peak at ~14k
+tokens, growing with context.
 
 Two codecs are available via `offload_codec` — both are the paper's method:
 
@@ -872,14 +881,26 @@ pool is sticky and would mask the win); and float and compact runs happen
 allocator state. A self-test allocates a known 64 MiB and asserts the harness
 reports it within 10% — a broken ruler otherwise "proves" whatever you like.
 
-**Warm the codec before measuring.** The first compact-cache forward on a device
-costs roughly 9 MB more than every later one: Lloyd-Max codebooks are solved and
-cached per `(dim, num_bits)` in a process-global dict, rotation buffers migrate to
-the device, and cuBLAS picks its workspace. Attribute that to the cache and the
-compact path can read as *worse* than float — measuring `bits ∈ {2,3,4}` in one
-process without warming reported 1225 MiB for whichever ran first and 265 MiB for
-the rest, which looks exactly like a bit-width regression and is not one. The
-session-scoped `warm_cuda_codec` fixture in `tests/conftest.py` pays this once.
+**Load the model before capturing the baseline.** `generate()` loads and caches
+the model on first call, so the first arm you measure has an empty baseline and
+absorbs ~959 MiB of weights, while the second is measured against a baseline that
+already contains them. That single mistake produced a "1225 MiB → 265 MiB, 4.6×"
+result that this README published — it was the model weights, not the cache
+(959 + 265 = 1224.6 exactly). Both arms must start from the same post-load
+baseline; do a throwaway `generate()` first.
+
+**Warm the codec too.** The first compact-cache forward on a device costs ~9 MB
+more than every later one: Lloyd-Max codebooks are solved into a process-global
+dict, rotation buffers migrate to the device, and cuBLAS picks a workspace. Charge
+that to the cache and the compact path reads as worse than float. The
+session-scoped `warm_cuda_codec` fixture in `tests/conftest.py` pays it once.
+
+**Watch what actually dominates the peak.** At short contexts it is not the
+cache — it is the prefill chunk's attention matrix, which is identical in both
+paths. With the default `prefill_chunk_size=512`, both arms peak at exactly
+265 MiB up to ~2.8k tokens and the cache saving is invisible. The table above uses
+`prefill_chunk_size=128` so the measurement reflects the cache. A peak-VRAM
+comparison that does not say which component dominates is not interpretable.
 
 **Quality** is judged on logits and perplexity, never on generated text.
 Sampling makes text a bad instrument: with `repetition_penalty=1.3`, a ~4e-4

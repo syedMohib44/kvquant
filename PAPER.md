@@ -10,6 +10,10 @@ We introduce five extensions attention-weighted quantization, delta compression,
 
 On distilgpt2, attention-weighted quantization cuts attention-weighted distortion by 47-70% per layer at the same average bit-width. Delta compression reduces MSE by 1.1-2.2x for correlated streams. Rank-4 error correction shaves off ~11% of the remaining MSE at 7.4% extra storage. Product quantization (M=16, b=8) produces coherent generation at 2 bits/dim the same storage as 2-bit scalar, which collapses matching 3-bit scalar quality. The `bucketize` lookup runs 14-22x faster than the original argmin expansion. Four additional improvements are described: k-means++ codebook initialisation (75% lower init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5% at 0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4% vs same-budget plain), and Hadamard rotation exposed as a configurable parameter ($O(d \log d)$ vs $O(d^2)$).
 
+Separately from the extensions, we make the compression *real*: the shipped cache stores compact codes rather than decompressing to float, so quantization now reduces memory instead of only simulating its quality cost. On Qwen2.5-0.5B-Instruct this holds 2.5-3.6x fewer cache bytes than fp16 with per-vector norm sidecars counted, and cuts peak VRAM by up to 1.9x at ~14k tokens at equal throughput — a saving that grows with context and is absent below ~1k tokens, where the prefill attention matrix rather than the cache sets the peak (Section 5.4).
+
+Two caveats stated up front, because both were previously overstated. First, our measured compression ratios are roughly **half** the nominal $16/b$ figure, because that figure ignores the per-vector L2 norms the codec must store; we count them. Second, each extension is measured **in isolation**, against its own baseline. An earlier version of this paper claimed the gains "compound" when composed; that claim was never measured, is contradicted for one pair of stages by our own §3.3, and is withdrawn in Section 4.
+
 ---
 
 ## 1. Introduction
@@ -20,7 +24,9 @@ What it doesn't do is think about which tokens matter. At the same average bit-b
 
 These aren't obscure edge cases. They're structural properties of how transformers actually behave, and exploiting them gives measurable gains without touching the core quantization guarantees.
 
-The paper is organized around these five extensions, preceded by a description of the implementation improvements we made to the baseline. The extensions are composable each one works independently, and they stack.
+The paper is organized around these five extensions, preceded by a description of the implementation improvements we made to the baseline. Each extension works independently and is measured independently; whether they stack is examined, and left open, in Section 4.
+
+There is also a problem that is not about compression ratios at all. A KV cache quantizer that compresses and then immediately decompresses to float reproduces quantization's *quality cost* while banking none of its *memory benefit* — and that is what our own implementation did until recently, and what a surprising amount of published work measures. Section 5.4 reports what the cache actually holds, and Section 5.5 states how it is measured, because a compression result whose ruler is unspecified is not reproducible.
 
 ---
 
@@ -338,9 +344,45 @@ where $\hat{\mathbf{k}}_t^{(m)}$ is looked up from codebook $\mathcal{C}_m$ usin
 
 ## 4. Full Pipeline
 
-Each new KV pair passes through four stages before it is stored. The stages are independent each targets a different source of inefficiency so their gains compound.
+This section describes a pipeline the five extensions are *designed* to form. An
+earlier version of this paper opened it by asserting that "the stages are
+independent, so their gains compound." We are withdrawing that claim. It was
+never measured, and one part of it is contradicted by evidence printed a page
+earlier in this same paper.
 
-**Scope note.** The four stages below describe the composed pipeline the extensions are *designed* to form, and each stage is implemented and unit-tested as a standalone module. They are not, however, composed into the shipped `generate()` / `eval_ppl` path: that path runs Stage 3's scalar backend with outlier-aware Lloyd-Max, per-layer calibration, and GQA compensation, and the low-rank correction is applied only when `bits < 4`. Delta compression, attention-weighted assignment, adaptive reallocation, and Huffman coding are reachable through their own module APIs but are not on the default generation path, so the Section 5 numbers should be read as measuring Stage 3 alone. Composing the full pipeline end-to-end is left for future work.
+**What is actually shipped.** The default `generate()` path runs Stage 3's
+scalar backend only: outlier-aware Lloyd-Max, per-layer calibration, GQA
+compensation, with low-rank correction gated to `bits < 4`. Delta compression,
+attention-weighted assignment, adaptive reallocation and Huffman coding are
+reachable through their own module APIs but are **not** on the generation path.
+Every number in Section 5 therefore measures Stage 3 alone, and should be read
+that way.
+
+**Why "compound" was the wrong word.** The four stages are not interchangeable
+parts of one composition:
+
+- Stage 4 does not compose with Stage 3 — it *degrades* it. §3.3 measures this
+  directly: fresh 4-bit gives MSE 0.0096, demoting to 3-bit gives 0.0352, and
+  promoting back to 4-bit gives 0.0492, which is worse than the 3-bit state it
+  came from. Adaptive reallocation recompresses the already-dequantized
+  $\hat{\mathbf{k}}$, so each tier change compounds *error*, not gains. Stage 4
+  is also itself a bit-allocation policy over Stage 3, not a stage after it.
+- Stages 1 and 2 have never been run together, or with Stage 3, on a real model.
+  Each is unit-tested standalone on distilgpt2 activations. Their gains are
+  reported against separate baselines and cannot simply be multiplied.
+- Stage 3's two backends are mutually exclusive by construction (§7), so there
+  is no single pipeline that contains both.
+- Delta compression's measured *distortion* gain (§3.2) is not a *storage* gain:
+  the implementation retains dense reconstruction buffers, so it currently
+  stores more than no compression at all. §3.2 should be read as a distortion
+  result only.
+
+What can honestly be said is narrower: each stage targets a distinct source of
+inefficiency, and each shows a gain in isolation against its own baseline.
+Whether those gains survive composition is an open question, and a
+composition harness that reports it — including negative results — is the
+subject of ongoing work. We would rather state that than publish an
+unmeasured multiplication.
 
 **Stage 1 Delta compression.** Rather than compressing each token's key and value vectors in isolation, we compress the *change* from the previous token. Because adjacent KV vectors in a real generation stream are highly correlated, the delta is typically much smaller in magnitude than the absolute vector. The same bit-width therefore achieves lower distortion: 1.1--2.2x lower MSE across distilgpt2 layers (Section 3.2).
 
@@ -366,7 +408,15 @@ We evaluate perplexity (PPL) under KV cache quantization using the generation sc
 
 **Protocol.** Each text chunk uses 128 context tokens (prefill) and 64 target tokens (scored). We evaluate on 50 non-overlapping chunks. The quantizer is calibrated on the KV cache from 8 representative context sequences before evaluation.
 
-**Quantizer.** OutlierKVQuant with automatic outlier detection (`n_outlier = head_dim / 4`), outlier channels stored at `min(bits+1, 4)` bits and regular channels at `max(bits-1, 1)` bits. Low-rank correction uses randomized SVD with rank 4.
+**Quantizer.** OutlierKVQuant with automatic outlier detection (`n_outlier = head_dim / 4`), outlier channels stored at `bits + 1` and regular channels at `max(bits-1, 1)`, both capped at 8 (the Lloyd-Max solver's 256-centroid limit). Low-rank correction uses randomized SVD with rank 4.
+
+An earlier version capped `outlier_bits` at 4 before applying the GQA
+allowance. That made the outlier premium — the whole reason for a two-group
+split — collapse to 1 bit at $b=4$ and to 0 at $b=5$, at which point the codec
+paid for two quantizers, two rotations and two sets of norms to reproduce plain
+uniform quantization. Removing the cap changes nothing at or below $b=3$; at
+$b=4$ it costs 4.8% more payload bytes and lowers reconstruction error by 16%
+(0.001370 → 0.001150, measured over 24 layers of real prefill KV).
 
 ---
 
@@ -390,6 +440,100 @@ On distilgpt2, rank-4 correction brings 2-bit dPPL from +276.64 down to +10.89 r
 
 ---
 
+### 5.4 Memory Actually Saved
+
+Sections 5.2 and 5.3 measure quantization's *quality cost*. This section asks
+the question that motivates the whole exercise, and that our own implementation
+failed to answer honestly until recently: how much memory does it *save*?
+
+The distinction matters because the obvious implementation saves none. Compress
+the prefill, decompress it back to float, hand the float cache to the model, and
+you reproduce the distortion exactly while holding the same bytes you started
+with — plus, if only the prefill is compressed, every generated token stays at
+full precision forever. The cache described here (`compact_cache.CompactKVCache`)
+instead keeps codes as the storage of record: `update()` returns zero-length
+tensors and a custom attention function reads compressed blocks directly,
+dequantizing one block at a time inside the attention computation.
+
+**Cache bytes.** Qwen2.5-0.5B-Instruct, ~840-token prompt, 64 generated tokens,
+counted from the objects the cache actually holds:
+
+| bits | nominal $16/b$ | **measured** | sidecar share |
+|---|---|---|---|
+| 2 | 8.00x | **3.56x** | 22% |
+| 3 | 5.33x | **2.91x** | 18% |
+| 4 | 4.00x | **2.46x** | 15% |
+
+The measured figure is consistently **about half** the nominal one. The gap is
+not overhead we introduced: it is the per-vector float32 L2 norms the codec
+needs to reconstruct, which the nominal $16/b$ accounting silently omits — as
+does the source paper's (Section 2.1). At `head_dim = 64` with two norms per
+quantized vector, that is 15--22% of everything stored. We report it as
+`sidecar_bytes`, separately from `code_bytes`.
+
+**Peak VRAM.** This is context-dependent, and the reason is worth stating rather
+than burying: at short contexts the peak is set by the prefill chunk's attention
+matrix, which is identical in both paths, not by the cache.
+
+| context | float peak | compact peak | ratio |
+|---|---|---|---|
+| ~840 tok | 85.2 MiB | 85.2 MiB | 1.00x |
+| ~6.3k tok | 225.9 MiB | 154.9 MiB | 1.46x |
+| ~9.8k tok | 356.4 MiB | 205.1 MiB | 1.74x |
+| ~14k tok | 488.5 MiB | 260.4 MiB | 1.88x |
+
+($b=3$, `prefill_chunk_size=128`, 32 generated tokens.) Below roughly 1k tokens
+there is nothing to win; the saving grows with context, which is the regime the
+method exists for. Throughput is unchanged.
+
+**A retracted number.** An earlier draft of this section reported "1225 MiB →
+265 MiB, 4.6x". That was a measurement error, not a result. `generate()` loads
+and caches the model on first call, so the first arm measured absorbed ~959 MiB
+of model weights into its delta while the second was measured against a baseline
+that already contained them — 959 + 265 = 1224.6. We record it because the
+failure is easy to repeat and impossible to spot from the number alone: it is
+large, it points the right way, and it is entirely an artifact.
+
+---
+
+### 5.5 What Is Measured, and How
+
+A compression result whose measurement protocol is unstated cannot be
+reproduced, so we state ours.
+
+**Cache bytes** are counted by walking the live cache object and classifying
+every tensor it holds: `code_bytes` (bit-packed Lloyd-Max indices),
+`sidecar_bytes` (per-vector norms, channel permutations, codebooks), and
+`float_bytes` — the *pending window*, up to `block_size - 1` positions that have
+not yet filled a block and are still uncompressed. All three are included in the
+reported ratio. The pending window is why a ratio quoted without its context
+length is meaningless: unflushed, the same cache reads 3.56x at 128 generated
+tokens and 1.17x at 127.
+
+**Peak VRAM** uses `torch.cuda.max_memory_allocated` minus a baseline captured
+after `gc.collect()`, `empty_cache()` and `reset_peak_memory_stats()`. Three
+choices matter. The baseline is subtracted, and both arms must be measured
+against the *same* post-load baseline (see the retraction above). We read
+`memory_allocated`, not `memory_reserved`, because the reserved pool is sticky
+and would hide the saving. And the codec is warmed first: its Lloyd-Max
+codebooks are solved once per `(dim, num_bits)` into a process-global dict, and
+charging that ~9 MB to the cache makes the compact path read as worse than
+float. A self-test allocates a known 64 MiB and asserts the harness reports it
+within 10%, since a broken ruler otherwise proves whatever one likes.
+
+**Quality is judged on logits and perplexity, never on generated text.**
+Sampling makes text a bad instrument: with `repetition_penalty = 1.3`, a ~4e-4
+difference in reconstruction flips one greedy argmax and the continuation
+diverges permanently, which says nothing about the codec. On random-weight test
+fixtures it is worse than useless — deleting the causal mask entirely leaves the
+output byte-identical while moving maximum logit error from 0.068 to 2.07.
+Perplexity is scored against a pinned git blob rather than a file in this
+repository, after discovering that editing the file we had been scoring against
+moved the fp32 baseline from 22.90 to 35.21, which looks exactly like a quality
+regression and is not one.
+
+---
+
 ## 6. Related Work
 
 **KV cache compression.** The most common approaches evict tokens entirely. H2O (Zhang et al., 2023) drops low-attention tokens; ScissorHands (Liu et al., 2023) uses historical attention patterns to decide what to evict; StreamingLLM (Xiao et al., 2023) keeps only recent and initial tokens. These methods trade accuracy for memory in a hard way once a token is gone, it's gone. Our approach keeps all tokens but at variable precision.
@@ -404,7 +548,34 @@ On distilgpt2, rank-4 correction brings 2-bit dPPL from +276.64 down to +10.89 r
 
 ## 7. Discussion and Limitations
 
-**Composability.** The five extensions are designed to be stacked, but not all combinations are equally useful. Delta compression and attention-weighted bit assignment are complementary delta targets temporal correlation in absolute vectors, AWQ targets token importance. Low-rank correction is orthogonal to both. PQ, however, is a full replacement for the scalar KVQuantIP path and cannot be trivially combined with it at the same layer; it is best treated as an alternative quantization backend.
+**Composability — the largest open question in this paper.** The five extensions
+are *designed* to stack, and are argued to be complementary: delta targets
+temporal correlation in absolute vectors, AWQ targets token importance, low-rank
+correction is orthogonal to both, and PQ is a full replacement for the scalar
+path that cannot be combined with it at the same layer. But designed-to-compose
+is not measured-to-compose, and we have measured only the individual stages.
+Section 4 sets out why the earlier "gains compound" claim was withdrawn. Three
+specific obstacles are known and none is merely engineering:
+
+- **Adaptive reallocation degrades what it composes with.** §3.3's own numbers
+  show a promote-back-up landing at MSE 0.0492, worse than the 0.0352 state it
+  came from, because recompression operates on $\hat{\mathbf{k}}$ rather than
+  $\mathbf{k}$. Storing the original to make tier changes reversible would
+  defeat the purpose. This is a limitation, not a to-do.
+- **Delta's gain is distortion, not storage.** `DeltaKVCache` retains a dense
+  float reconstruction per token, so as implemented it stores *more* than no
+  compression at all. Dropping those buffers makes `get()` quadratic in $T$.
+  Neither variant is a compression win, and §3.2 must be read as a distortion
+  result only.
+- **Three incompatible tensor layouts** and a mix of sequential-per-token versus
+  batch-over-all-$T$ interfaces mean several pairs cannot currently be wired
+  together at all, independently of whether they would help.
+
+The honest summary is that "composes" is currently a design claim with unit-test
+support per stage, not an end-to-end measurement. Reporting *why* a pair does not
+compose is as much a result as reporting that it does, and a harness that emits
+machine-readable incompatibility reasons alongside metrics is the natural next
+step.
 
 **GQA amplification and compensation.** Models with Grouped Query Attention (GQA) share KV heads across multiple query heads. With a grouping factor $g = \text{num\_heads} / \text{kv\_heads}$, the effective per-attention-head distortion is:
 $$D_{\text{eff}} \approx g \cdot D_{\text{mse}}.$$
@@ -441,7 +612,28 @@ This aligns with the paper's framework: outlier channel detection should use eac
 
 **Calibration dependency.** PQ codebooks are trained on prefill KV vectors and held fixed during generation. If the generation distribution drifts significantly from the prefill distribution (e.g., very different topic or language), codebook quality degrades. Periodic re-calibration or online codebook updates are not implemented.
 
-**Scope of PPL evaluation.** Perplexity numbers are reported on a fixed 50-chunk evaluation with 128-token prefill and 64 target tokens. This captures steady-state quantization quality but does not measure latency, throughput, or memory footprint directly. Real deployment decisions require profiling on target hardware.
+**Scope of PPL evaluation.** Perplexity numbers are reported on a fixed 50-chunk evaluation with 128-token prefill and 64 target tokens. This captures steady-state quantization quality but does not measure latency or throughput. Real deployment decisions require profiling on target hardware.
+
+**Peak VRAM savings need long contexts.** Section 5.4 shows the compact cache
+gives no peak-memory advantage below roughly 1k tokens, because the prefill
+chunk's attention matrix — identical in both paths — dominates the peak there.
+The saving reaches 1.9x at ~14k tokens and is still growing, but any deployment
+below a few thousand tokens should expect the *byte* saving without the *peak*
+saving.
+
+**Attention weights in §3.1 are a proxy.** The 47--70% attention-weighted
+distortion reduction is computed with the last key vector standing in for the
+query, not with real attention weights from a forward pass. Real attention is
+considerably more peaked than that proxy, and `top_fraction = 0.5` is a poor
+match for a distribution where a few percent of tokens carry most of the mass.
+Re-measuring with captured weights may move this number, and may move it down;
+we would publish that outcome.
+
+**Small models are not a good showcase for aggressive bit-widths.** On
+Qwen2.5-0.5B the 2- and 3-bit configurations degrade badly (Section 5.4's
+companion perplexity run: 30.29 fp32 → 34.98 at 4-bit, but 95.69 at 3-bit).
+Smaller models have less redundancy to give up. The shipped default of `bits=3`
+is validated on larger models; on a 0.5B model, 4-bit is the usable floor.
 
 ---
 
@@ -451,9 +643,21 @@ The core insight behind KVQuant rotate into an approximately isotropic distribut
 
 Attention-weighted quantization aligns the bit budget with what the model actually attends to. Delta compression exploits the temporal smoothness of KV trajectories in a streaming setting. Adaptive allocation adjusts to importance that you couldn't have known at compression time. Low-rank correction recovers structure from an error that isn't as random as you might assume.
 
-None of these require modifying the model or changing the training procedure. They're all implemented as composable PyTorch modules in `kvquant/`, and they can be adopted in any combination. Four further improvements strengthen the implementation: k-means++ seeding reduces Lloyd-Max initialisation MSE by up to 75% at low bit-widths; K-V asymmetric quantization cuts V reconstruction error by 61.5% at a lower bit budget; combining delta compression with outlier-aware quantization reduces V MSE by 95.4% versus same-budget scalar; and Hadamard rotation is now a configurable parameter throughout the stack.
+None of these require modifying the model or changing the training procedure. They're all implemented as independent PyTorch modules in `kvquant/`. Whether they can be adopted *in combination* is, as Section 4 sets out, not yet established — each is measured alone. Four further improvements strengthen the implementation: k-means++ seeding reduces Lloyd-Max initialisation MSE by up to 75% at low bit-widths; K-V asymmetric quantization cuts V reconstruction error by 61.5% at a lower bit budget; combining delta compression with outlier-aware quantization reduces V MSE by 95.4% versus same-budget scalar; and Hadamard rotation is now a configurable parameter throughout the stack.
 
-Two additional fixes address non-MHA architectures. GQA models amplify effective distortion by $g$ (query heads per KV head); compensating with $\lceil \log_4 g \rceil$ extra bits per coordinate, capped at 8, restores generation quality on Qwen2.5-1.5B ($g=6$) and Qwen2.5-7B ($g=7$). Per-layer calibration of the outlier detector, rather than pooling KV data across all transformer layers, correctly identifies the layer-specific channels that carry anomalous variance. The full test suite passes cleanly.
+Separately from the extensions, the compression is now real rather than
+simulated. The shipped cache stores compact codes and never materialises the
+full float tensors, so the memory benefit is banked and not merely modelled:
+2.5--3.6x fewer cache bytes with sidecars counted, and up to 1.9x lower peak
+VRAM at long context. Getting there required building the measurement
+instruments first and then discovering that several of our own published figures
+were artifacts of how they were measured — a 4.6x VRAM claim that was really the
+model weights, a perplexity "regression" that was really an edited corpus, and
+an outlier bit schedule whose premium silently collapsed to zero. Section 5.5
+states the protocol for each remaining number so those can be checked rather
+than trusted.
+
+Two additional fixes address non-MHA architectures. GQA models amplify effective distortion by $g$ (query heads per KV head); compensating with $\lceil \log_4 g \rceil$ extra bits per coordinate, capped at 8, restores generation quality on Qwen2.5-1.5B ($g=6$) and Qwen2.5-7B ($g=7$). Per-layer calibration of the outlier detector, rather than pooling KV data across all transformer layers, correctly identifies the layer-specific channels that carry anomalous variance. Note that both of these are our own additions: the source paper never mentions grouped-query attention, and is explicitly data-oblivious, so neither has support there and both rest on the measurements above. The full test suite passes cleanly.
 
 ---
 
