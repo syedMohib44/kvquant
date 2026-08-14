@@ -21,7 +21,15 @@ def torch_seed() -> int:
     return 1234
 
 
-@pytest.fixture(scope="session")
+# Function-scoped, not session-scoped, on purpose.  Tests legitimately need to
+# move a model to CUDA or cast it to fp16, and a shared instance would carry
+# that state into every later test — producing device-mismatch and dtype errors
+# far from their cause.  Loading these tiny models is cheap; the weights come
+# from a cached snapshot or a local config, so per-test construction costs
+# little and buys full isolation.
+
+
+@pytest.fixture
 def tiny_model():
     """
     Small MHA causal LM (GPT-2 family).  `n_head == n_kv_head`, so this
@@ -37,7 +45,7 @@ def tiny_model():
     return model
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def tiny_gqa_model():
     """
     Small GQA causal LM: 8 query heads over 2 KV heads, so g == 4 and
@@ -61,10 +69,39 @@ def tiny_gqa_model():
     return model
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def gqa_factor(tiny_gqa_model) -> int:
     cfg = tiny_gqa_model.config
     return cfg.num_attention_heads // cfg.num_key_value_heads
+
+
+def make_ids(model, length: int, device=None) -> torch.Tensor:
+    """
+    Build a valid token-id sequence of ``length`` for ``model``.
+
+    Both limits here are easy to blow past by accident and fail in unhelpful
+    ways.  Token ids at or above ``vocab_size`` trip an embedding bounds assert
+    *on the device*, which poisons the CUDA context — every later test in the
+    session then fails during setup with an unrelated-looking error, so the
+    real cause is far from the reported failure.  Exceeding the model's position
+    limit fails just as obscurely.  Clamping both here keeps a test's intent
+    ("a long context") from silently becoming an invalid input.
+    """
+    cfg = model.config
+    vocab = getattr(cfg, "vocab_size")
+    max_pos = (
+        getattr(cfg, "n_positions", None)
+        or getattr(cfg, "max_position_embeddings", None)
+        or length
+    )
+    if length > max_pos:
+        raise ValueError(
+            f"{type(model).__name__} supports at most {max_pos} positions, "
+            f"asked for {length}"
+        )
+    ids = torch.arange(length) % (vocab - 1) + 1
+    ids = ids.unsqueeze(0)
+    return ids.to(device) if device is not None else ids
 
 
 @pytest.fixture(scope="session")

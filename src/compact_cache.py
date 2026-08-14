@@ -678,45 +678,78 @@ def compact_attention_forward(
     total_len = layer.get_seq_length()
     q_abs_start = total_len - q_len  # queries occupy the final q_len positions
 
-    # Accumulate in float32 even under fp16: the softmax denominator is a sum
-    # of exponentials over the whole context and loses precision quickly.
+    # Running softmax state, in float32 even when the model runs fp16: `l` is a
+    # sum of exponentials over the whole context, which loses precision and
+    # eventually overflows at half precision.
     q32 = query.to(torch.float32)
-    blocks = []
+    b, h_q, _, head_dim = q32.shape
+    running_max = torch.full(
+        (b, h_q, q_len, 1), float("-inf"), device=q32.device, dtype=torch.float32
+    )
+    running_sum = torch.zeros_like(running_max)
+    acc = torch.zeros(
+        (b, h_q, q_len, head_dim), device=q32.device, dtype=torch.float32
+    )
+
+    captured: list[Tensor] | None = [] if cache.capture_attn_weights else None
     k_abs = 0
+    saw_block = False
+
     for k_blk, v_blk in layer.iter_kv_blocks():
+        saw_block = True
         blk_len = k_blk.shape[-2]
         k_exp = _repeat_kv(k_blk.to(torch.float32), n_rep)
         v_exp = _repeat_kv(v_blk.to(torch.float32), n_rep)
+
         scores = torch.matmul(q32, k_exp.transpose(-2, -1)) * scaling
         scores = _causal_block_mask(scores, q_abs_start, k_abs)
-        blocks.append((scores, v_exp))
-        k_abs += blk_len
-        del k_blk, v_blk, k_exp
+        if attention_mask is not None:
+            # A provided mask carries padding information that self-built
+            # causality cannot know; slice out this block's key range.
+            span = attention_mask[..., k_abs : k_abs + blk_len]
+            if span.shape[-1] == blk_len:
+                scores = scores + span.to(scores.dtype)
 
-    if not blocks:
+        # Online (flash-style) softmax: rescale the running total to the new
+        # maximum rather than materializing the full (B, H, Tq, Tk) matrix.
+        block_max = scores.amax(dim=-1, keepdim=True)
+        new_max = torch.maximum(running_max, block_max)
+        probs = torch.exp(scores - new_max)
+        rescale = torch.exp(running_max - new_max)
+        # A block that is entirely masked gives -inf - -inf = nan; those rows
+        # contribute nothing, so force their correction factor to zero.
+        rescale = torch.where(
+            torch.isinf(running_max), torch.zeros_like(rescale), rescale
+        )
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        running_sum = running_sum * rescale + probs.sum(dim=-1, keepdim=True)
+        acc = acc * rescale + torch.matmul(probs, v_exp)
+        running_max = new_max
+
+        if captured is not None:
+            # Unnormalized, relative to the running max at this point; fixed up
+            # after the loop once the final max and denominator are known.
+            captured.append((probs, new_max))
+
+        k_abs += blk_len
+        del k_blk, v_blk, k_exp, v_exp, scores, probs
+
+    if not saw_block:
         raise RuntimeError(
             f"layer {layer_idx} holds no KV; the cache was never populated"
         )
 
-    # Phase 2 formulation: concatenate the per-block scores and take one
-    # softmax.  Correct and easy to verify against a stock model; Phase 3
-    # replaces it with a streaming online softmax that never builds the full
-    # score matrix.
-    all_scores = torch.cat([s for s, _ in blocks], dim=-1)
-    all_values = torch.cat([v for _, v in blocks], dim=-2)
-
-    if attention_mask is not None:
-        # Provided masks carry padding information that self-built causality
-        # cannot know about; honour it where the shapes line up.
-        trimmed = attention_mask[..., : all_scores.shape[-1]]
-        if trimmed.shape[-1] == all_scores.shape[-1]:
-            all_scores = all_scores + trimmed.to(all_scores.dtype)
-
-    weights = F.softmax(all_scores, dim=-1, dtype=torch.float32)
-    attn_output = torch.matmul(weights, all_values)
+    # Fully-masked query rows have a zero denominator; clamp so they yield zeros
+    # rather than NaN.
+    safe_sum = running_sum.clamp(min=torch.finfo(torch.float32).tiny)
+    attn_output = acc / safe_sum
     attn_output = attn_output.transpose(1, 2).contiguous().to(query.dtype)
 
-    if cache.capture_attn_weights:
+    if captured is not None:
+        weights = torch.cat(
+            [p * torch.exp(m - running_max) for p, m in captured], dim=-1
+        ) / safe_sum
         cache.captured_attn[layer_idx] = weights.detach()
         return attn_output, weights.to(query.dtype)
     return attn_output, None
