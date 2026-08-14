@@ -28,7 +28,7 @@ KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 
 | Delta compression MSE improvement | **1.1--2.2x** on correlated streams |
 | Low-rank correction MSE reduction | **~11%** at rank-4, ~19% at rank-8 |
 | Codebook lookup speedup vs argmin | **14--22x** (bucketize) |
-| Test suite | **88/88 passing** |
+| Test suite | **119/119 passing** |
 
 ---
 
@@ -84,7 +84,7 @@ Token importance evolves during generation. An EMA-based importance tracker dyna
 
 ### 7. Low-Rank Error Correction (Extension 4)
 
-Quantization error `R = K - k(cap)` is structured - its top singular vectors capture most of the error energy. A rank-r SVD correction reduces MSE by **~11% at rank-4** using only 6.3% extra storage.
+Quantization error `R = K - k(cap)` is structured - its top singular vectors capture most of the error energy. A rank-r SVD correction reduces MSE by **~11% at rank-4** using only 7.4% extra storage (at `T=360, d=64`; the overhead is `r(T+d)/(T*d)`, so it shrinks as context grows — 3.5% at `T=1024, d=128`).
 
 ![Low-Rank Correction](https://github.com/syedMohib44/kvquant/blob/main/plots/7_low_rank_correction.png?raw=true)
 
@@ -92,7 +92,7 @@ Quantization error `R = K - k(cap)` is structured - its top singular vectors cap
 
 ### 8. Entropy Coding
 
-Codebook indices are non-uniformly distributed after rotation. Huffman coding reduces storage toward the Shannon entropy - at 4-bit, d=128: ~5% savings.
+Codebook indices are non-uniformly distributed after rotation. Huffman coding reduces storage toward the Shannon entropy (3.771 bits at 4-bit, d=128) - the Huffman average is 3.815 bits, giving ~4.6% savings.
 
 ![Entropy Coding](https://github.com/syedMohib44/kvquant/blob/main/plots/8_entropy_coding.png?raw=true)
 
@@ -777,7 +777,7 @@ python -m kvquant.demo_llm --model Qwen/Qwen2.5-1.5B-Instruct --prompt "Explain 
 ## Running tests
 
 ```bash
-python -m pytest test_kvquant.py -v   # 88 tests, all pass
+python -m pytest test_kvquant.py -v   # 119 tests, all pass
 ```
 
 ---

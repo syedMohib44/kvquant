@@ -7,8 +7,10 @@ probabilities follow the area under each Voronoi cell of the codebook.
 Huffman coding exploits this non-uniformity to reduce the average
 bit-width toward the Shannon entropy.
 
-At b=4 the entropy is ~3.8 bits/coordinate (paper Table 1), giving ~4%
-compression on top of the raw 4-bit representation.
+At b=4, d=128 the Shannon entropy is 3.771 bits/coordinate and the Huffman
+average is 3.815, giving ~4.6% compression on top of the raw 4-bit
+representation.  (Huffman sits slightly above the entropy because it emits a
+whole number of bits per symbol; the entropy is the unreachable lower bound.)
 
 Classes
 -------
@@ -56,7 +58,7 @@ def codebook_probs(num_bits: int, dim: int) -> Tensor:
     Returns:
         probs: Tensor of shape (2**num_bits,) summing to 1.
     """
-    centroids, _ = build_codebook(num_bits, dim)  # (k,) scaled by 1/sqrt(d)
+    centroids, _ = build_codebook(num_bits, dim)  # (k,) already at sphere scale
     k = len(centroids)
     std = 1.0 / math.sqrt(dim)
 
@@ -190,8 +192,9 @@ def analyse(num_bits: int, dim: int) -> EntropyStats:
     Example::
 
         >>> from kvquant.entropy import analyse
-        >>> analyse(4, 128)
-        EntropyStats(raw_bits=4, entropy=3.816, huffman_avg=3.847, saving_pct=3.83)
+        >>> s = analyse(4, 128)
+        >>> round(s.entropy, 3), round(s.huffman_avg, 3), round(s.saving_pct, 2)
+        (3.771, 3.815, 4.62)
     """
     codec = HuffmanCodec(num_bits, dim)
     raw = float(num_bits)

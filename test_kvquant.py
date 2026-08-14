@@ -842,3 +842,83 @@ class TestPaperCodec:
             return ((t - t_hat).norm() / t.norm()).item()
 
         assert rel(4) < rel(2)
+
+
+# ---------------------------------------------------------------------------
+# Entropy coding  (paper Section 2.2.5)
+# ---------------------------------------------------------------------------
+
+
+class TestEntropyCoding:
+    """
+    Locks the entropy/Huffman figures quoted in the paper so they cannot
+    silently drift.  The paper previously reported the Huffman average
+    (3.815) as the Shannon entropy; these are distinct quantities and both
+    are asserted here.
+    """
+
+    @pytest.mark.parametrize(
+        "bits,expected_h",
+        [(2, 1.9129), (3, 2.8281), (4, 3.7715)],
+    )
+    def test_shannon_entropy_matches_paper(self, bits, expected_h):
+        from src.entropy import entropy_bits
+
+        assert entropy_bits(bits, D) == pytest.approx(expected_h, abs=1e-3)
+
+    def test_huffman_average_above_entropy_below_raw(self):
+        """
+        Huffman must sit strictly between the Shannon lower bound and the raw
+        bit-width: it emits whole bits per symbol so it cannot reach H, but it
+        must still beat the uncoded representation.  Paper quotes 3.815 at b=4.
+        """
+        from src.entropy import HuffmanCodec, entropy_bits
+
+        c = HuffmanCodec(num_bits=4, dim=D)
+        h = entropy_bits(4, D)
+        assert h < c.avg_bits < 4.0
+        assert c.avg_bits == pytest.approx(3.8151, abs=1e-3)
+        # ~4.6% saving vs raw 4-bit, as quoted in the paper
+        assert (4.0 - c.avg_bits) / 4.0 == pytest.approx(0.046, abs=5e-3)
+
+    def test_huffman_roundtrip_is_lossless(self):
+        from src.entropy import HuffmanCodec
+
+        torch.manual_seed(SEED)
+        c = HuffmanCodec(num_bits=4, dim=D)
+        idx = torch.randint(0, 16, (500,))
+        assert torch.equal(c.decode(c.encode(idx), idx.numel()), idx)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive tier changes are NOT lossless  (paper Section 3.3)
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptiveTierChangeIsLossy:
+    def test_promotion_does_not_recover_original(self):
+        """
+        Recompression runs on the already-dequantized k_hat, not the original
+        k, so a demote->promote cycle compounds error instead of undoing it.
+        The paper's Section 3.3 text is explicit about this; this test pins the
+        direction of the inequality so the claim cannot regress to "reversible".
+        """
+        torch.manual_seed(SEED)
+        x = torch.randn(64, D)
+        q4 = KVQuantMSE(dim=D, num_bits=4, seed=0)
+        q3 = KVQuantMSE(dim=D, num_bits=3, seed=0)
+
+        def rt(qz, t):
+            return qz.dequantize(qz.quantize(t))
+
+        def mse(a, b):
+            return float(((a - b) ** 2).mean())
+
+        fresh4 = mse(x, rt(q4, x))
+        demoted3 = rt(q3, x)
+        promoted = mse(x, rt(q4, demoted3))
+
+        # Promotion is strictly worse than a fresh 4-bit encode ...
+        assert promoted > fresh4
+        # ... and worse even than the 3-bit state it was promoted from.
+        assert promoted > mse(x, demoted3)

@@ -105,7 +105,7 @@ We also swap the dense QR rotation for a structured Hadamard rotation:
 $$\mathbf{y} \;=\; \frac{1}{\sqrt{d}}\, H(D \cdot \mathbf{x}),$$
 where $D = \mathrm{diag}(\pm 1)$ is a random sign flip matrix and $H$ is the Walsh-Hadamard transform. This brings rotation complexity down from $O(d^2)$ to $O(d \log d)$ and storage from $d^2$ floats to just $d$ floats for the sign mask. The randomization guarantee still holds (Ailon & Chazelle, 2006).
 
-On top of that: codebook indices are non-uniformly distributed under the sphere marginal, so Huffman coding can compress them further toward the Shannon entropy. At $b=4$, $d=128$ the entropy is 3.816 bits vs 4 raw, giving roughly 4% compression. It's not dramatic, but it's free.
+On top of that: codebook indices are non-uniformly distributed under the sphere marginal, so Huffman coding can compress them further toward the Shannon entropy. At $b=4$, $d=128$ the Shannon entropy is 3.771 bits vs 4 raw, and the Huffman average achieves 3.815 bits — roughly 4.6% compression. (Huffman lands slightly above the entropy because it emits a whole number of bits per symbol; the entropy is the lower bound it approaches, not a rate it attains.) It's not dramatic, but it's free.
 
 #### 2.2.6 Unit-Norm Fast Path in `KVQuantIP.quantize()`
 
@@ -255,7 +255,7 @@ Static bit allocation has an obvious limitation: you don't know which tokens wil
 
 The fix is an EMA over attention scores. Each token maintains a score:
 $$s_t \;\leftarrow\; \alpha \cdot s_{t-1} \;+\; (1-\alpha) \cdot a_t,$$
-where $a_t$ is the attention weight it receives at step $t$. As scores evolve, tokens move between four bit-width tiers: scores above $\tau_{\mathrm{hi}}$ stay at 4-bit, scores between $\tau_{\mathrm{mid}}$ and $\tau_{\mathrm{hi}}$ drop to 3-bit, scores between $\tau_{\mathrm{lo}}$ and $\tau_{\mathrm{mid}}$ drop to 2-bit, and anything below $\tau_{\mathrm{lo}}$ is evicted to 1-bit. Recompression happens when a token crosses a threshold. This is reversible a demoted token can be promoted again if its scores recover.
+where $a_t$ is the attention weight it receives at step $t$. As scores evolve, tokens move between four bit-width tiers: scores above $\tau_{\mathrm{hi}}$ stay at 4-bit, scores between $\tau_{\mathrm{mid}}$ and $\tau_{\mathrm{hi}}$ drop to 3-bit, scores between $\tau_{\mathrm{lo}}$ and $\tau_{\mathrm{mid}}$ drop to 2-bit, and anything below $\tau_{\mathrm{lo}}$ is evicted to 1-bit. Recompression happens when a token crosses a threshold. A demoted token can be promoted again if its scores recover, but promotion is *not* lossless: recompression operates on the already-dequantized $\hat{\mathbf{k}}$, not the original $\mathbf{k}$, so each tier change compounds error rather than undoing it. Measured on random Gaussian input ($d=128$): fresh 4-bit gives MSE 0.0096, demoting to 3-bit gives 0.0352, and promoting that back to 4-bit gives 0.0492 — worse than the 3-bit state it came from. Tier changes should therefore be treated as a bit-budget mechanism, not a reversible one, and the hysteresis counter matters for accuracy as well as cost.
 
 As an illustrative example: at short sequence lengths (12 tokens, distilgpt2 layer 0), no tokens get demoted since attention is fairly spread, and all 12 end up at 4-bit MSE of 0.017 vs 0.064 for uniform 3-bit. This is a single-layer observation under low attention peakedness. The adaptive behavior activates more visibly at longer sequences with more peaked attention distributions, which is exactly when it matters most; a full multi-layer, multi-length evaluation is left for future work.
 
@@ -316,13 +316,15 @@ where $\hat{\mathbf{k}}_t^{(m)}$ is looked up from codebook $\mathcal{C}_m$ usin
 
 Each new KV pair passes through four stages before it is stored. The stages are independent each targets a different source of inefficiency so their gains compound.
 
+**Scope note.** The four stages below describe the composed pipeline the extensions are *designed* to form, and each stage is implemented and unit-tested as a standalone module. They are not, however, composed into the shipped `generate()` / `eval_ppl` path: that path runs Stage 3's scalar backend with outlier-aware Lloyd-Max, per-layer calibration, and GQA compensation, and the low-rank correction is applied only when `bits < 4`. Delta compression, attention-weighted assignment, adaptive reallocation, and Huffman coding are reachable through their own module APIs but are not on the default generation path, so the Section 5 numbers should be read as measuring Stage 3 alone. Composing the full pipeline end-to-end is left for future work.
+
 **Stage 1 Delta compression.** Rather than compressing each token's key and value vectors in isolation, we compress the *change* from the previous token. Because adjacent KV vectors in a real generation stream are highly correlated, the delta is typically much smaller in magnitude than the absolute vector. The same bit-width therefore achieves lower distortion: 1.1--2.2x lower MSE across distilgpt2 layers (Section 3.2).
 
 **Stage 2 Attention-weighted bit assignment.** Before committing to a quantizer, we rank the tokens by how much attention the current query places on them. The top half get one extra bit; the bottom half give one bit back. The average bit-width is unchanged, but the bits go where the model actually looks. This cuts attention-weighted distortion by 47--70% per layer with no storage overhead (Section 3.1).
 
 **Stage 3 Quantization backend (choose one).** Two backends are available and are mutually exclusive per layer:
 
-- *KVQuantIP (default)* scalar Lloyd-Max quantization with inner-product-optimal K encoding and MSE-optimal V encoding. Low-rank error correction is applied on top: the quantization residual is approximated with a rank-4 SVD and added back, recovering ~11% of the remaining MSE at 7.4% extra storage. Huffman coding of the codebook indices is available as a final lossless step, saving ~4% at 4-bit.
+- *KVQuantIP (default)* scalar Lloyd-Max quantization with inner-product-optimal K encoding and MSE-optimal V encoding. Low-rank error correction is applied on top: the quantization residual is approximated with a rank-4 SVD and added back, recovering ~11% of the remaining MSE at 7.4% extra storage. Huffman coding of the codebook indices is available as a final lossless step, saving ~4.6% at 4-bit.
 
 - *ProductKVCache (alternative)* Product Quantization splits each vector into M subvectors and encodes each with its own k-means codebook. At M=16, b=8 this matches 3-bit scalar quality at 2-bit scalar storage. No low-rank correction is needed at this operating point because PQ already captures inter-dimension correlations that scalar quantization misses.
 
@@ -427,7 +429,7 @@ Attention-weighted quantization aligns the bit budget with what the model actual
 
 None of these require modifying the model or changing the training procedure. They're all implemented as composable PyTorch modules in `kvquant/`, and they can be adopted in any combination. Four further improvements strengthen the implementation: k-means++ seeding reduces Lloyd-Max initialisation MSE by up to 75% at low bit-widths; K-V asymmetric quantization cuts V reconstruction error by 61.5% at a lower bit budget; combining delta compression with outlier-aware quantization reduces V MSE by 95.4% versus same-budget scalar; and Hadamard rotation is now a configurable parameter throughout the stack.
 
-Two additional fixes address non-MHA architectures. GQA models amplify effective distortion by $g$ (query heads per KV head); compensating with $\lceil \log_4 g \rceil$ extra bits per coordinate, capped at 8, restores generation quality on Qwen2.5-1.5B ($g=6$) and Qwen2.5-7B ($g=7$). Per-layer calibration of the outlier detector, rather than pooling KV data across all transformer layers, correctly identifies the layer-specific channels that carry anomalous variance. The full test suite (88 tests) passes cleanly.
+Two additional fixes address non-MHA architectures. GQA models amplify effective distortion by $g$ (query heads per KV head); compensating with $\lceil \log_4 g \rceil$ extra bits per coordinate, capped at 8, restores generation quality on Qwen2.5-1.5B ($g=6$) and Qwen2.5-7B ($g=7$). Per-layer calibration of the outlier detector, rather than pooling KV data across all transformer layers, correctly identifies the layer-specific channels that carry anomalous variance. The full test suite (119 tests) passes cleanly.
 
 ---
 
@@ -624,7 +626,7 @@ Three performance and correctness issues were identified and fixed in the delta 
 
 With no anchor beyond the initial one, MSE accumulates to 0.116. A fixed `anchor_every=32` uses a second anchor but places it at position 32 after the drift at position 15 so it barely helps (MSE 0.116, essentially the same). Adaptive anchoring with `anchor_threshold=0.4` uses the same two anchors but fires the second one at position 15 exactly where the drift happens, reducing MSE to 0.00126 a **98.9% reduction** at zero extra anchor cost.
 
-All three fixes are covered by 10 new tests in `TestDeltaKVCache`; the full suite of 88 tests passes.
+All three fixes are covered by 10 new tests in `TestDeltaKVCache`; the full suite of 119 tests passes.
 
 ---
 
