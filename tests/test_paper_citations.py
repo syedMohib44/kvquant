@@ -46,6 +46,15 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 _SRC_DIRS = ("src", "tests")
 
+# Naming a fabricated section in order to say it is fabricated is the opposite
+# of the error this file guards, but a text scan cannot tell the two apart —
+# it flagged the very comments explaining why the bad citations were removed.
+# Loosening the patterns to allow "does not exist" nearby would be worse: it
+# would let a real citation through by writing the wrong prose around it.  So
+# the exemption is explicit and greppable instead.  A line carrying this marker
+# is a deliberate reference to a section that is NOT in the paper.
+_EXEMPT = "[non-existent-section]"
+
 # Each entry: (compiled pattern, why it is wrong).
 # The message is the point of the test — a bare match tells a future reader
 # nothing about which real section, if any, they should have cited.
@@ -114,6 +123,8 @@ def test_no_fabricated_paper_citations(pattern: re.Pattern[str], reason: str):
             continue
         text = path.read_text(encoding="utf-8")
         for lineno, line in enumerate(text.splitlines(), start=1):
+            if _EXEMPT in line:
+                continue
             if pattern.search(line):
                 rel = path.relative_to(_REPO).as_posix()
                 hits.append(f"  {rel}:{lineno}: {line.strip()}")

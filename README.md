@@ -14,7 +14,7 @@ Naïve quantization (uniform grid) fails because KV vectors have heavy-tailed ou
 
 KVQUANT compresses the KV cache from 16-bit floats down to 2–4 bits while preserving attention accuracy. It isolates outlier dimensions at higher precision, fits per-layer non-uniform codebooks to the actual KV distribution, and minimises distortion directly on the `<Q,K>` dot products rather than pointwise values.
 
-**Measured end-to-end**, on Qwen2.5-0.5B-Instruct with a ~300-token prompt and 64 generated tokens, `generate()` holds **2.6–3.6× fewer cache bytes** than fp16 and cuts **peak VRAM from 1225 MiB to 265 MiB (4.6×)** at equal throughput. Those numbers are counted from bytes actually resident, sidecars included — see [What is measured, and how](#what-is-measured-and-how). The nominal `16/bits` figure (4–8×) is roughly double the truth, because it ignores the per-vector norms the codec must store.
+**Measured end-to-end**, on Qwen2.5-0.5B-Instruct with a ~300-token prompt and 64 generated tokens, `generate()` holds **2.5–3.6× fewer cache bytes** than fp16 and cuts **peak VRAM from 1225 MiB to 265 MiB (4.6×)** at equal throughput. Those numbers are counted from bytes actually resident, sidecars included — see [What is measured, and how](#what-is-measured-and-how). The nominal `16/bits` figure (4–8×) is roughly double the truth, because it ignores the per-vector norms the codec must store.
 
 ---
 
@@ -42,7 +42,7 @@ make, and they need to stand on their own measurements:
 | `KVQuantMSE` for **both** K and V | Nothing. The paper never distinguishes keys from values, and never says which of its two quantizers to use for either. Our choice is pinned by `test_mse_key_reconstructs_far_better_than_ip`. |
 | Outlier channels chosen by **empirical per-channel variance** | The outlier split is a three-sentence aside in §4.3 with **no selection criterion** — no threshold, no statistic, no mention of whether the choice is static or calibrated. |
 | **Per-layer calibration** on real prefill KVs | Nothing. TurboQuant is explicitly *data-oblivious* ("apply instantly without needing data-specific tuning or calibrations", §1.2), so calibrating at all is a departure — one the outlier split forces on us. |
-| Bit schedule `outlier=min(b+1,4)`, `regular=max(b-1,1)` | The paper gives one configuration and no formula to generalise it. |
+| Bit schedule `outlier=b+1`, `regular=max(b-1,1)`, both capped at 8 | The paper gives one configuration and no formula to generalise it. |
 | **GQA bump** `+ceil(log4(g))` | Nothing. Grouped-query attention is never mentioned outside a bibliography entry. |
 | **Hadamard** rotation for power-of-2 dims | Nothing. The paper says only "a random rotation matrix"; fast/structured transforms are never discussed. Sound (Ailon & Chazelle 2006), but ours. |
 | **det(Π) = +1** (SO(d), not O(d)) | Nothing. The determinant is never discussed, and the paper's argument holds for reflections too. We pin it so the QR and Hadamard backends stay interchangeable. |
@@ -66,7 +66,7 @@ norms as `sidecar_bytes` and report them separately.
 | Delta compression MSE improvement | **1.1--2.2x** on correlated streams |
 | Low-rank correction MSE reduction | **~11%** at rank-4, ~19% at rank-8 |
 | Codebook lookup speedup vs argmin | **14--22x** (bucketize) |
-| Measured cache-byte reduction, end to end | **2.6--3.6x** (sidecars included) |
+| Measured cache-byte reduction, end to end | **2.5--3.6x** (sidecars included) |
 | Measured peak-VRAM reduction, end to end | **4.6x** (1225 -> 265 MiB) |
 | Test suite | full suite green; counts change every commit, so run `pytest tests/` |
 
@@ -438,7 +438,7 @@ python -m kvquant.demo_llm --model Qwen/Qwen2.5-7B-Instruct --weights offload \
     --prompt "What is machine learning?" --max-new-tokens 40
 
 # 4-bit weights + KV-cache offload on an 8 GB GPU (paper-outlier codec, bits=4).
-# The GQA bump is applied automatically for Qwen2.5-7B (g=7 → effective 5.25 bits).
+# The GQA bump is applied automatically for Qwen2.5-7B (g=7 → effective 5.5 bits).
 python run_offload.py --model Qwen/Qwen2.5-7B-Instruct --weights 4bit \
     --offload-to-disk --offload-codec paper-outlier --bits 4 --device cuda \
     --prompt "Explain machine learning"
@@ -557,7 +557,7 @@ models — Qwen2.5-7B, Llama-3, most modern 7B+ checkpoints — share each KV he
 across `g = n_heads / n_kv_heads` query heads, which amplifies quantization error by
 ~`g`×. To hold quality constant the codec adds `ceil(log4(g))` bits per coordinate to
 **both** the outlier and regular channels (Qwen2.5-7B has `g=7` → +2 bits, so
-`bits=4` is stored at an *effective* 5.25 bits/dim). This matches the in-memory path
+`bits=4` is stored at an *effective* 5.5 bits/dim). This matches the in-memory path
 and is applied for you — you still pass `bits=4`; the bump happens internally and is
 reflected in the reported `avg_bits_per_dim`. Without it, a GQA model under-quantizes
 and generates gibberish, so **don't try to hand-tune around it** — just pick 3 or 4.
@@ -888,9 +888,23 @@ continuation diverges, which says nothing about codec quality. On a random-weigh
 test fixture it is worse than useless — deleting the causal mask entirely leaves
 the output byte-identical while moving max logit error from 0.068 to 2.07.
 
-Perplexity on held-out text (Qwen2.5-0.5B-Instruct, 256-token context):
-fp32 baseline **22.90**; 4-bit **30.35**, 3-bit **38.93**, 2-bit **46.35**.
-Monotone in bits, as reconstruction error is at every level of the codec.
+**Perplexity** (Qwen2.5-0.5B-Instruct, 256-token context, scored on the 512-token
+prefix of `PAPER.md` at commit `8a62b7c` — a pinned git blob, so editing this
+repo cannot move the number):
+
+| | fp32 | 4-bit | 3-bit | 2-bit |
+|---|---|---|---|---|
+| perplexity | 30.29 | **34.98** | 95.69 | 131.70 |
+
+Monotone in bits, as reconstruction error is at every level of the codec. Use a
+fixed corpus for this: an earlier version scored against `README.md`, and editing
+the README moved the fp32 baseline from 22.90 to 35.21, which looks exactly like
+a quality regression and is not one.
+
+The 3-bit and 2-bit numbers are poor on a 0.5B model — small models have less
+redundancy to spare. Treat `bits=4` as the usable default here and `bits=3` as
+the floor on larger models, rather than reading the shipped default as validated
+at every scale.
 
 ---
 

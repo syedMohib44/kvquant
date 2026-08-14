@@ -351,10 +351,12 @@ def _build_quantized_cache(
     # One KVCacheQuantizer PER LAYER, each calibrated on its own layer's KV
     # (pooling across layers mis-identifies the per-layer outlier channels).
     # MSE-for-K makes reconstruction faithful for generation.  The
-    # outlier_bits=min(bits+1,4) / regular_bits=max(bits-1,1) schedule is our
+    # outlier_bits=bits+1 / regular_bits=max(bits-1,1) schedule is our
     # generalisation of the single worked example in §4.3 — the paper gives one
     # configuration and no formula.  (Its stated example, 32@3 + 96@2 = "2.5"
-    # bits, actually averages 2.25; see the note in outlier.py.)
+    # bits, actually averages 2.25; see the note in outlier.py.)  Left implicit
+    # rather than passed: KVCacheQuantizer derives exactly this, and passing a
+    # capped copy is how the three schedules drifted apart in the first place.
     kvc = []
     for k, v in kvs:
         k3 = k.reshape(-1, k.shape[-2], head_dim)
@@ -364,8 +366,6 @@ def _build_quantized_cache(
             num_bits=bits,
             use_outlier=True,
             n_outlier=n_outlier,
-            outlier_bits=min(bits + 1, 4),
-            regular_bits=max(bits - 1, 1),
             gqa_factor=gqa,
             k_quantizer_cls=KVQuantMSE,
         )

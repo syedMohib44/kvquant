@@ -94,33 +94,34 @@ def _make_outlier_quantizer(
     g query heads share one KV head, so a quantization error in that head is
     amplified across all g of them.
 
-    Mirrors ``KVCacheDiskOffload._get_outlier_q`` exactly, including the
-    cap-then-bump order: ``outlier_bits`` is capped at 4 *first*, then the GQA
-    allowance is added.  Doing it the other way round reports a bit-width that
-    differs from what is actually stored.
+    Mirrors ``KVCacheDiskOffload._get_outlier_q`` exactly.
 
-    On the cap order specifically
-    -----------------------------
-    Cap-then-bump makes ``bits=3`` and ``bits=4`` share an outlier width: both
-    cap to 4, then bump to 4+ge.  Only ``regular_bits`` separates them.  That
-    reads like a saturation bug, and bump-then-cap is the obvious "fix", so it is
-    worth recording why it was measured and rejected.
+    Why the cap is at 8 and not 4
+    ------------------------------
+    This used to cap ``outlier_bits`` at 4 before adding the GQA allowance,
+    justified by a citation to a "paper §5.1" [non-existent-section] — the paper
+    ends at §4.4 and prescribes no schedule at all.  The cap had a real cost:
+    it made the outlier premium (``outlier_bits - regular_bits``) collapse
+    exactly where the codec is supposed to be most faithful.
 
-    Measured on Qwen2.5-0.5B (d=64, g=7, ge=2), 24 layers of real prefill KV,
-    relative reconstruction error against payload bytes:
+        premium at b=2  b=3  b=4  b=5
+          capped at 4:    2    2    1    0
+          capped at 8:    2    2    2    2
 
-        b=4 cap-then-bump   ob=6 rb=5   avg 5.25   1032192 B   0.001370
-        b=4 bump-then-cap   ob=7 rb=5   avg 5.50   1081344 B   0.001150
+    At ``bits=5`` the capped schedule gave outliers *no* extra bits — the
+    outlier codec silently degenerated into uniform quantization while still
+    paying for two separate quantizers, two rotations and two sets of norms.
+    That is a defect, not a trade-off.  The premium is now constant at 1 bit
+    before the GQA allowance, and 8 is the real limit (``_pack_indices``
+    asserts ``num_bits <= 8``).
 
-    Bump-then-cap is better, but only by spending 4.8% more bytes for 16% less
-    error — it is not a free win, it is a different point on the same curve, and
-    a 5-bit-wide sweep at fixed byte budget shows both sit on it.  Changing the
-    order would shift every stored bit-width and invalidate the measured figures
-    in PAPER.md and the README for no clear gain.  Someone who wants more
-    fidelity should raise ``bits``, which is the knob that exists for it.
+    The cost is honest and small: at b=4 on Qwen2.5-0.5B this spends 4.8% more
+    payload bytes for 16% lower reconstruction error (measured over 24 layers of
+    real prefill KV: 0.001370 -> 0.001150).  Nothing below b=4 changes at all,
+    so the shipped default (``bits=3``) is unaffected.
     """
     gqa_extra = math.ceil(math.log(gqa_factor, 4)) if gqa_factor > 1 else 0
-    outlier_bits = min(min(bits + 1, 4) + gqa_extra, 8)
+    outlier_bits = min(bits + 1 + gqa_extra, 8)
     regular_bits = min(max(max(bits - 1, 1) + gqa_extra, 1), 8)
     n_outlier = min(max(dim // 4, 1), dim - 1)
     return OutlierKVQuant(

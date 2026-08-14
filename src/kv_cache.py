@@ -597,7 +597,7 @@ class KVCacheDiskOffload:
             # Our generalisation of the paper's single §4.3 example (32 of 128
             # channels at 3 bits, the remaining 96 at 2):
             #   n_outlier    = head_dim / 4        (32 of 128 — the paper's fraction)
-            #   outlier_bits = min(bits + 1, 4)
+            #   outlier_bits = bits + 1
             #   regular_bits = max(bits - 1, 1)
             # At d=128 that gives b=2 -> 32@3 + 96@1 = 1.50 bits/coord, and
             # b=3 -> 32@4 + 96@2 = 2.50.  The paper supplies no formula, no
@@ -610,12 +610,16 @@ class KVCacheDiskOffload:
             # GQA compensation: bump BOTH groups by gqa_extra so a grouped-query
             # model (Qwen2.5-7B, g=7 -> +2) stores enough effective bits.  This is
             # entirely ours — the paper never mentions grouped-query attention.
-            # The base config is capped at min(b+1,4)/max(b-1,1) FIRST, then
-            # gqa_extra is added (capped at 8-bit) — the exact same order
-            # KVCacheQuantizer uses in-memory, so the reported avg_bits matches
-            # what is actually stored.
+            #
+            # Both groups are capped at 8, the codec's real limit (_pack_indices
+            # asserts num_bits <= 8).  outlier_bits used to be capped at 4 first,
+            # on the strength of a "paper §5.1" [non-existent-section] citation;
+            # that made the outlier premium collapse to 1 bit at b=4 and 0 at b=5,
+            # silently turning this into uniform quantization while still paying
+            # for two quantizers.  See _make_outlier_quantizer in compact_cache.py,
+            # which must stay identical to this (test_bit_schedules_agree).
             ge = self._gqa_extra
-            ob = min(min(b + 1, 4) + ge, 8)
+            ob = min(b + 1 + ge, 8)
             rb = min(max(max(b - 1, 1) + ge, 1), 8)
             # clamp n_outlier to leave >=1 regular channel on odd head dims.
             n_outlier = min(max(dim // 4, 1), dim - 1)
