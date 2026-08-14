@@ -47,5 +47,8 @@ packages = ["kvquant", "kvquant.csrc"]
 "kvquant.csrc" = "src/csrc"
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "cuda: requires a CUDA device (skipped otherwise)",
+]
