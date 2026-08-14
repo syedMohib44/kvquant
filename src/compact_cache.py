@@ -118,6 +118,22 @@ class CompactKVLayer:
     ``kvs_from_cache`` and ``Cache.__getitem__``/``__iter__`` read them
     directly; ``None`` would crash those, while a zero-length tensor keeps the
     structure valid and carries no data.
+
+    **The pending window is real memory.**  Tokens accumulate in float until
+    they fill a block, so up to ``block_size - 1`` positions are uncompressed
+    at any moment.  That cost is fixed while the compressed part grows, so the
+    achieved ratio is context-dependent and approaches the steady state from
+    below.  Measured on a 2-layer GQA model at 3 bits, ``block_size=128``, with
+    a 64-token tail:
+
+        T=192  1.17x     T=1088  2.62x
+        T=320  1.60x     T=2112  3.00x
+        T=576  2.12x     T=4160  3.25x     -> 3.56x fully flushed
+
+    At short contexts the tail dominates, and unflushed it can push total bytes
+    *above* float16 (0.88x at T=255 before ``flush()`` existed).  Hence
+    ``flush()`` at the end of prefill.  A ratio quoted without its context
+    length is not a meaningful number for this cache.
     """
 
     is_sliding = False
@@ -207,6 +223,30 @@ class CompactKVLayer:
 
         return key_states[..., :0, :], value_states[..., :0, :]
 
+    def flush(self) -> None:
+        """
+        Compress the pending window as a short block.
+
+        Blocks need not be uniform: the attention loop reads each block's
+        length from its own shape, and the codec's norms are per-vector, so a
+        128-token block and a 7-token block cost the same per token.  The only
+        per-block waste is bit-packing padding to a byte boundary — under two
+        bytes.
+
+        Worth calling once when a burst of tokens ends (end of prefill), and
+        not on every decode step: it leaves each token compressed exactly once
+        either way, but per-step flushing pays a codec call per layer per token
+        for no storage gain.  Left un-flushed, the tail stays float, which at
+        short contexts can be most of the cache — 127 of 255 tokens at the
+        default block size, enough to put total bytes *above* float16.
+        """
+        if self._pending_k is None or self._pending_k.shape[-2] == 0:
+            return
+        self._k_blocks.append(self._compress(self._pending_k, is_value=False))
+        self._v_blocks.append(self._compress(self._pending_v, is_value=True))
+        self._pending_k = None
+        self._pending_v = None
+
     def get_seq_length(self, cache_position=None) -> int:
         """
         Total positions represented, blocks plus pending.
@@ -235,31 +275,45 @@ class CompactKVLayer:
         """
         Truncate to ``max_length`` positions.
 
-        Whole blocks are dropped; a cut that lands inside a stored block can
-        only be honoured down to that block's boundary, since re-encoding the
-        partial block would violate compress-exactly-once.  The generation
-        path avoids needing this by prefilling one token short instead.
+        Whole blocks are dropped; a cut landing inside a stored block can only
+        be honoured down to that block's boundary, since re-encoding the
+        partial block would violate compress-exactly-once.  The result is
+        therefore a *lower* bound on ``max_length``, and ``_cum_len`` is set to
+        what is genuinely stored rather than what was asked for — reporting a
+        length longer than ``iter_kv_blocks`` yields would misalign every
+        subsequent causal mask.  The generation path sidesteps the whole
+        question by prefilling one token short instead of cropping.
         """
         if max_length >= self._cum_len:
             return
         if max_length < 0:
             max_length = max(self._cum_len + max_length, 0)
 
-        n_whole = max_length // self.block_size
+        # Walk each block's own length rather than assuming all hold
+        # `block_size` tokens: `flush()` seals a short tail block, so blocks
+        # are not uniform and `max_length // block_size` would cut in the
+        # wrong place after one.
+        kept = 0
+        n_whole = 0
+        for blk in self._k_blocks:
+            blk_len = blk.shape[-2]
+            if kept + blk_len > max_length:
+                break
+            kept += blk_len
+            n_whole += 1
         if n_whole < len(self._k_blocks):
             del self._k_blocks[n_whole:]
             del self._v_blocks[n_whole:]
-        kept = len(self._k_blocks) * self.block_size
-        keep_pending = max_length - kept
+
+        have_pending = 0 if self._pending_k is None else self._pending_k.shape[-2]
+        keep_pending = min(max(max_length - kept, 0), have_pending)
         if keep_pending <= 0:
             self._pending_k = None
             self._pending_v = None
-            self._cum_len = kept
         else:
-            if self._pending_k is not None:
-                self._pending_k = self._pending_k[..., :keep_pending, :]
-                self._pending_v = self._pending_v[..., :keep_pending, :]
-            self._cum_len = kept + keep_pending
+            self._pending_k = self._pending_k[..., :keep_pending, :].contiguous()
+            self._pending_v = self._pending_v[..., :keep_pending, :].contiguous()
+        self._cum_len = kept + keep_pending
 
     def offload(self) -> None:
         """Move stored codes (not the empty `keys`) to host memory."""
@@ -538,14 +592,28 @@ class CompactKVCache:
         for layer, (k, v) in zip(self.layers, kvs):
             layer.calibrate(k, v)
 
-    def ingest(self, kvs: list[tuple[Tensor, Tensor]]) -> None:
-        """Feed float prefill KV into the compact layers, block by block."""
+    def ingest(self, kvs: list[tuple[Tensor, Tensor]], flush: bool = True) -> None:
+        """
+        Feed float prefill KV into the compact layers, block by block.
+
+        Flushes the tail by default: prefill is a one-shot burst, so any
+        remainder below ``block_size`` would otherwise stay float for the rest
+        of the run.  Pass ``flush=False`` to ingest in several calls and seal
+        the tail only after the last.
+        """
         if len(kvs) != len(self.layers):
             raise ValueError(
                 f"expected {len(self.layers)} (k, v) pairs, got {len(kvs)}"
             )
         for layer, (k, v) in zip(self.layers, kvs):
             layer.update(k, v)
+            if flush:
+                layer.flush()
+
+    def flush(self) -> None:
+        """Seal every layer's pending window into a short block."""
+        for layer in self.layers:
+            layer.flush()
 
     def byte_breakdown(self):
         """Measured storage across all layers, payload vs sidecar."""

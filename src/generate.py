@@ -39,6 +39,7 @@ from .kv_cache import (
     crop_model_cache,
     KVCacheDiskOffload,
 )
+from .compact_cache import CompactKVCache, DEFAULT_BLOCK_SIZE
 from .quantizer import KVQuantMSE
 
 
@@ -376,6 +377,72 @@ def _build_quantized_cache(
     return past, avg_bits, T_p, ids
 
 
+def _build_compact_cache(
+    mdl, input_ids, bits, prefill_chunk_size: int = 512,
+    block_size: int = DEFAULT_BLOCK_SIZE, codec: str = "paper-outlier",
+):
+    """
+    Prefill into a cache that stores compressed codes, and return it ready to
+    generate from.
+
+    This is the path that actually saves VRAM.  ``_build_quantized_cache``
+    compresses the prefill and immediately decompresses it back to float, so it
+    measures quantization's *quality* cost while banking none of its memory
+    benefit — and it only ever touches the prefill, because the cache the model
+    mutates during generation is a plain float ``DynamicCache``.  Here the codes
+    are the storage of record for prefill and every generated token alike.
+
+    Sequencing matters and is not interchangeable:
+
+    1. Prefill ``ids[:, :-1]`` into an ordinary float cache.  One token short so
+       the caller can feed the final token itself and get first-token logits at
+       the right position — the same invariant ``crop_model_cache`` enforces for
+       the float path, obtained here without a crop, since truncating inside an
+       already-compressed block would mean re-encoding it and breaking
+       compress-exactly-once.
+    2. Calibrate each layer on *that layer's own* prefill KV (paper §399-412).
+       Outlier channels are layer-specific; pooling across layers mis-identifies
+       them.
+    3. Ingest the float KV block by block, then drop the float cache.
+
+    Calibration must precede ingest: a layer that compresses before it is
+    calibrated falls back to fitting on its first block alone, which is a
+    smaller and less representative sample than the full prefill.
+
+    Returns ``(cache, avg_bits, T_p, ids)`` where ``avg_bits`` is *measured*
+    from what is stored — sidecar norms included — not the nominal bit-width.
+    """
+    device = _model_device(mdl)
+    ids = input_ids.to(device)
+    T_p = ids.shape[1]
+
+    n_heads, n_kv_heads, _ = _model_dims(mdl)
+
+    # Prefill one token short (see docstring) in a float cache we then discard.
+    float_cache = _chunked_prefill(mdl, ids[:, : T_p - 1], prefill_chunk_size)
+    kvs = kvs_from_cache(float_cache)
+    if not kvs:
+        raise RuntimeError(
+            "prefill produced no KV tensors; the compact cache cannot be built. "
+            "Pass compact_cache=False for this model."
+        )
+
+    cache = CompactKVCache(
+        n_layers=len(kvs),
+        bits=bits,
+        block_size=block_size,
+        codec=codec,
+        gqa_factor=n_heads // n_kv_heads,
+    )
+    cache.calibrate_from(kvs)
+    cache.ingest(kvs)
+
+    del kvs, float_cache
+    _gpu_gc()
+
+    return cache, cache.avg_bits_per_dim, T_p, ids
+
+
 def _build_offload(max_vram_tokens, warm_size, disk_dir, offload_codec="paper-outlier",
                    bits=3, device=None, gqa_factor=1):
     """
@@ -415,6 +482,161 @@ def _gpu_gc():
         torch.cuda.empty_cache()
 
 
+def _check_cache_mode(compact_cache: bool, offload_to_disk: bool) -> None:
+    """
+    Reject the one combination that would compress twice.
+
+    Both paths are lossy codecs over the same tensors, and the disk tier would
+    be handed an already-dequantized reconstruction to re-encode.  Lloyd-Max
+    error compounds under re-encoding — measured in PAPER.md §3.3, where a
+    4-bit value demoted to 3 bits and promoted back lands at MSE 0.0492, worse
+    than the 3-bit state it came from.  Choosing silently for the caller would
+    hide that; raising names the tradeoff instead.
+    """
+    if compact_cache and offload_to_disk:
+        raise ValueError(
+            "compact_cache=True and offload_to_disk=True cannot be combined: "
+            "both compress the same KV, and running one over the other's "
+            "output compounds quantization error. Choose one — "
+            "compact_cache=True keeps compressed codes in VRAM (fast, "
+            "~4-5x smaller), offload_to_disk=True spills them to SSD (slower, "
+            "for contexts that exceed RAM). Pass compact_cache=False to use "
+            "the offload path."
+        )
+
+
+def _compact_decode(
+    mdl, tok, input_ids, bits, max_new_tokens, temperature, top_p,
+    repetition_penalty, prefill_chunk_size, block_size,
+):
+    """
+    Run the whole compact-cache generation loop, yielding one token id tensor
+    at a time and finally the cache itself.
+
+    A generator so ``generate()`` and ``stream()`` share one implementation
+    rather than two copies that can drift apart — the float path's duplication
+    is exactly how its offload and in-memory branches came to differ in their
+    ``_gpu_gc`` throttling.  ``stream()`` decodes each yielded token as it
+    arrives; ``generate()`` drains the generator and joins.
+
+    The model stays attached to the compact attention implementation for the
+    entire loop.  ``attached()`` is the single mechanism that restores it — on
+    normal exit, on an exception, and on ``GeneratorExit`` when a caller
+    abandons a partly-consumed stream.  Deliberately not belt-and-braces with a
+    second ``finally: cache.detach()``: a redundant restore makes the primary
+    one untestable, since breaking either alone leaves the model correctly
+    restored by the other.
+    """
+    cache, _, _T_p, ids = _build_compact_cache(
+        mdl, input_ids, bits, prefill_chunk_size, block_size
+    )
+    suppress_ids = _get_suppress_ids(tok)
+
+    with cache.attached(mdl):
+        # The cache already holds positions 0..T_p-2 (prefilled one short), so
+        # feeding the final prompt token puts it at the right position.
+        with torch.no_grad():
+            out = mdl(ids[:, -1:], past_key_values=cache, use_cache=True)
+        logits = _suppress(out.logits[:, -1, :], suppress_ids)
+
+        next_tok = _sample_next(logits, temperature, top_p)
+        seen_ids = ids[0].tolist()
+        seen_ids.append(next_tok.item())
+        yield next_tok
+
+        for step_i in range(max_new_tokens - 1):
+            if next_tok.item() == tok.eos_token_id:
+                break
+            with torch.no_grad():
+                step = mdl(next_tok, past_key_values=cache, use_cache=True)
+            logits = _suppress(step.logits[:, -1, :], suppress_ids)
+            logits = _apply_repetition_penalty(
+                logits, seen_ids, repetition_penalty
+            )
+            next_tok = _sample_next(logits, temperature, top_p)
+            seen_ids.append(next_tok.item())
+            yield next_tok
+            if step_i % 64 == 63:
+                _gpu_gc()
+
+    # Seal the decode tail before anyone measures.  Generated tokens land in
+    # the same pending window as prefill, so a run that stops mid-block leaves
+    # up to block_size-1 positions in float — which makes the achieved ratio
+    # sawtooth with max_new_tokens rather than describe the codec: measured
+    # 3.56x at 128 generated tokens but 1.17x at 127, on the same prompt.
+    # Generation is over here, so there is nothing to lose by compressing the
+    # remainder, and each token is still compressed exactly once.
+    cache.flush()
+
+    # Yielded last so the caller can report measured storage.  Everything
+    # before this is a token; this is the cache.
+    yield cache
+
+
+def _stream_compact(
+    mdl, tok, input_ids, bits, max_new_tokens, temperature, top_p,
+    repetition_penalty, prefill_chunk_size, block_size,
+):
+    """
+    Yield text fragments from the compact decode loop.
+
+    Re-decodes the whole token list each step and yields only the tail, rather
+    than decoding tokens individually: byte-level BPE tokenizers split
+    multi-byte characters across tokens, so a per-token decode emits U+FFFD
+    replacement characters mid-emoji.  Fragments still containing U+FFFD are
+    held back until the next token completes the sequence.
+    """
+    generated: list[torch.Tensor] = []
+    prev_len = 0
+    for item in _compact_decode(
+        mdl, tok, input_ids, bits, max_new_tokens, temperature, top_p,
+        repetition_penalty, prefill_chunk_size, block_size,
+    ):
+        if isinstance(item, CompactKVCache):
+            continue  # not `break`: let the inner generator run its own finally
+        generated.append(item)
+        text = tok.decode(
+            torch.cat(generated, dim=1)[0], skip_special_tokens=True
+        )
+        fragment = text[prev_len:].replace("�", "")
+        if fragment:
+            yield fragment
+        prev_len = len(text)
+
+
+def _generate_compact(
+    mdl, tok, model, prompt, input_ids, bits, max_new_tokens, temperature,
+    top_p, repetition_penalty, prefill_chunk_size, block_size,
+) -> "GenerateResult":
+    """Drain the compact decode loop into a GenerateResult with measured bytes."""
+    generated: list[torch.Tensor] = []
+    cache = None
+    for item in _compact_decode(
+        mdl, tok, input_ids, bits, max_new_tokens, temperature, top_p,
+        repetition_penalty, prefill_chunk_size, block_size,
+    ):
+        if isinstance(item, CompactKVCache):
+            cache = item
+        else:
+            generated.append(item)
+
+    text = _clean_text(
+        tok.decode(torch.cat(generated, dim=1)[0], skip_special_tokens=True)
+    )
+    breakdown = cache.byte_breakdown()
+    return GenerateResult(
+        text=text,
+        bits=bits,
+        avg_bits_per_dim=breakdown.bits_per_coord,
+        compression_ratio=breakdown.compression_ratio,
+        model=model,
+        prompt=prompt,
+        cache_bytes=breakdown.total,
+        sidecar_bytes=breakdown.sidecar_bytes,
+        measured=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public result type
 # ---------------------------------------------------------------------------
@@ -427,11 +649,35 @@ class GenerateResult:
     bits: int
     """Nominal bit-width requested."""
     avg_bits_per_dim: float
-    """Effective bits/dim after GQA compensation."""
+    """
+    Bits per KV coordinate.
+
+    On the compact path this is *measured* from the bytes actually held at the
+    end of generation, side information included — the per-vector float32 norms
+    the codec stores alongside the packed indices are real memory and are
+    counted here.  It is therefore higher than the nominal bit-width, and that
+    gap is the point: the nominal figure describes an aspiration, this one
+    describes an allocation.
+    """
     compression_ratio: float
-    """Storage reduction vs float16  (16 / avg_bits_per_dim)."""
+    """
+    float16-equivalent bytes divided by bytes actually stored.
+
+    Compact path: measured.  Float path: the nominal ``16 / avg_bits``, which
+    describes only the compressed prefill — the generated tokens stay
+    full-precision there, so it overstates the saving.
+    """
     model: str
     prompt: str
+    cache_bytes: int = 0
+    """Bytes held by the KV cache at the end of generation (0 if unmeasured)."""
+    sidecar_bytes: int = 0
+    """Of ``cache_bytes``, how many are side information rather than payload."""
+    measured: bool = False
+    """
+    True when the two ratio fields come from counting bytes rather than from
+    the nominal bit-width.  False on the float and offload paths.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +707,8 @@ def generate(
     warm_size: int = 16,
     disk_dir: Optional[str] = None,
     offload_codec: str = "paper-outlier",
+    compact_cache: bool = True,
+    block_size: int = DEFAULT_BLOCK_SIZE,
 ) -> GenerateResult:
     """
     Generate text from a prompt using a quantized KV cache.
@@ -536,9 +784,29 @@ def generate(
                             Lloyd-Max, calibrated on the prefill — best fidelity on
                             real KV.  "paper": plain Lloyd-Max, bit-packed (smallest,
                             degrades on outlier-heavy KV).
+        compact_cache:      Keep the KV cache as compressed codes in memory
+                            (default True).  This is what makes the compression
+                            reduce VRAM rather than only measure quality: codes
+                            are the storage of record, decompressed one block at
+                            a time inside attention and dropped immediately, for
+                            both the prefill and every generated token.
+                            compact_cache=False restores the previous behaviour,
+                            where the prefill is compressed and immediately
+                            expanded back to float and generated tokens are never
+                            compressed at all — useful for A/B comparison, but it
+                            saves no memory.  Mutually exclusive with
+                            offload_to_disk.
+        block_size:         Tokens per compressed block (default 128).  Larger
+                            blocks amortise the per-block sidecar over more
+                            tokens (slightly better ratio) at the cost of a
+                            larger transient during attention; smaller blocks do
+                            the reverse.
 
     Returns:
         GenerateResult with .text, .bits, .avg_bits_per_dim, .compression_ratio.
+        On the compact path .measured is True and .avg_bits_per_dim /
+        .compression_ratio are counted from the bytes actually held, side
+        information included, rather than derived from the nominal bit-width.
 
     Example::
 
@@ -588,7 +856,17 @@ def generate(
     if _device and _map is None and not _mode_manages_placement(weights):
         mdl = mdl.to(_device)
 
+    _check_cache_mode(compact_cache, offload_to_disk)
+
     input_ids = _format_prompt(tok, prompt, raw, system=system)
+
+    if compact_cache:
+        return _generate_compact(
+            mdl, tok, model, prompt, input_ids, bits, max_new_tokens,
+            temperature, top_p, repetition_penalty, prefill_chunk_size,
+            block_size,
+        )
+
     past, avg_bits, T_p, ids = _build_quantized_cache(
         mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size,
         quantize=not offload_to_disk,
@@ -671,9 +949,14 @@ def generate(
         text=text,
         bits=bits,
         avg_bits_per_dim=avg_bits,
+        # Nominal, and deliberately left so: on this path the compressed prefill
+        # is expanded back to float and generated tokens are never compressed,
+        # so there is no compact byte count to report.  `measured=False` marks
+        # the difference rather than dressing this figure up as a measurement.
         compression_ratio=16.0 / avg_bits,
         model=model,
         prompt=prompt,
+        measured=False,
     )
 
 
@@ -700,6 +983,8 @@ def stream(
     warm_size: int = 16,
     disk_dir: Optional[str] = None,
     offload_codec: str = "paper-outlier",
+    compact_cache: bool = True,
+    block_size: int = DEFAULT_BLOCK_SIZE,
 ) -> Generator[str, None, None]:
     """
     Stream generated text token-by-token from a quantized KV cache.
@@ -736,7 +1021,17 @@ def stream(
     if _device and _map is None and not _mode_manages_placement(weights):
         mdl = mdl.to(_device)
 
+    _check_cache_mode(compact_cache, offload_to_disk)
+
     input_ids = _format_prompt(tok, prompt, raw, system=system)
+
+    if compact_cache:
+        yield from _stream_compact(
+            mdl, tok, input_ids, bits, max_new_tokens, temperature, top_p,
+            repetition_penalty, prefill_chunk_size, block_size,
+        )
+        return
+
     past, _, T_p, ids = _build_quantized_cache(
         mdl, tok, input_ids, bits, correction_rank, prefill_chunk_size,
         quantize=not offload_to_disk,
