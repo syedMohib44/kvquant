@@ -67,6 +67,47 @@ def gqa_factor(tiny_gqa_model) -> int:
     return cfg.num_attention_heads // cfg.num_key_value_heads
 
 
+@pytest.fixture(scope="session")
+def warm_cuda_codec():
+    """
+    Pay the codec's one-time GPU costs before any VRAM measurement.
+
+    The first compact-cache forward on a device allocates roughly 9 MB more
+    than every subsequent one: Lloyd-Max codebooks are solved and cached
+    per ``(dim, num_bits)`` in a module-global dict, rotation and boundary
+    buffers migrate to the device, and cuBLAS picks its workspace.  All of it
+    is process-global and paid once.
+
+    A measurement that includes it attributes those 9 MB to the cache and can
+    report the compact path as several times *worse* than float — the opposite
+    of the truth (steady state is ~1.2 MB vs ~11.5 MB here).  Because the
+    caches are global, warming inside a single test is not enough: whichever
+    CUDA test runs first would absorb the cost and the rest would look fine,
+    making results depend on test order.  Warming once per session removes
+    that dependency.
+    """
+    if not torch.cuda.is_available():
+        return
+    from src.compact_cache import CompactKVCache
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        "hf-internal-testing/tiny-random-gpt2"
+    ).cuda()
+    model.eval()
+    ids = torch.arange(1, 65).unsqueeze(0).cuda()
+    for bits in (2, 3, 4, 8):
+        cache = CompactKVCache(
+            n_layers=model.config.n_layer, bits=bits, block_size=16, codec="paper"
+        )
+        with cache.attached(model) as c:
+            with torch.no_grad():
+                model(ids, past_key_values=c, use_cache=True)
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
+
+
 def pytest_runtest_setup(item):
     """Skip tests marked `cuda` when no device is present."""
     if any(mark.name == "cuda" for mark in item.iter_markers()):
