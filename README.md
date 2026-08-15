@@ -34,13 +34,13 @@ KVQUANT extends [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 
 ## Relationship to the TurboQuant paper
 
 TurboQuant is a 25-page theory paper: three theorems, two algorithms, and four
-experiment subsections. It ends at §4.4 — there is no §5, §6, §7, and no
+experiment subsections. It ends at Section 4.4 — there is no Section 5, Section 6, Section 7, and no
 appendix. What we take from it, and what is ours, is worth stating plainly.
 
 **From the paper.** The MSE-optimal quantizer — random rotation, then a
 per-coordinate Lloyd-Max codebook fitted to the sphere marginal of Lemma 1
-(§3.1, Algorithm 1, Theorem 1). The inner-product-optimal two-stage quantizer,
-`(b-1)`-bit MSE plus 1-bit QJL on the residual (§3.2, Algorithm 2, Theorem 2).
+(Section 3.1, Algorithm 1, Theorem 1). The inner-product-optimal two-stage quantizer,
+`(b-1)`-bit MSE plus 1-bit QJL on the residual (Section 3.2, Algorithm 2, Theorem 2).
 The distortion bounds we test against.
 
 **Ours, not the paper's.** These are engineering decisions the paper does not
@@ -49,17 +49,17 @@ make, and they need to stand on their own measurements:
 | Decision | What the paper says |
 |---|---|
 | `KVQuantMSE` for **both** K and V | Nothing. The paper never distinguishes keys from values, and never says which of its two quantizers to use for either. Our choice is pinned by `test_mse_key_reconstructs_far_better_than_ip`. |
-| Outlier channels chosen by **empirical per-channel variance** | The outlier split is a three-sentence aside in §4.3 with **no selection criterion** — no threshold, no statistic, no mention of whether the choice is static or calibrated. |
-| **Per-layer calibration** on real prefill KVs | Nothing. TurboQuant is explicitly *data-oblivious* ("apply instantly without needing data-specific tuning or calibrations", §1.2), so calibrating at all is a departure — one the outlier split forces on us. |
+| Outlier channels chosen by **empirical per-channel variance** | The outlier split is a three-sentence aside in Section 4.3 with **no selection criterion** — no threshold, no statistic, no mention of whether the choice is static or calibrated. |
+| **Per-layer calibration** on real prefill KVs | Nothing. TurboQuant is explicitly *data-oblivious* ("apply instantly without needing data-specific tuning or calibrations", Section 1.2), so calibrating at all is a departure — one the outlier split forces on us. |
 | Bit schedule `outlier=b+1`, `regular=max(b-1,1)`, both capped at 8 | The paper gives one configuration and no formula to generalise it. |
 | **GQA bump** `+ceil(log4(g))` | Nothing. Grouped-query attention is never mentioned outside a bibliography entry. |
 | **Hadamard** rotation for power-of-2 dims | Nothing. The paper says only "a random rotation matrix"; fast/structured transforms are never discussed. Sound (Ailon & Chazelle 2006), but ours. |
 | **det(Π) = +1** (SO(d), not O(d)) | Nothing. The determinant is never discussed, and the paper's argument holds for reflections too. We pin it so the QR and Hadamard backends stay interchangeable. |
-| **Low-rank correction**, delta, adaptive, PQ, Huffman | Not in the paper. PQ appears only as a baseline to beat (§4.4); the ~5% entropy-coding gain is noted in §3.1 and explicitly declined. |
+| **Low-rank correction**, delta, adaptive, PQ, Huffman | Not in the paper. PQ appears only as a baseline to beat (Section 4.4); the ~5% entropy-coding gain is noted in Section 3.1 and explicitly declined. |
 
-**Two errata in the source.** §4.3 states its worked example as
+**Two errata in the source.** Section 4.3 states its worked example as
 "(32×3+96×2)/128 = 2.5" — that sum is **2.25**. And the paper's bits-per-channel
-figures are payload-only: §1.3 concedes that non-unit vectors need their L2
+figures are payload-only: Section 1.3 concedes that non-unit vectors need their L2
 norms stored "in floating-point precision", but no bit-width figure anywhere
 accounts for them. At head_dim 64 that omission is substantial, and it is the
 main reason our measured ratios land near half the nominal ones. We count the
@@ -535,9 +535,9 @@ tokens, growing with context.
 
 Two codecs are available via `offload_codec` — both are the paper's method:
 
-- **`"paper-outlier"` (default)** outlier-aware Lloyd-Max — the paper's §3.1
+- **`"paper-outlier"` (default)** outlier-aware Lloyd-Max — the paper's Section 3.1
   MSE quantizer applied separately to the outlier and regular channel groups it
-  sketches in §4.3 — calibrated once on the prefill KVs. Real attention K/V tensors have a
+  sketches in Section 4.3 — calibrated once on the prefill KVs. Real attention K/V tensors have a
   few high-magnitude "outlier" channels; this codec gives them extra bits and
   quantizes the rest at `bits`, reaching near-lossless fidelity (cosine ~0.999) at
   3-4 bits/dim. **This is the recommended paper-faithful codec** plain Lloyd-Max
@@ -561,7 +561,7 @@ or **`bits=3`** (paper's sweet spot). **`bits=2` is very lossy** 4 Lloyd-Max lev
 per coordinate is at the edge of usable and can visibly hurt quality; raise `bits`
 if output degrades — there is no non-paper fallback.
 
-**GQA models are handled automatically (paper §GQA compensation).** Grouped-query
+**GQA models are handled automatically (paper Section GQA compensation).** Grouped-query
 models — Qwen2.5-7B, Llama-3, most modern 7B+ checkpoints — share each KV head
 across `g = n_heads / n_kv_heads` query heads, which amplifies quantization error by
 ~`g`×. To hold quality constant the codec adds `ceil(log4(g))` bits per coordinate to

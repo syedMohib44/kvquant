@@ -36,7 +36,7 @@ to Near-Optimal Vector Quantization for KV Cache Compression}
 
 % -----------------------------------------------------------------------
 \begin{abstract}
-KVQuant \citep{zandieh2025} is a compelling approach to KV cache
+TurboQuant \citep{zandieh2025} is a compelling approach to KV cache
 compression: rotate, then quantize with Lloyd-Max, and you get near-optimal
 MSE with provable bounds. But it treats every token the same, compresses
 each vector in isolation, and does nothing with the residual error once it is
@@ -46,18 +46,45 @@ We introduce five extensions---attention-weighted quantization, delta
 compression, adaptive bit allocation, low-rank error correction, and
 product quantization---each targeting a different structural property of
 transformer attention that the original method leaves on the table. Along
-the way, we also fixed several issues in the original implementation: the codebook was
-fitted to a Gaussian approximation rather than the actual sphere marginal
-distribution, the QR decomposition could silently produce a reflection
-instead of a rotation, and the nearest-centroid search was doing
-$O(N \cdot d \cdot k)$ work when a binary search suffices.
+the way, we also corrected several issues in the original implementation: the
+codebook was fitted to a Gaussian approximation rather than the actual sphere
+marginal distribution; the QR decomposition could silently produce a
+reflection instead of a rotation; the nearest-centroid search was doing
+$O(N \cdot d \cdot k)$ work when a binary search suffices; and the
+inner-product quantizer was applying a redundant second normalisation pass on
+vectors already on the unit sphere.
 
 On distilgpt2, attention-weighted quantization cuts attention-weighted
 distortion by 47--70\% per layer at the same average bit-width. Delta
 compression reduces MSE by $1.1$--$2.2\times$ for correlated streams.
 Rank-4 error correction shaves off $\sim$11\% of the remaining MSE at 7.4\%
-extra storage. The \texttt{bucketize} lookup runs 14--22$\times$ faster than
-the original \texttt{argmin} expansion.
+extra storage. Product quantization ($M{=}16$, $b{=}8$) produces coherent
+generation at 2 bits/dim---the same storage as 2-bit scalar, which collapses
+matching 3-bit scalar quality. The \texttt{bucketize} lookup runs 14--22$\times$
+faster than the original \texttt{argmin} expansion. Four additional
+improvements are described: k-means++ codebook initialisation (75\% lower
+init MSE at 1-bit), K-V asymmetric quantization (V MSE reduced 61.5\% at
+0.5 fewer bits/dim), delta+outlier combination (V MSE reduced 95.4\% vs
+same-budget plain), and Hadamard rotation exposed as a configurable parameter
+($O(d \log d)$ vs $O(d^2)$).
+
+Separately from the extensions, we make the compression \emph{real}: the
+shipped cache stores compact codes rather than decompressing to float, so
+quantization now reduces memory instead of only simulating its quality cost.
+On Qwen2.5-0.5B-Instruct this holds 2.5--3.6$\times$ fewer cache bytes than
+fp16 with per-vector norm sidecars counted, and cuts peak VRAM by up to
+1.9$\times$ at $\sim$14k tokens at equal throughput---a saving that grows
+with context and is absent below $\sim$1k tokens, where the prefill attention
+matrix rather than the cache sets the peak (Section~5.4).
+
+Two caveats stated up front, because both were previously overstated. First,
+our measured compression ratios are roughly \textbf{half} the nominal $16/b$
+figure, because that figure ignores the per-vector L2 norms the codec must
+store; we count them. Second, each extension is measured \textbf{in
+isolation}, against its own baseline. An earlier version of this paper claimed
+the gains ``compound'' when composed; that claim was never measured, is
+contradicted for one pair of stages by our own Section~3.3, and is withdrawn
+in Section~4.
 \end{abstract}
 
 % -----------------------------------------------------------------------
@@ -85,8 +112,18 @@ transformers actually behave, and exploiting them gives measurable gains
 without touching the core quantization guarantees.
 
 The paper is organized around these five extensions, preceded by a
-description of the implementation improvements we made to the baseline. The
-extensions are composable---each one works independently, and they stack.
+description of the implementation improvements we made to the baseline. Each
+extension works independently and is measured independently; whether they
+stack is examined, and left open, in Section~4.
+
+There is also a problem that is not about compression ratios at all. A KV
+cache quantizer that compresses and then immediately decompresses to float
+reproduces quantization's \emph{quality cost} while banking none of its
+\emph{memory benefit} --- and that is what our own implementation did until
+recently, and what a surprising amount of published work measures.
+Section~5.4 reports what the cache actually holds, and Section~5.5 states how
+it is measured, because a compression result whose ruler is unspecified is
+not reproducible.
 
 % -----------------------------------------------------------------------
 \section{Background}
